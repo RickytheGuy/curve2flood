@@ -681,30 +681,29 @@ def Write_Output_Raster_As_GeoDataFrame(raster_data, ncols, nrows, dem_geotransf
 
 
 def Remove_Crop_Circles(flood_gdf, StrmShp_File, shp_output_filename):
-    print('Removing Crop Circles by Intersecting')
-    print('  Read Input: ' + str(StrmShp_File))
+    LOG.info('Removing Crop Circles by Intersecting')
+    LOG.info('  Read Input: ' + str(StrmShp_File))
 
     strm_gdf = gpd.read_file(StrmShp_File)
 
     #strm_gdf = strm_gdf.to_crs(flood_gdf.crs)
 
-    #flood_gdf = gpd.sjoin(flood_gdf, strm_gdf, how="inner", op="intersects")
-    flood_gdf = gpd.sjoin(flood_gdf, strm_gdf, how="inner", predicate="intersects")
+    flood_gdf: gpd.GeoDataFrame = gpd.sjoin(flood_gdf, strm_gdf, how="inner", predicate="intersects")
 
     if flood_gdf is None:
         raise ValueError("GeoDataFrame is empty! Check data before saving.")
 
     #flood_gdf.set_geometry("geometry", inplace=True)
 
-    print('Try dropping duplicate fid column (not always needed)...')
+    LOG.info('Try dropping duplicate fid column (not always needed)...')
     try:
         flood_gdf = flood_gdf.drop_duplicates(subset=["fid"])
-        print('   Dropped the fid column')
+        LOG.info('   Dropped the fid column')
     except:
-        print('   No dublicate fid column')
+        LOG.info('   No dublicate fid column')
     
     flood_gdf.to_file(shp_output_filename)
-    print('  Wrote Output: ' + str(shp_output_filename))
+    LOG.info('  Wrote Output: ' + str(shp_output_filename))
 
     return flood_gdf
 
