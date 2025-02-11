@@ -245,6 +245,7 @@ def Calculate_TW_D_ForEachCOMID(E_DEM, CurveParamFileName, COMID_Unique_Flow, CO
 
     return (COMID_Unique_TW, COMID_Unique_Depth, TopWidthMax, T_Rast, W_Rast)
 
+# @njit(cache=True)
 # def Find_TopWidth_at_Baseflow_when_using_VDT(QB, QVTW, num_q):
 #     for x in range(0,num_q):
 #         if QB <= QVTW[x*4]:
@@ -252,6 +253,7 @@ def Calculate_TW_D_ForEachCOMID(E_DEM, CurveParamFileName, COMID_Unique_Flow, CO
 #             return TopWidth
 #     return QVTW[(num_q-1)*4+2]
 
+@njit(cache=True)
 def Find_TopWidth_at_Baseflow_when_using_VDT(QB, flow_values, top_width_values):
     """
     Find the TopWidth corresponding to the baseflow (QB).
