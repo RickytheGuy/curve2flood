@@ -1283,8 +1283,8 @@ def Curve2Flood_MainFunction(input_file):
     if StrmShp_File:
         # convert the raster to a geodataframe
         flood_gdf = Write_Output_Raster_As_GeoDataFrame(Flood_Ensemble, ncols, nrows, dem_geotransform, dem_projection, gdal.GDT_Int32)
-        flood_gdf = Remove_Crop_Circles(flood_gdf, StrmShp_File, Flood_File)
-        shp_output_filename = f"{Flood_File[:-4]}.shp"
+        shp_output_filename = f"{Flood_File[:-4]}.gpkg"
+        flood_gdf = Remove_Crop_Circles(flood_gdf, StrmShp_File, shp_output_filename)
 
         # write the final output raster
         #Write_Output_Raster(Flood_File, Flood_Ensemble, ncols, nrows, dem_geotransform, dem_projection, "GTiff", gdal.GDT_Int32)
