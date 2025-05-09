@@ -1335,7 +1335,8 @@ def Curve2Flood_MainFunction(input_file: str,
         except:
             if os.path.exists(BathyWaterMaskFileName):
                 LOG.warning('Could not open ' + BathyWaterMaskFileName)
-            LOG.warning('Going to use the Flood Map ' + Flood_File)
+            if not quiet:
+                LOG.warning('Going to use the Flood Map ' + Flood_File)
             #ARBathyMas = np.where(~np.isnan(Flood_Ensemble), np.where(Flood_Ensemble > 0, 1, 0), 0)
             #ARBathyMask = np.zeros((nrows+2,ncols+2))  #Create an array that is slightly larger than the Bathy Raster Array
             #ARBathyMask[1:(nrows+1), 1:(ncols+1)] = np.where(ARBathyMas>0,1,0)
