@@ -1154,6 +1154,10 @@ def Curve2Flood_MainFunction(input_file: str,
         LOG.error("Flow file name is required.")
         return
     
+    if not Flood_File:
+        LOG.error("Flood file name is required.")
+        return
+    
     Q_Fraction = float(Q_Fraction)
     TopWidthPlausibleLimit = float(TopWidthPlausibleLimit)
     TW_MultFact = float(TW_MultFact)
@@ -1253,44 +1257,43 @@ def Curve2Flood_MainFunction(input_file: str,
     # (WeightBox, ElipseMask) = CreateWeightAndElipseMask(TW_for_WeightBox_ElipseMask, dx, dy, TW_MultFact)  #3D Array with the same row/col dimensions as the WeightBox
     WeightBox = CreateWeightAndElipseMask(TW_for_WeightBox_ElipseMask, dx, dy, TW_MultFact)  #3D Array with the same row/col dimensions as the WeightBox
     
-    if Flood_File:
-        Flood_Ensemble = np.zeros((nrows,ncols))
-        
-        #If you're setting a set-depth value for all streams, just need to simulate one flood event
-        if Set_Depth>=0.0:
-            num_flows = 1
-        
-        #Go through all the Flow Events
-        for flow_event_num in range(num_flows):
-            LOG.info('Working on Flow Event ' + str(flow_event_num))
-            #Get an Average Flow rate associated with each stream reach.
-            if Set_Depth<=0.000000001:
-                FindFlowRateForEachCOMID_Ensemble(comid_file_lines, flow_event_num, COMID_to_ID, MinCOMID, COMID_Unique_Flow)
-            Flood = Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, MinCOMID, COMID_to_ID, COMID_Unique_Flow, CurveParamFileName, VDTDatabaseFileName, Q_Fraction, TopWidthPlausibleLimit, TW_MultFact, WeightBox, TW_for_WeightBox_ElipseMask, LocalFloodOption, Set_Depth, quiet, flood_vdt_cells)        
-            Flood_Ensemble = Flood_Ensemble + Flood
-        
-        #Turn into a percentage
-        Flood_Ensemble = (100 * Flood_Ensemble / num_flows).astype(int)
+    Flood_Ensemble = np.zeros((nrows,ncols))
+    
+    #If you're setting a set-depth value for all streams, just need to simulate one flood event
+    if Set_Depth>=0.0:
+        num_flows = 1
+    
+    #Go through all the Flow Events
+    for flow_event_num in range(num_flows):
+        LOG.info('Working on Flow Event ' + str(flow_event_num))
+        #Get an Average Flow rate associated with each stream reach.
+        if Set_Depth<=0.000000001:
+            FindFlowRateForEachCOMID_Ensemble(comid_file_lines, flow_event_num, COMID_to_ID, MinCOMID, COMID_Unique_Flow)
+        Flood = Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, MinCOMID, COMID_to_ID, COMID_Unique_Flow, CurveParamFileName, VDTDatabaseFileName, Q_Fraction, TopWidthPlausibleLimit, TW_MultFact, WeightBox, TW_for_WeightBox_ElipseMask, LocalFloodOption, Set_Depth, quiet, flood_vdt_cells)        
+        Flood_Ensemble = Flood_Ensemble + Flood
+    
+    #Turn into a percentage
+    Flood_Ensemble = (100 * Flood_Ensemble / num_flows).astype(int)
 
 
-        # If selected, we can also flood cells based on the Land Cover and the Stream Raster
-        LOG.info(Flood_WaterLC_and_STRM_Cells)
-        if Flood_WaterLC_and_STRM_Cells==True:
-            LOG.info('Flooding the Water-Related Land Cover and STRM cells')
-            Flood_Ensemble = Flood_WaterLC_and_STRM_Cells_in_Flood_Map(Flood_Ensemble, S, LAND_File, LAND_WaterValue)
+    # If selected, we can also flood cells based on the Land Cover and the Stream Raster
+    LOG.info(Flood_WaterLC_and_STRM_Cells)
+    if Flood_WaterLC_and_STRM_Cells==True:
+        LOG.info('Flooding the Water-Related Land Cover and STRM cells')
+        Flood_Ensemble = Flood_WaterLC_and_STRM_Cells_in_Flood_Map(Flood_Ensemble, S, LAND_File, LAND_WaterValue)
 
-        if Set_Depth < 0:
-            LOG.info('Creating Ensemble Flood Map...' + str(Flood_File))
+    if Set_Depth < 0:
+        LOG.info('Creating Ensemble Flood Map...' + str(Flood_File))
 
-        # Remove crop circles and other disconnected cells
-        Flood_Ensemble = remove_cells_not_connected(Flood_Ensemble, S)
+    # Remove crop circles and other disconnected cells
+    Flood_Ensemble = remove_cells_not_connected(Flood_Ensemble, S)
 
-        # Write the output raster
-        out_ds: gdal.Dataset = gdal.GetDriverByName("GTiff").Create(Flood_File, ncols, nrows, 1, gdal.GDT_Byte, options=["COMPRESS=DEFLATE", "PREDICTOR=2"])
-        out_ds.SetGeoTransform(dem_geotransform)
-        out_ds.SetProjection(dem_projection)
-        out_ds.WriteArray(Flood_Ensemble)
-        out_ds.FlushCache()
+    # Write the output raster
+    out_ds: gdal.Dataset = gdal.GetDriverByName("GTiff").Create(Flood_File, ncols, nrows, 1, gdal.GDT_Byte, options=["COMPRESS=DEFLATE", "PREDICTOR=2"])
+    out_ds.SetGeoTransform(dem_geotransform)
+    out_ds.SetProjection(dem_projection)
+    out_ds.WriteArray(Flood_Ensemble)
+    out_ds.FlushCache()
 
     if StrmShp_File:
         # convert the raster to a geodataframe
