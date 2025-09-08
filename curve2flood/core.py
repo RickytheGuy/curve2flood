@@ -717,8 +717,6 @@ def create_weightbox(tw: int, dx: float, dy: float):
     # These offsets represent the "cell distance" in each direction.
     X = ((indices - tw) * dx) ** 2 # shape (n,)
     Y = ((indices - tw) * dy) ** 2 # shape (n,)
-    X = X.astype(np.float32)
-    Y = Y.astype(np.float32)
     
     # Broadcast to compute the squared distances:
     # For every cell, z2 = (dx * (x offset))^2 + (dy * (y offset))^2.
@@ -1408,8 +1406,8 @@ def Curve2Flood_MainFunction(input_file: str = None,
         num_flows = 1
 
     # Create initial rasters once, outside the loop
-    T_Rast = np.empty((nrows,ncols), np.float32)
-    W_Rast = np.empty((nrows,ncols), np.float32)
+    T_Rast = np.empty((nrows,ncols), np.float64)
+    W_Rast = np.empty((nrows,ncols), np.float64)
 
     #Go through all the Flow Events
     Flood_array_list = []
