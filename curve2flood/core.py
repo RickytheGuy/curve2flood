@@ -375,10 +375,10 @@ def Calculate_TW_D_ForEachCOMID_VDTDatabase(E_DEM, VDTDatabaseFileName: str, COM
     e_dem = E_DEM[vdt_df['Row'].values + 1, vdt_df['Col'].values + 1]
 
     # Extract flow, TopWidth, and WSE values for interpolation
-    flow_values = vdt_df.iloc[:, flow_cols].values
-    top_width_values = vdt_df.iloc[:, top_width_cols].values
-    wse_values = vdt_df.iloc[:, wse_cols].values
-    elev_values = vdt_df['Elev'].values
+    flow_values = vdt_df.iloc[:, flow_cols].values.astype(np.float64)
+    top_width_values = vdt_df.iloc[:, top_width_cols].values.astype(np.float64)
+    wse_values = vdt_df.iloc[:, wse_cols].values.astype(np.float64)
+    elev_values = vdt_df['Elev'].values.astype(np.float64)
 
     top_width, depth, wse = vdt_interpolate(flow, qb, flow_values, top_width_values, elev_values, wse_values, e_dem, TW_MultFact)
 
@@ -400,6 +400,7 @@ def Calculate_TW_D_ForEachCOMID_VDTDatabase(E_DEM, VDTDatabaseFileName: str, COM
 
     # Drop rows with NaN values introduced during outlier removal
     vdt_df = vdt_df.dropna(subset=['TopWidth', 'Depth', 'WSE'])
+    vdt_df.to_csv('vdt_filtered.csv', index=False)
     
     # Fill T_Rast and W_Rast
     T_Rast[vdt_df['Row'], vdt_df['Col']] = vdt_df['TopWidth']
