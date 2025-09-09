@@ -895,7 +895,7 @@ def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, E, B, nrows, ncols, sd, TW_m, d
 
     return Flooded_array[1:-1, 1:-1], Depth_array[1:-1, 1:-1], WSE_array[1:-1, 1:-1]
 
-@njit(cache=True)
+@njit("float32[:](float64)", cache=True)
 def create_gaussian_kernel_1d(sigma):
     kernel_size = int(6 * sigma + 1)
     if kernel_size % 2 == 0:
@@ -913,7 +913,7 @@ def create_gaussian_kernel_1d(sigma):
 
     return kernel
 
-@njit(cache=True)
+@njit("float64[:, :](float64[:, :], float32[:])", cache=True)
 def convolve_rows(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
     nrows, ncols = image.shape
     klen = len(kernel)
@@ -938,7 +938,7 @@ def convolve_rows(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
             output[r, c] = acc / weight_sum if weight_sum > 0 else image[r, c]
     return output
 
-@njit(cache=True)
+@njit("float64[:, :](float64[:, :], float32[:])", cache=True)
 def convolve_cols(image, kernel):
     nrows, ncols = image.shape
     klen = len(kernel)
@@ -962,7 +962,7 @@ def convolve_cols(image, kernel):
             output[r, c] = acc / weight_sum if weight_sum > 0 else image[r, c]
     return output
 
-@njit(cache=True)
+@njit("float64[:, :](float64[:, :], float64)", cache=True)
 def gaussian_blur_separable(image, sigma):
     kernel = create_gaussian_kernel_1d(sigma)
     blurred = convolve_rows(image, kernel)
