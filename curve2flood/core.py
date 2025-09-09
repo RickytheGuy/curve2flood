@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 # from scipy.interpolate import interp1d
-from scipy.ndimage import label, generate_binary_structure
+from scipy.ndimage import label, generate_binary_structure, distance_transform_edt
 from shapely.geometry import shape
 
 import rasterio
@@ -846,13 +846,13 @@ def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, E, B, nrows, ncols, sd, TW_m, d
                     b_r_max = bathy_r+COMID_TW_Bathy+1
                     if b_r_min<1:
                         b_r_min = 1 
-                    if b_r_max>(nrows+1):
+                    if b_r_max>-1:
                         b_r_max=nrows+1
                     b_c_min = bathy_c-COMID_TW_Bathy
                     b_c_max = bathy_c+COMID_TW_Bathy+1
                     if b_c_min<1:
                         b_c_min = 1 
-                    if b_c_max>(ncols+1):
+                    if b_c_max>-1:
                         b_c_max=ncols+1
                     
                     w_r_min = TW_for_WeightBox_ElipseMask-(bathy_r-b_r_min)
@@ -895,7 +895,6 @@ def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, E, B, nrows, ncols, sd, TW_m, d
 
     return Flooded_array[1:-1, 1:-1], Depth_array[1:-1, 1:-1], WSE_array[1:-1, 1:-1]
 
-
 @njit(cache=True)
 def create_gaussian_kernel_1d(sigma):
     kernel_size = int(6 * sigma + 1)
@@ -903,63 +902,64 @@ def create_gaussian_kernel_1d(sigma):
         kernel_size += 1
     center = kernel_size // 2
 
-    kernel = np.zeros(kernel_size, dtype=np.float32)
-    sum_val = 0.0
+    kernel = np.empty(kernel_size, dtype=np.float32)
 
     for i in range(kernel_size):
         x = i - center
         kernel[i] = np.exp(- (x**2) / (2.0 * sigma**2))
-        sum_val += kernel[i]
 
-    for i in range(kernel_size):
-        kernel[i] /= sum_val
+    sum_val = np.sum(kernel)
+    kernel /= sum_val
 
     return kernel
 
 @njit(cache=True)
-def convolve_rows(image, kernel):
+def convolve_rows(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
     nrows, ncols = image.shape
-    pad = len(kernel) // 2
-    output = np.zeros_like(image)
+    klen = len(kernel)
+    pad = klen // 2
+    output = np.empty_like(image)
 
     for r in range(nrows):
         for c in range(ncols):
             acc = 0.0
             weight_sum = 0.0
-            for k in range(len(kernel)):
-                cc = c - pad + k
-                if cc >= 0 and cc < ncols:
-                    val = image[r, cc]
-                    if val != -9999.0:
-                        acc += val * kernel[k]
-                        weight_sum += kernel[k]
-            if weight_sum > 0:
-                output[r, c] = acc / weight_sum
-            else:
-                output[r, c] = image[r, c]
+            c_start = max(0, c - pad)
+            c_end = min(ncols, c + pad + 1)
+            k_start = pad - (c - c_start)
+
+            for k in range(c_end - c_start):
+                val = image[r, c_start + k]
+                if val != -9999.0:
+                    w = kernel[k_start + k]
+                    acc += val * w
+                    weight_sum += w
+
+            output[r, c] = acc / weight_sum if weight_sum > 0 else image[r, c]
     return output
 
 @njit(cache=True)
 def convolve_cols(image, kernel):
     nrows, ncols = image.shape
-    pad = len(kernel) // 2
+    klen = len(kernel)
+    pad = klen // 2
     output = np.zeros_like(image)
 
     for c in range(ncols):
         for r in range(nrows):
             acc = 0.0
             weight_sum = 0.0
-            for k in range(len(kernel)):
-                rr = r - pad + k
-                if rr >= 0 and rr < nrows:
-                    val = image[rr, c]
-                    if val != -9999.0:
-                        acc += val * kernel[k]
-                        weight_sum += kernel[k]
-            if weight_sum > 0:
-                output[r, c] = acc / weight_sum
-            else:
-                output[r, c] = image[r, c]
+            r_start = max(0, r - pad)
+            r_end = min(nrows, r + pad + 1)
+            k_start = pad - (r - r_start)
+
+            for k in range(r_end - r_start):
+                val = image[r_start + k, c]
+                if val != -9999.0:
+                    acc += val * kernel[k_start + k]
+                    weight_sum += kernel[k_start + k]
+
+            output[r, c] = acc / weight_sum if weight_sum > 0 else image[r, c]
     return output
 
 @njit(cache=True)
@@ -969,8 +969,6 @@ def gaussian_blur_separable(image, sigma):
     blurred = convolve_cols(blurred, kernel)
     return blurred
 
-
-from scipy.ndimage import distance_transform_edt
 
 # @njit(cache=True)
 def Create_Topobathy_Dataset(E, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, Bathy, ARBathyMask, Bathy_Use_Banks):
@@ -1026,7 +1024,7 @@ def Create_Topobathy_Dataset(E, nrows, ncols, WeightBox, TW_for_WeightBox_Elipse
     # this Scipy function doesn't work with Numba, so Numba is turned off for this function
     mask = (Bathy > -98.99)
     # Find nearest valid points for all cells
-    distance, indices = distance_transform_edt(~mask, return_indices=True)
+    indices = distance_transform_edt(~mask, return_distances=False, return_indices=True)
     # Replace invalid points with the values from the nearest valid points
     Bathy[~mask] = Bathy[indices[0][~mask], indices[1][~mask]]
 
@@ -1035,18 +1033,21 @@ def Create_Topobathy_Dataset(E, nrows, ncols, WeightBox, TW_for_WeightBox_Elipse
     Bathy = gaussian_blur_separable(Bathy, sigma=sigma_value)
 
     # filter out any bathy data not in the water mask
-    Bathy = np.where(ARBathyMask==1, Bathy, E)   
+    # Bathy = np.where(ARBathyMask==1, Bathy, E)
+    mask = ARBathyMask != 1
+    Bathy[mask] = E[mask]
 
     # Replace *any remaining bad values*, including -99, -9999, or NaN
-    Bathy = np.where(Bathy<=-98.99, E, Bathy)
+    bad_mask = (Bathy <= -98.99) | (Bathy < -9998.0)
+    Bathy[bad_mask] = E[bad_mask]
 
     # replace any values below -9998.0 with a np.nan
     Bathy = np.where(Bathy < -9998.0, np.nan, Bathy)
 
     # if we used the WSE and baseflow, we don't want the bathymetry to be above the WSE
     # bathymetry may be higher if we use bank elevations and bankfull discharge estimate
-    if Bathy_Use_Banks == False:
-        Bathy = np.where(Bathy > E, E, Bathy)
+    if not Bathy_Use_Banks:
+        Bathy[Bathy > E] = E[Bathy > E]
 
     return Bathy[1:nrows+1, 1:ncols+1]
 
@@ -1274,6 +1275,28 @@ def create_numba_dict_from(keys: np.ndarray, values: np.ndarray) -> dict[int, fl
     for i in range(len(keys)):
         d[keys[i]] = values[i]
     return d
+def create_bathymetry(E: np.ndarray, nrows: int, ncols: int, dem_geotransform: tuple, dem_projection: str, BathyFromARFileName: str, BathyWaterMaskFileName: str, Flood_Ensemble: np.ndarray, BathyOutputFileName: str, WeightBox: np.ndarray, TW_for_WeightBox_ElipseMask: int, Bathy_Use_Banks: bool):
+    LOG.info('Working on Bathymetry')
+    ds: gdal.Dataset = gdal.Open(BathyFromARFileName)
+    ARBathy = np.full((nrows+2, ncols+2), -9999.0)  #Create an array that is slightly larger than the Bathy Raster Array
+    ARBathy[1:-1, 1:-1] = ds.ReadAsArray()
+    ds = None
+
+    ARBathyMask = np.zeros((nrows+2,ncols+2), dtype=np.bool)
+    if os.path.exists(BathyWaterMaskFileName):
+        ds = gdal.Open(BathyWaterMaskFileName)
+        ARBathyMask[1:-1, 1:-1] = ds.ReadAsArray() > 0
+        ds = None
+    else:
+        ARBathyMask[1:-1, 1:-1] = Flood_Ensemble > 0
+
+    ARBathy[np.isnan(ARBathy)] = -99.000  #This converts all nan values to a -99
+    ARBathy = ARBathy * ARBathyMask
+    ARBathy[ARBathyMask != 1] = -9999.000
+    # Bathy = Create_Topobathy_Dataset(RR, CC, E, B, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, Bathy_Yes, ARBathy, ARBathyMask)
+    ARBathy = Create_Topobathy_Dataset(E, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, ARBathy, ARBathyMask, Bathy_Use_Banks)
+    # write the Bathy output raster
+    Write_Output_Raster(BathyOutputFileName, ARBathy, ncols, nrows, dem_geotransform, dem_projection, "GTiff", gdal.GDT_Float32)
 
 def Curve2Flood_MainFunction(input_file: str = None,
                              args: dict = None, 
@@ -1390,7 +1413,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
     
     #Get list of Unique Stream IDs.  Also find where all the cell values are.
     B = np.zeros((nrows+2,ncols+2), dtype=np.int32)  #Create an array that is slightly larger than the STRM Raster Array
-    B[1:(nrows+1), 1:(ncols+1)] = S
+    B[1:-1, 1:-1] = S
 
     (RR,CC) = np.where(B > 0)
 
@@ -1508,63 +1531,9 @@ def Curve2Flood_MainFunction(input_file: str = None,
 
         # save the geodataframe (do not specify the driver, it will be inferred from the file extension)
         flood_gdf.to_file(shp_output_filename)
-    
-    #Bathymetry
-    LOG.info('Working on Bathymetry')
-    Bathy_Yes = False
+
     if BathyFromARFileName and os.path.exists(BathyFromARFileName) and BathyOutputFileName:
-        Bathy_Yes = True
-        LOG.info('Attempting to open these files to do the Bathymetry work:')
-        LOG.info('   ' + BathyFromARFileName)
-        try:
-            (ARBath, ncolsar, nrowsar, cellsizear, yllar, yurar, xllar, xurar, latar, dem_geotransformar, dem_projectionar) = Read_Raster_GDAL(BathyFromARFileName)
-            ARBathy = np.full((nrows+2, ncols+2), -9999.0)  #Create an array that is slightly larger than the Bathy Raster Array
-            ARBathy[1:(nrows+1), 1:(ncols+1)] = ARBath
-            del ARBath
-            # Force garbage collection
-            gc.collect()
-        except:
-            Bathy_Yes = False
-            LOG.warning('Could not open ' + BathyFromARFileName)
-        
-        LOG.info('   ' + BathyWaterMaskFileName)
-        try:
-            (ARBathyMas, ncolsar, nrowsar, cellsizear, yllar, yurar, xllar, xurar, latar, dem_geotransformar, dem_projectionar) = Read_Raster_GDAL(BathyWaterMaskFileName)
-            ARBathyMask = np.zeros((nrows+2,ncols+2), dtype=np.int32)  #Create an array that is slightly larger than the Bathy Raster Array
-            ARBathyMask[1:(nrows+1), 1:(ncols+1)] = np.where(ARBathyMas>0,1,0)
-            del ARBathyMas
-            # Force garbage collection
-            gc.collect()
-        except:
-            if os.path.exists(BathyWaterMaskFileName):
-                LOG.warning('Could not open ' + BathyWaterMaskFileName)
-            if not quiet:
-                LOG.warning('Going to use the Flood Map ' + Flood_File)
-            #ARBathyMas = np.where(~np.isnan(Flood_Ensemble), np.where(Flood_Ensemble > 0, 1, 0), 0)
-            #ARBathyMask = np.zeros((nrows+2,ncols+2))  #Create an array that is slightly larger than the Bathy Raster Array
-            #ARBathyMask[1:(nrows+1), 1:(ncols+1)] = np.where(ARBathyMas>0,1,0)
-            #del(ARBathyMas)
-            (ARBathyMas, ncolsar, nrowsar, cellsizear, yllar, yurar, xllar, xurar, latar, dem_geotransformar, dem_projectionar) = Read_Raster_GDAL(Flood_File)
-            ARBathyMask = np.full((nrows+2, ncols+2), -9999.0) #Create an array that is slightly larger than the Bathy Raster Array
-            ARBathyMask[1:(nrows+1), 1:(ncols+1)] = np.where(~np.isnan(ARBathyMas), np.where(ARBathyMas > 0, 1, -9999.0), -9999.0)
-            del ARBathyMas
-            # Force garbage collection
-            gc.collect()
-    
-    if Bathy_Yes:
-        ARBathy[np.isnan(ARBathy)] = -99.000  #This converts all nan values to a -99
-        ARBathy = ARBathy * ARBathyMask
-        ARBathy = np.where(ARBathyMask==1, ARBathy, -9999.000)
-        # Bathy = Create_Topobathy_Dataset(RR, CC, E, B, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, Bathy_Yes, ARBathy, ARBathyMask)
-        ARBathy = Create_Topobathy_Dataset(E, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, ARBathy, ARBathyMask, Bathy_Use_Banks)
-        # write the Bathy output raster
-        Write_Output_Raster(BathyOutputFileName, ARBathy, ncols, nrows, dem_geotransform, dem_projection, "GTiff", gdal.GDT_Float32)
-    else:
-        LOG.info('Not doing Bathymetry.  If you want to do bathymetry add these input cards and files:')
-        LOG.info('   BathyWaterMask')
-        LOG.info('   BATHY_Out_File')
-        LOG.info('   FSOutBATHY')
-    
+        create_bathymetry(E, nrows, ncols, dem_geotransform, dem_projection, BathyFromARFileName, BathyWaterMaskFileName, Flood_Ensemble, BathyOutputFileName, WeightBox, TW_for_WeightBox_ElipseMask, Bathy_Use_Banks)
 
     # Example of simulated execution
     LOG.info("Flood mapping completed.")
