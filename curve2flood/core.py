@@ -1419,7 +1419,6 @@ def Curve2Flood_MainFunction(input_file: str = None,
 
     COMID_Unique = np.unique(B[RR, CC]) # Always sorted
     COMID_Unique = COMID_Unique.astype(int) # Ensure it's treated as integers
-    COMID_Unique = np.delete(COMID_Unique, 0)  #We don't need the first entry of zero
 
     # Open the StrmShp_File if provided
     if StrmShp_File:
