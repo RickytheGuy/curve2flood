@@ -73,35 +73,20 @@ def read_manning_table(s_manning_path: str, da_input_mannings: np.ndarray):
 
 from scipy import ndimage as ndi
 
-def create_velocity_output(OutVEL, Depth_Array, LU_Manning_n, LC_array, Slope_Array,
+def create_velocity(OutVEL, Depth_Array, LU_Manning_n, LC_array, Slope_array_list,
                            geotransform, projection, ncols, nrows,
                            Flood_Ensemble, Velocity_array_list, S):
     """
     """
-    # --- 0) Build SegID_Array from S via distance transform ---
-    wet = np.isfinite(Depth_Array) & (Depth_Array > 0)
-    stream_mask = S > 0
 
-    dist, (ii, jj) = distance_transform_edt(
-        ~stream_mask,              # True where NOT stream
-        return_indices=True
-    )
+    # # --- 1) Ensemble-average velocity (unchanged) ---
+    # sum_arr = np.nansum(Velocity_array_list, axis=0).astype(np.float32)
+    # valid_count = np.sum(~np.isnan(Velocity_array_list), axis=0)
 
-    SegID_Array = S[ii, jj].astype(np.int32)
-    SegID_Array[~wet] = 0  # 0 = non-wet / no-stream
+    # avg = np.full_like(Flood_Ensemble, np.nan, dtype=np.float32)
+    # np.divide(sum_arr, valid_count, out=avg, where=(valid_count > 0)).astype(np.float32)
 
-    # --- 1) Ensemble-average velocity (unchanged) ---
-    sum_arr = np.nansum(Velocity_array_list, axis=0).astype(np.float32)
-    valid_count = np.sum(~np.isnan(Velocity_array_list), axis=0)
-
-    avg = np.full_like(Flood_Ensemble, np.nan, dtype=np.float32)
-    np.divide(sum_arr, valid_count, out=avg, where=(valid_count > 0)).astype(np.float32)
-
-    VEL_Array = avg.astype(np.float32)
-
-    # --- 2) Manning's n raster ---
-    da_input_mannings = read_manning_table(LU_Manning_n, LC_array).astype(np.float32)
-
+    # VEL_Array = avg.astype(np.float32)
 
     # # # ------------------------------------------------------------------
     # # # 3) PER-SEGMENT NORMALIZATION of (1/n) * depth
@@ -145,6 +130,14 @@ def create_velocity_output(OutVEL, Depth_Array, LU_Manning_n, LC_array, Slope_Ar
     # else:
     #     # no segments found; fall back to original behavior or leave VEL_Array as-is
     #     pass
+
+    # find the maximum slope across ensembles, ignoring NaNs when calculating an average with NaNs mixed in
+    # Stack them into one 3D array
+    Slope_Array = create_positive_max_array(Slope_array_list)
+
+
+    # --- 2) Manning's n raster ---
+    da_input_mannings = read_manning_table(LU_Manning_n, LC_array).astype(np.float32)
 
     # # test using Manning's solutions that assumes each pixel is a rectangular channel
     VEL_Array = (1/(da_input_mannings))*((Depth_Array)**(2/3))*((Slope_Array)**(1/2))
@@ -1050,26 +1043,28 @@ def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, V_Rast, E, B, nrows, nc
     else:
         Depth_array = np.empty((3, 3), dtype=np.float32) # Dummy array if not used
 
-    # Create the WSE array
-    if OutWSE:
-        WSE_array = np.where((WSE_divided_by_weight > E) & (E > -9998.0), WSE_divided_by_weight, np.nan).astype(np.float32)
-    else:
-        WSE_array = np.empty((3, 3), dtype=np.float32) # Dummy array if not used
+    # # Create the WSE array
+    # if OutWSE:
+    #     WSE_array = np.where((WSE_divided_by_weight > E) & (E > -9998.0), WSE_divided_by_weight, np.nan).astype(np.float32)
+    # else:
+    #     WSE_array = np.empty((3, 3), dtype=np.float32) # Dummy array if not used
     
     # Create the WSE array
     if OutVEL:
-        V_array = np.where((WSE_divided_by_weight > E) & (E > -9998.0), V_divided_by_weight, np.nan).astype(np.float32)
+        Velocity_array = np.where((WSE_divided_by_weight > E) & (E > -9998.0), V_divided_by_weight, np.nan).astype(np.float32)
     else:
-        V_array = np.empty((3, 3), dtype=np.float32) # Dummy array if not used
+        Velocity_array = np.empty((3, 3), dtype=np.float32) # Dummy array if not used
 
     # if you want, create the slope array
     if S_Rast is not None:
         Slope_divided_by_weight = Slope_Times_Weight / Total_Weight
         Slope_array = np.where((WSE_divided_by_weight > E) & (E > -9998.0), Slope_divided_by_weight, np.nan).astype(np.float32)
         Slope_array = np.where((Slope_array <= 0), 0.0002, Slope_array).astype(np.float32)
-        return Flooded_array[1:-1, 1:-1], Depth_array[1:-1, 1:-1], WSE_array[1:-1, 1:-1], V_array[1:-1, 1:-1], Slope_array[1:-1, 1:-1]
+        # return Flooded_array[1:-1, 1:-1], Depth_array[1:-1, 1:-1], WSE_array[1:-1, 1:-1], V_array[1:-1, 1:-1], Slope_array[1:-1, 1:-1]
+        return Flooded_array[1:-1, 1:-1], Depth_array[1:-1, 1:-1], Velocity_array[1:-1, 1:-1], Slope_array[1:-1, 1:-1]
 
-    return Flooded_array[1:-1, 1:-1], Depth_array[1:-1, 1:-1], WSE_array[1:-1, 1:-1], V_array[1:-1, 1:-1], None
+
+    return Flooded_array[1:-1, 1:-1], Depth_array[1:-1, 1:-1], Velocity_array[1:-1, 1:-1], None
 
 @njit("float32[:](float32)", cache=True)
 def create_gaussian_kernel_1d(sigma):
@@ -1163,7 +1158,6 @@ def Create_Topobathy_Dataset(
 
     E, Bathy, ARBathyMask are all (nrows+2, ncols+2).
     """
-
     # ------------------------------------------------------------
     # 1) PRE-CLEANUP: Outside ARBathyMask, Bathy = DEM BEFORE weighting
     # ------------------------------------------------------------
@@ -1201,10 +1195,19 @@ def Create_Topobathy_Dataset(
 
         weight_slice = WeightBox[w_r_min:w_r_max, w_c_min:w_c_max]
 
+        # NEW: restrict receiving cells to ARBathyMask == 1 within this window
+        receiver_mask = (ARBathyMask[r_min:r_max, c_min:c_max] == 1)
+
+        # Convert receiver_mask to float so we can multiply with weights
+        receiver_mask_f = receiver_mask.astype(np.float32)
+
+        # Zero out weights going to non-stream cells
+        weight_slice_use = weight_slice * receiver_mask_f
+
         val = Bathy[r_use, c_use]
 
-        bathy_times_weight[r_min:r_max, c_min:c_max] += val * weight_slice
-        total_weight[r_min:r_max, c_min:c_max]       += weight_slice
+        bathy_times_weight[r_min:r_max, c_min:c_max] += val * weight_slice_use
+        total_weight[r_min:r_max, c_min:c_max]       += weight_slice_use
 
     # 4) Compute weighted average where we have any weight
     total_weight = np.where(total_weight == 0.0, 1e-12, total_weight)
@@ -1235,7 +1238,7 @@ def Create_Topobathy_Dataset(
     filled[bad_mask] = E[bad_mask]
 
     # 9) Honor Bathy_Use_Banks: keep bathy from being above DEM if requested
-    if not Bathy_Use_Banks:
+    if Bathy_Use_Banks == False:
         above_dem = filled > E
         filled[above_dem] = E[above_dem]
 
@@ -1309,9 +1312,9 @@ def Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, COMID_Unique_F
     COMID_Unique_Depth = create_numba_dict_from(keys_dep, vals_dep)
     COMID_Unique_Velocity = create_numba_dict_from(keys_vel, vals_vel)
 
-    Flood_array, Depth_array, WSE_array, Velocity_array, Slope_array  = CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, V_Rast, E, B, nrows, ncols, search_dist_for_min_elev, TopWidthMax, dx, dy, LocalFloodOption, COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, WeightBox, TW_for_WeightBox_ElipseMask, TW, TW_MultFact, TopWidthPlausibleLimit, Set_Depth, flood_vdt_cells, OutDEP, OutWSE, OutVEL)
+    Flood_array, Depth_array, Velocity_array, Slope_array  = CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, V_Rast, E, B, nrows, ncols, search_dist_for_min_elev, TopWidthMax, dx, dy, LocalFloodOption, COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, WeightBox, TW_for_WeightBox_ElipseMask, TW, TW_MultFact, TopWidthPlausibleLimit, Set_Depth, flood_vdt_cells, OutDEP, OutWSE, OutVEL)
     
-    return Flood_array, Depth_array, WSE_array, Slope_array, Velocity_array
+    return Flood_array, Depth_array, Velocity_array, Slope_array
 
 
 def Set_Stream_Locations(nrows: int, ncols: int, infilename: str):
@@ -1441,12 +1444,16 @@ def ReadInputFile(lines,P):
     for i in range(num_lines):
         ls = lines[i].strip().split()
         if len(ls)>1 and ls[0]==P:
-            if P in ['LocalFloodOption', 'FloodLocalOnly', 'Flood_WaterLC_and_STRM_Cells', 'Bathy_Use_Banks']:
+            if P in ['LocalFloodOption', 'FloodLocalOnly']:
                 return True
             if P=='Set_Depth' or P=='FloodSpreader_SpecifyDepth':
                 return float(ls[1])
-            return ls[1]
-        
+            if P in ['Bathy_Use_Banks', 'Flood_WaterLC_and_STRM_Cells']:
+                if "True" in ls[1]:
+                    return True
+                elif "False" in ls[1] or ls[1] == '':
+                    return False    
+            return ls[1]   
     if P=='Q_Fraction':
         return 1.0
     if P=='TopWidthPlausibleLimit':
@@ -1455,7 +1462,7 @@ def ReadInputFile(lines,P):
         return 3.0
     if P=='Set_Depth' or P=='FloodSpreader_SpecifyDepth':
         return float(-1.1)
-    if P in ['LocalFloodOption', 'FloodLocalOnly', 'Flood_WaterLC_and_STRM_Cells', 'Bathy_Use_Banks']:
+    if P in ['LocalFloodOption', 'FloodLocalOnly', 'Bathy_Use_Banks', 'Flood_WaterLC_and_STRM_Cells']:
         return False
     if P=='LAND_WaterValue':
         return 80
@@ -1464,47 +1471,63 @@ def ReadInputFile(lines,P):
 
     return ''
 
+def create_positive_max_array(array_list: list[np.ndarray]) -> np.ndarray:
+    """Create a maximum value array from a list of arrays, ignoring NaNs."""
+    # Convert list to stacked array of shape (N, rows, cols)
+    arr_stack = np.stack(array_list, axis=0).astype(np.float32)
 
-def create_depth_or_wse_or_velocity(
-    num_flows: int,
-    array_list: list[np.ndarray],
-    Flood_Ensemble: np.ndarray,
-    streams: np.ndarray,
-    geotransform: tuple,
-    projection: str,
-    ncols: int,
-    nrows: int,
-    fname: str,
-    nodata_value: float = -9999.0,   # use a numeric NoData sentinel (safer than NaN for many readers)
-):
-    # --- average across ensembles, ignoring NaNs correctly ---
-    # Sum of non-NaN values
-    sum_arr = np.nansum(array_list, axis=0).astype(np.float32)
+    # Positive-value mask
+    positive_mask = arr_stack > -9998.9
+    masked_arr = np.ma.array(arr_stack, mask=~positive_mask)
 
-    # Count of valid (non-NaN) members at each cell
-    valid_count = np.sum(~np.isnan(array_list), axis=0)
+    # Max across the stack, ignoring masked values
+    max_vals = masked_arr.max(axis=0).filled(np.nan).astype(np.float32)
 
-    # Avoid divide-by-zero; initialize with NaN where no valid members
-    avg = np.full_like(Flood_Ensemble, np.nan, dtype=np.float32)
-    np.divide(sum_arr, valid_count, out=avg, where=(valid_count > 0))
+    return max_vals.astype(np.float32)
 
-    # Optional rounding (match your original 0.01 precision)
-    avg = np.round(avg, 2)
+def create_depth(
+                num_flows: int,
+                array_list: list[np.ndarray],
+                Flood_Ensemble: np.ndarray,
+                streams: np.ndarray,
+                E: np.ndarray,
+                geotransform: tuple,
+                projection: str,
+                ncols: int,
+                nrows: int,
+                fname: str,
+                nodata_value: float = -9999.0,
+    ):
+    max_vals = create_positive_max_array(array_list)
+    # # Convert list to stacked array of shape (N, rows, cols)
+    # arr_stack = np.stack(array_list, axis=0).astype(np.float32)
 
-    # Your domain-specific masks
-    avg = Flood_Flooded_Cells_in_Map(avg, Flood_Ensemble)
-    # avg = remove_cells_not_connected(avg, streams)
+    # # Positive-value mask
+    # positive_mask = arr_stack > -9998.9
+    # masked_arr = np.ma.array(arr_stack, mask=~positive_mask)
+
+    # # Max across the stack, ignoring masked values
+    # max_vals = masked_arr.max(axis=0).filled(np.nan).astype(np.float32)
+
+    # Optional rounding
+    max_vals = np.round(max_vals, 2)
+
+    # match the flood extent of Flood_Ensemble
+    max_vals = Flood_Flooded_Cells_in_Map(max_vals, Flood_Ensemble, eps=0.01)
+
+    # # filter out WSE that is not above the ground elevation
+    # max_vals = np.where((max_vals > E[1:-1, 1:-1]) & (E[1:-1, 1:-1] > -9998.0), max_vals, np.nan).astype(np.float32)
 
 
-    # Treat tiny values as no water; convert to NaN first
-    # avg[np.isclose(avg, 0.0, atol=1e-6)] = np.float32('nan')
+    # # smooth max values with Gaussian filter
+    # sigma_value = 0.75
+    # max_vals = gaussian_blur_separable(max_vals, sigma=sigma_value)
 
-    # Replace NaN with numeric NoData sentinel for safer downstream handling
-    out_band_data = np.where(np.isnan(avg), nodata_value, avg).astype(np.float32)
+    # Convert NaN → NoData sentinel
+    out_band_data = np.where(np.isnan(max_vals), nodata_value, max_vals).astype(np.float32)
 
-    # --- write GeoTIFF with NoData metadata set ---
+    # --- Write GeoTIFF ---
     driver = gdal.GetDriverByName("GTiff")
-    # add tiling & compression for performance if desired
     ds: gdal.Dataset = driver.Create(
         fname, ncols, nrows, 1, gdal.GDT_Float32,
         options=["COMPRESS=DEFLATE", "PREDICTOR=2", "TILED=YES"]
@@ -1517,15 +1540,91 @@ def create_depth_or_wse_or_velocity(
 
     band = ds.GetRasterBand(1)
     band.WriteArray(out_band_data)
-    band.SetNoDataValue(nodata_value)     # <- critical: advertise NoData to readers
+    band.SetNoDataValue(nodata_value)
     band.FlushCache()
     ds.FlushCache()
 
-    # Clean close
+    # Cleanup
     band = None
     ds = None
 
-    return avg
+
+    # # ------------------------------------------------------------------
+    # # Find nearest non-zero stream value for every cell (by index)
+    # # ------------------------------------------------------------------
+    # streams_flat = streams.ravel()
+    # m_flat = max_vals.ravel()  # not strictly needed, but handy if you mask later
+
+    # # Indices of non-zero stream cells (i.e., real stream IDs)
+    # nz_idx = np.flatnonzero(streams_flat)
+    # if nz_idx.size == 0:
+    #     raise ValueError("streams has no non-zero values")
+
+    # # All positions in the flattened grid
+    # pos = np.arange(streams_flat.size)
+
+    # # For each position, find where it would be inserted among non-zero indices
+    # insert_pos = np.searchsorted(nz_idx, pos)
+
+    # # Candidate nearest indices to the left and right in nz_idx
+    # left_idx = np.clip(insert_pos - 1, 0, nz_idx.size - 1)
+    # right_idx = np.clip(insert_pos, 0, nz_idx.size - 1)
+
+    # left_nz = nz_idx[left_idx]
+    # right_nz = nz_idx[right_idx]
+
+    # # Distances to left and right non-zero positions
+    # left_dist = np.abs(pos - left_nz)
+    # right_dist = np.abs(pos - right_nz)
+
+    # # Choose nearest non-zero index (tie -> left)
+    # nearest_nz = np.where(left_dist <= right_dist, left_nz, right_nz)
+
+    # # Map each cell to the nearest non-zero stream ID
+    # nearest_stream_ids_flat = streams_flat[nearest_nz]
+    # nearest_stream_ids = nearest_stream_ids_flat.reshape(streams.shape)
+    # # ------------------------------------------------------------------
+
+    # # "Wet" cells: where max_vals is finite and not nodata-ish
+    # wet = np.isfinite(max_vals) & (max_vals > -9998.0)
+
+    # # SegID_Array: each cell gets the nearest stream ID
+    # SegID_Array = nearest_stream_ids.astype(np.int32)
+    # SegID_Array[~wet] = 0  # 0 = non-wet / no-stream zone
+
+    # # make an array of the unique stream IDs present in SegID_Array
+    # unique_stream_ids = np.unique(SegID_Array)
+
+    # for stream_id in unique_stream_ids:
+    #     if stream_id == 0:
+    #         continue  # skip background / non-wet
+
+    #     # All cells (stream + floodplain) that belong to this nearest-stream zone
+    #     zone_mask = (SegID_Array == stream_id)
+    #     if not np.any(zone_mask):
+    #         continue
+
+    #     # Only use finite water surface elevations in this zone
+    #     zone_mask_finite = zone_mask & np.isfinite(max_vals)
+    #     zone_vals = max_vals[zone_mask_finite]
+    #     if zone_vals.size < 3:
+    #         # not enough data for percentiles
+    #         continue
+
+    #     p25 = np.percentile(zone_vals, 25)
+    #     p75 = np.percentile(zone_vals, 75)
+    #     median_val = np.median(zone_vals)
+
+    #     # Identify outliers in this zone
+    #     outliers = (zone_vals < p25) | (zone_vals > p75)
+    #     if np.any(outliers):
+    #         # Write back only for outliers in this zone
+    #         idx_row, idx_col = np.where(zone_mask_finite)
+    #         max_vals[idx_row[outliers], idx_col[outliers]] = median_val
+
+
+    return max_vals
+
 
 @njit("DictType(int32, float32)(int32[:], float32[:])", cache=True)
 def create_numba_dict_from(keys: np.ndarray, values: np.ndarray) -> dict[int, float]:
@@ -1631,7 +1730,9 @@ def Curve2Flood_MainFunction(input_file: str = None,
     Flood_WaterLC_and_STRM_Cells = ReadInputFile(lines,'Flood_WaterLC_and_STRM_Cells')
     LAND_WaterValue = ReadInputFile(lines,'LAND_WaterValue')
     LAND_WaterValue = int(LAND_WaterValue)
-    Bathy_Use_Banks = bool(ReadInputFile(lines,'Bathy_Use_Banks'))
+    # Find the True/False variable to use the bank elevations to calculate the depth of the bathymetry estimate
+    Bathy_Use_Banks = ReadInputFile(lines,'Bathy_Use_Banks')
+
 
     # Some checks
     if not FlowFileName:
@@ -1750,7 +1851,6 @@ def Curve2Flood_MainFunction(input_file: str = None,
     #Go through all the Flow Events
     Flood_array_list = []
     Depth_array_list = []
-    WSE_array_list = []
     Slope_array_list = []
     Velocity_array_list = []
     for flow_event_num in range(num_flows):
@@ -1761,11 +1861,10 @@ def Curve2Flood_MainFunction(input_file: str = None,
         #Get an Average Flow rate associated with each stream reach.
         if Set_Depth<=0.000000001:
             COMID_Unique_Flow = FindFlowRateForEachCOMID_Ensemble(FlowFileName, flow_event_num)
-        Flood_array, Depth_array, WSE_array, Slope_Array, Velocity_array = Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, COMID_Unique_Flow, CurveParamFileName, VDTDatabaseFileName, Q_Fraction, TopWidthPlausibleLimit, TW_MultFact, WeightBox, TW_for_WeightBox_ElipseMask, LocalFloodOption, Set_Depth, quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast, V_Rast, OutDEP, OutWSE, OutVEL, linkno_to_twlimit=linkno_to_twlimit)        
+        Flood_array, Depth_array, Velocity_array, Slope_array = Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, COMID_Unique_Flow, CurveParamFileName, VDTDatabaseFileName, Q_Fraction, TopWidthPlausibleLimit, TW_MultFact, WeightBox, TW_for_WeightBox_ElipseMask, LocalFloodOption, Set_Depth, quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast, V_Rast, OutDEP, OutWSE, OutVEL, linkno_to_twlimit=linkno_to_twlimit)        
         Flood_array_list.append(Flood_array)
         Depth_array_list.append(Depth_array)
-        WSE_array_list.append(WSE_array)
-        Slope_array_list.append(Slope_Array)
+        Slope_array_list.append(Slope_array)
         Velocity_array_list.append(Velocity_array)
 
     # Combine all flow events into a single ensemble
@@ -1798,57 +1897,40 @@ def Curve2Flood_MainFunction(input_file: str = None,
     out_ds.FlushCache()
     out_ds = None  # Close the dataset to ensure it's written to disk
 
+
     if OutDEP:
-        Depth_Array = create_depth_or_wse_or_velocity(num_flows, Depth_array_list, Flood_Ensemble, S, dem_geotransform, dem_projection, ncols, nrows, OutDEP)
+        Depth_Array = create_depth(num_flows, Depth_array_list, Flood_Ensemble, S, E, dem_geotransform, dem_projection, ncols, nrows, OutDEP)
 
-    if OutWSE:
-        WSE_Array = create_depth_or_wse_or_velocity(num_flows, WSE_array_list, Flood_Ensemble, S, dem_geotransform, dem_projection, ncols, nrows, OutWSE)
+    if OutDEP and OutWSE:
+        WSE_Array = np.where((Depth_Array > 0) & (E[1:-1, 1:-1] > -9998.0), Depth_Array+E[1:-1, 1:-1], np.nan).astype(np.float32)
 
-    if OutVEL:
-        # find the average slope across ensembles, ignoring NaNs when calculating an average with NaNs mixed in
-        # Stack them into one 3D array
-        slopes_stacked = np.stack(Slope_array_list, axis=0).astype(np.float32)   # shape: (n_arrays, nrows+2, ncols+2)
+        
+        # --- Write GeoTIFF ---
+        driver = gdal.GetDriverByName("GTiff")
+        ds: gdal.Dataset = driver.Create(
+            OutWSE, ncols, nrows, 1, gdal.GDT_Float32,
+            options=["COMPRESS=DEFLATE", "PREDICTOR=2", "TILED=YES"]
+        )
+        if ds is None:
+            raise RuntimeError(f"Failed to create output raster: {OutDEP}")
 
-        sum_s   = np.nansum(slopes_stacked, axis=0, dtype=np.float64)
-        count_s = np.sum(~np.isnan(slopes_stacked), axis=0)
+        ds.SetGeoTransform(dem_geotransform)
+        ds.SetProjection(dem_projection)
 
-        # Compute mean along the first axis, ignoring NaNs
-        Slope_Array = np.divide(
-            sum_s, count_s,
-            out=np.full_like(sum_s, np.nan, dtype=np.float64),
-            where=(count_s > 0)
-        ).astype(np.float32)
+        band = ds.GetRasterBand(1)
+        band.WriteArray(WSE_Array)
+        band.SetNoDataValue(-9999.0)
+        band.FlushCache()
+        ds.FlushCache()
 
+        # Cleanup
+        band = None
+        ds = None
 
-        # nodata_value = np.nan
-        # out_band_data = np.where(np.isnan(Slope_Array), nodata_value, Slope_Array).astype(np.float32)
-
-        # driver = gdal.GetDriverByName("GTiff")
-        # ds: gdal.Dataset = driver.Create(
-        #     r"C:\Users\jlgut\OneDrive\Desktop\nencarta_libraries\Test_Cases\UTAH_TestforWettedP\Results\UTAH_TestCase_NenCarta_WseBanks_NotClean\FloodMap\Slope_Array.tif", 
-        #     ncols, nrows, 1, gdal.GDT_Float32,
-        #     options=["COMPRESS=DEFLATE", "PREDICTOR=2", "TILED=YES"]
-        # )
-        # if ds is None:
-        #     raise RuntimeError(f"Failed to create output raster: {OutVEL}")
-
-        # ds.SetGeoTransform(dem_geotransform)
-        # ds.SetProjection(dem_projection)
-
-        # band = ds.GetRasterBand(1)
-        # band.WriteArray(out_band_data)
-        # band.SetNoDataValue(nodata_value)
-        # band.FlushCache()
-        # ds.FlushCache()
-
-        # band = None
-        # ds = None
-
-        # print("Slope stats:", np.nanmin(Slope_Array), np.nanmedian(Slope_Array), np.nanmax(Slope_Array))
-
+    if OutVEL and OutDEP:
         # Create the velocity output raster
-        # VEL_Array = create_depth_or_wse_or_velocity(num_flows, Velocity_array_list, Flood_Ensemble, S, dem_geotransform, dem_projection, ncols, nrows, OutVEL)
-        create_velocity_output(OutVEL, Depth_Array, LU_Manning_n, LC_array, Slope_Array, dem_geotransform, dem_projection, ncols, nrows, Flood_Ensemble, Velocity_array_list, S)
+        # VEL_Array = create_depth_or_wse(num_flows, Velocity_array_list, Flood_Ensemble, S, dem_geotransform, dem_projection, ncols, nrows, OutVEL)
+        create_velocity(OutVEL, Depth_Array, LU_Manning_n, LC_array, Slope_array_list, dem_geotransform, dem_projection, ncols, nrows, Flood_Ensemble, Velocity_array_list, S)
 
 
     if StrmShp_File:
