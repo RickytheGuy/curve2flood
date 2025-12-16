@@ -2,10 +2,11 @@
 #This code looks at a DEM raster to find the dimensions, then writes a script to create a STRM raster.
 # built-in imports
 import gc
+import json
+import math
 import sys
 import os
 from datetime import datetime
-import json
 
 # third-party imports
 try:
@@ -28,18 +29,14 @@ import pandas as pd
 import geopandas as gpd
 # from scipy.interpolate import interp1d
 from scipy.ndimage import label, generate_binary_structure, distance_transform_edt
-
 from shapely.geometry import shape
-
 import rasterio
 from rasterio.features import rasterize
-
 from curve2flood import LOG
 
 gdal.UseExceptions()
 
-from numba import njit
-import numpy as np
+COMID_FLOW_DICT_TYPE = types.DictType(types.int32, types.float32)
 
 def read_manning_table(s_manning_path: str, da_input_mannings: np.ndarray):
     """
@@ -75,7 +72,7 @@ from scipy import ndimage as ndi
 
 def create_velocity(OutVEL, Depth_Array, LU_Manning_n, LC_array, Slope_array_list,
                            geotransform, projection, ncols, nrows,
-                           Flood_Ensemble, Velocity_array_list, S):
+                           Flood_Ensemble, S):
     """
     """
 
@@ -335,7 +332,7 @@ def filter_outliers(group):
 
     return group
 
-def Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName: str, COMID_Unique_Flow: dict, COMID_Unique, T_Rast, W_Rast, S_Rast, V_Rast, TW_MultFact):
+def Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName: str, COMID_Unique_Flow: dict, COMID_Unique, T_Rast, W_Rast, S_Rast, TW_MultFact):
 
     LOG.debug('\nOpening and Reading ' + CurveParamFileName)
 
@@ -367,7 +364,6 @@ def Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName: str, COMID_Uniqu
     for index, row in curve_df.iterrows():
         T_Rast[int(row['Row']), int(row['Col'])] = row['TopWidth'] * TW_MultFact
         W_Rast[int(row['Row']), int(row['Col'])] = row['Depth'] + row['BaseElev']
-        V_Rast[int(row['Row']), int(row['Col'])] = row['Velocity']
         if S_Rast is not None:
             S_Rast[int(row['Row']), int(row['Col'])] = row['Slope']
 
@@ -399,7 +395,7 @@ def Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName: str, COMID_Uniqu
     # Get the maximum TopWidth for all COMIDs
     TopWidthMax = comid_result_df['TopWidth'].max()
 
-    return (COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, TopWidthMax, T_Rast, W_Rast, S_Rast, V_Rast)
+    return (COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, TopWidthMax, T_Rast, W_Rast, S_Rast)
 
 # @njit(cache=True)
 @njit("float32(float32, float32[:], float32[:])", cache=True)
@@ -468,7 +464,7 @@ def interp1d_numba(x: np.ndarray, y: np.ndarray, xi: float | int) -> float:
 
     return y0 + (xi - x0) * (y1 - y0) / (x1 - x0) if (x1 - x0) != 0 else y0
 
-@njit("Tuple((float32[:], float32[:], float32[:], float32[:]))(float32[:], float32[:], float32[:,:], float32[:, :], float32[:], float32[:, :], float32[:, :], float64[:], float32)",
+@njit("Tuple((float32[:], float32[:], float32[:], float32[:]))(float32[:], float32[:], float32[:,:], float32[:, :], float32[:], float32[:, :], float32[:, :], float32[:], float32)",
       cache=True)
 def vdt_interpolate(flow: np.ndarray,
                     qb: np.ndarray, 
@@ -514,7 +510,7 @@ def vdt_interpolate(flow: np.ndarray,
     
     return top_width, depth, wse, vel
 
-def Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E_DEM, VDTDatabaseFileName: str, COMID_Unique_Flow: dict, COMID_Unique, T_Rast, W_Rast, S_Rast, V_Rast, TW_MultFact):    
+def Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E_DEM, VDTDatabaseFileName: str, COMID_Unique_Flow: dict, COMID_Unique, T_Rast, W_Rast, S_Rast, TW_MultFact):    
     LOG.debug('\nOpening and Reading ' + VDTDatabaseFileName)
     
     # Read the VDT Database into a DataFrame
@@ -581,7 +577,6 @@ def Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E_DEM, VDTDatabaseFileName: str, C
     # Fill T_Rast, W_Rast, and S_Rast
     T_Rast[vdt_df['Row'], vdt_df['Col']] = vdt_df['TopWidth']
     W_Rast[vdt_df['Row'], vdt_df['Col']] = vdt_df['WSE']
-    V_Rast[vdt_df['Row'], vdt_df['Col']] = vdt_df['Velocity']
     if S_Rast is not None:
         S_Rast[vdt_df['Row'], vdt_df['Col']] = vdt_df['Slope']
     
@@ -617,7 +612,6 @@ def Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E_DEM, VDTDatabaseFileName: str, C
         T_Rast,
         W_Rast,
         S_Rast,
-        V_Rast,
     )
   
 def Get_Raster_Details(DEM_File):
@@ -916,12 +910,198 @@ def create_weightbox(tw: int, dx: float, dy: float):
 
 
 @njit(cache=True)
-def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, V_Rast, E, B, nrows, ncols, sd, TW_m, dx, dy, LocalFloodOption, COMID_Unique_TW: dict, COMID_Unique_Depth: dict, COMID_Unique_Velocity: dict, WeightBox, TW_for_WeightBox_ElipseMask, TW, TW_MultFact, TopWidthPlausibleLimit, Set_Depth, flood_vdt_cells, OutDEP, OutWSE, OutVEL):
+def propagate_wse_fast_convergent(WSE_Divided_by_weight, E, nrows, ncols):
+    """
+    Iteratively spreads the Water Surface Elevation (WSE) until convergence,
+    using fixed-size buffers for Numba stability.
+    """
+    WSE_Out = WSE_Divided_by_weight.copy()
+    
+    # Calculate maximum domain size for fixed buffers
+    max_domain_size = (nrows + 2) * (ncols + 2)
+    
+    # 1. Initialize Active Set
+    # (WSE_Out > E) checks where water exists above ground
+    initial_wet_mask = (WSE_Out > E) & (E > -9998.0)
+    
+    # Cast to int32 explicitly for Numba
+    wet_rows_64, wet_cols_64 = np.where(initial_wet_mask)
+    active_rows = wet_rows_64.astype(np.int32)
+    active_cols = wet_cols_64.astype(np.int32)
+    
+    # Pre-allocate fixed buffers
+    next_rows_buffer = np.empty(max_domain_size, dtype=np.int32)
+    next_cols_buffer = np.empty(max_domain_size, dtype=np.int32)
+    
+    neighbor_offsets = np.array([
+        [-1, -1], [-1, 0], [-1, 1],
+        [0, -1], [0, 1],
+        [1, -1], [1, 0], [1, 1]
+    ], dtype=np.int32)
+    
+    iteration = 0
+    
+    while active_rows.size > 0:
+        iteration += 1
+        current_active_size = active_rows.size
+        next_active_count = 0
+                   
+        for i in range(current_active_size):
+            r, c = active_rows[i], active_cols[i]
+            WSE_source = WSE_Out[r, c]
+
+            for j in range(8):
+                dr = neighbor_offsets[j, 0]
+                dc = neighbor_offsets[j, 1]
+                r_adj, c_adj = r + dr, c + dc
+                
+                # Boundary check
+                if 0 <= r_adj < nrows + 2 and 0 <= c_adj < ncols + 2:
+                    E_adj = E[r_adj, c_adj]
+                    WSE_adj = WSE_Out[r_adj, c_adj]
+                    
+                    # Only process valid DEM cells
+                    if E_adj > -9998.0:
+                        # Only dry cells
+                        if WSE_adj <= E_adj:
+                            # Only flood if source water level is above this ground
+                            if WSE_source > E_adj:
+                                # New water level is source level
+                                WSE_Out[r_adj, c_adj] = WSE_source
+                                
+                                # Now it's newly wet -> add to queue
+                                if next_active_count < max_domain_size:
+                                    next_rows_buffer[next_active_count] = r_adj
+                                    next_cols_buffer[next_active_count] = c_adj
+                                    next_active_count += 1
+                        
+
+        if next_active_count > 0:
+            active_rows = next_rows_buffer[:next_active_count].copy()
+            active_cols = next_cols_buffer[:next_active_count].copy()
+        else:
+            active_rows = np.empty(0, dtype=np.int32) 
+
+    return WSE_Out
+
+@njit(cache=True)
+def hydraulic_flood_fill(
+    E,
+    WSE_channel,
+    is_channel,
+    nrows,
+    ncols,
+    cellsize,
+    loss_per_meter,
+    nodata_elev=-9998.0,
+    nodata_wse=-9999.0
+):
+    """
+    Compute domain-wide WSE by hydraulic flood-fill from channel WSE,
+    using a BFS-style active set (Numba-friendly).
+
+    E           : (nrows+2, ncols+2) DEM (padded)
+    WSE_channel : (nrows+2, ncols+2) WSE only at channel cells (else nodata_wse)
+    is_channel  : (nrows+2, ncols+2) 0/1 mask of channel cells
+    """
+
+    # Initialize output
+    WSE_out = np.full(E.shape, nodata_wse, dtype=np.float64)
+
+    max_domain_size = (nrows + 2) * (ncols + 2)
+    active_rows = np.empty(max_domain_size, dtype=np.int32)
+    active_cols = np.empty(max_domain_size, dtype=np.int32)
+    active_count = 0
+
+    # --- 1. Seed from channel cells ---
+    for r in range(nrows + 2):
+        for c in range(ncols + 2):
+            if is_channel[r, c] != 0 and E[r, c] > nodata_elev:
+                wse_ch = WSE_channel[r, c]
+                if wse_ch > E[r, c]:
+                    WSE_out[r, c] = wse_ch
+                    active_rows[active_count] = r
+                    active_cols[active_count] = c
+                    active_count += 1
+
+    # If no seeds, return nodata_wse everywhere
+    if active_count == 0:
+        return WSE_out
+
+    # 4-neighbor connectivity (you can expand to 8-neighbor if you want)
+    neighbor_offsets = np.array([
+        [-1, 0],
+        [ 1, 0],
+        [ 0,-1],
+        [ 0, 1]
+    ], dtype=np.int32)
+
+    # Working buffers for next frontier
+    next_rows = np.empty(max_domain_size, dtype=np.int32)
+    next_cols = np.empty(max_domain_size, dtype=np.int32)
+
+    # --- 2. BFS-style propagation ---
+    while active_count > 0:
+        next_count = 0
+
+        for i in range(active_count):
+            r = active_rows[i]
+            c = active_cols[i]
+            WSE_source = WSE_out[r, c]
+
+            for k in range(4):
+                rr = r + neighbor_offsets[k, 0]
+                cc = c + neighbor_offsets[k, 1]
+
+                # Boundary
+                if rr < 0 or rr >= (nrows + 2) or cc < 0 or cc >= (ncols + 2):
+                    continue
+
+                E_adj = E[rr, cc]
+                if E_adj <= nodata_elev:
+                    continue
+
+                # Distance (4-neighbors => cellsize)
+                dist = cellsize
+
+                # Monotone-decay water surface
+                candidate_wse = WSE_source - loss_per_meter * dist
+
+                # Must be above ground to flood
+                if candidate_wse <= E_adj:
+                    continue
+
+                # Only update if we improve neighbor WSE
+                if candidate_wse > WSE_out[rr, cc]:
+                    WSE_out[rr, cc] = candidate_wse
+
+                    # Add neighbor to next active list
+                    next_rows[next_count] = rr
+                    next_cols[next_count] = cc
+                    next_count += 1
+
+        # Advance frontier
+        active_count = next_count
+        for i in range(active_count):
+            active_rows[i] = next_rows[i]
+            active_cols[i] = next_cols[i]
+
+    return WSE_out
+
+
+@njit(cache=True)
+def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, E, B, nrows, ncols, sd, TW_m, dx, dy, LocalFloodOption, 
+                         COMID_Unique_TW: COMID_FLOW_DICT_TYPE,   # <--- FIX THIS
+                         COMID_Unique_Depth: COMID_FLOW_DICT_TYPE, # <--- FIX THIS
+                         COMID_Unique_Velocity: COMID_FLOW_DICT_TYPE, # <--- FIX THIS
+                         WeightBox, TW_for_WeightBox_ElipseMask, TW, TW_MultFact, TopWidthPlausibleLimit, Set_Depth, flood_vdt_cells, OutDEP, OutWSE, OutVEL):
        
     COMID_Averaging_Method = 0
+
+
+
     
     WSE_Times_Weight = np.zeros((nrows+2,ncols+2), dtype=np.float32)
-    V_Times_Weight = np.zeros((nrows+2,ncols+2), dtype=np.float32)
     # make the slope times weight array only if S_Rast is provided
     if S_Rast is not None:
         # make the NaN values NaN in the Slope_Times_Weight array
@@ -938,10 +1118,10 @@ def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, V_Rast, E, B, nrows, nc
         E_Min = E[r,c]
         
         COMID_Value = B[r,c]
+        # Flow_Value = float(COMID_Unique_Flow[COMID_Value])
         #Now start with rows and start flooding everything in site
         if Set_Depth>0.0:
             WSE = float(E[r_use,c_use] + Set_Depth)
-            V = float(V_Rast[r_use,c_use])
             if S_Rast is not None:
                 SLOPE = float(S_Rast[r_use,c_use])
             COMID_TW_m = TopWidthPlausibleLimit
@@ -959,14 +1139,12 @@ def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, V_Rast, E, B, nrows, nc
             else:
                 COMID_D = np.float32(0.0)
             WSE = float(E[r_use,c_use] + COMID_D)
-            V = float(V_Rast[r_use,c_use])
             if S_Rast is not None:
                 SLOPE = float(S_Rast[r_use,c_use])
         else:
             #These are Based on the AutoRoute Results, not averaged for COMID
             WSE = W_Rast[r-1,c-1]  #Have to have the '-1' because of the Row and Col being inset on the B raster.
             COMID_TW_m = T_Rast[r-1,c-1]
-            V = V_Rast[r-1,c-1]
             if S_Rast is not None:
                 SLOPE = S_Rast[r-1,c-1]
             #print(str(WSE) + '  ' + str(COMID_TW_m))
@@ -1012,22 +1190,34 @@ def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, V_Rast, E, B, nrows, nc
             E_Box = E[r_min:r_max,c_min:c_max]
             FloodLocalMask = FloodAllLocalAreas(WSE, E_Box, r_min, r_max, c_min, c_max, r_use, c_use)
             WSE_Times_Weight[r_min:r_max, c_min:c_max] += (WSE * weight_slice * FloodLocalMask)
-            V_Times_Weight[r_min:r_max, c_min:c_max] += (V * weight_slice * FloodLocalMask)
             if S_Rast is not None:
                 Slope_Times_Weight[r_min:r_max, c_min:c_max] += (SLOPE * weight_slice * FloodLocalMask)
         else:
             WSE_Times_Weight[r_min:r_max, c_min:c_max] += (WSE * weight_slice)
-            V_Times_Weight[r_min:r_max, c_min:c_max] += (V * weight_slice)
             if S_Rast is not None:
                 Slope_Times_Weight[r_min:r_max, c_min:c_max] += (SLOPE * weight_slice)
 
         Total_Weight[r_min:r_max,c_min:c_max] += weight_slice
 
+    is_channel = np.where(B > 0, 1, 0).astype(np.uint8)
+
     # divide the values in WSE_Times_Weight by the 
-    # values in Total_Weight
+    # values in Total_Weight   
     Total_Weight = np.where(Total_Weight == 0, 1e-12, Total_Weight)  # Avoid division by zero
     WSE_divided_by_weight = WSE_Times_Weight / Total_Weight
-    V_divided_by_weight = V_Times_Weight / Total_Weight
+    # loss_per_meter = 1e-4  # for pure bathtub; try 1e-4 or 1e-3 for decay
+    # WSE_divided_by_weight = hydraulic_flood_fill(
+    #     E,
+    #     W_Rast,
+    #     is_channel,
+    #     nrows,
+    #     ncols,
+    #     max(dx, dy),        # your grid resolution
+    #     loss_per_meter
+    # )
+
+    # # iteratively fill in the WSE values until convergence
+    # WSE_divided_by_weight = propagate_wse_fast_convergent(WSE_divided_by_weight, E, nrows, ncols)
 
     # Create the Flooded array
     Flooded_array = np.where((WSE_divided_by_weight>E)&(E>-9998.0), 1, 0).astype(np.uint8)
@@ -1043,28 +1233,15 @@ def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, V_Rast, E, B, nrows, nc
     else:
         Depth_array = np.empty((3, 3), dtype=np.float32) # Dummy array if not used
 
-    # # Create the WSE array
-    # if OutWSE:
-    #     WSE_array = np.where((WSE_divided_by_weight > E) & (E > -9998.0), WSE_divided_by_weight, np.nan).astype(np.float32)
-    # else:
-    #     WSE_array = np.empty((3, 3), dtype=np.float32) # Dummy array if not used
-    
-    # Create the WSE array
-    if OutVEL:
-        Velocity_array = np.where((WSE_divided_by_weight > E) & (E > -9998.0), V_divided_by_weight, np.nan).astype(np.float32)
-    else:
-        Velocity_array = np.empty((3, 3), dtype=np.float32) # Dummy array if not used
-
     # if you want, create the slope array
     if S_Rast is not None:
         Slope_divided_by_weight = Slope_Times_Weight / Total_Weight
         Slope_array = np.where((WSE_divided_by_weight > E) & (E > -9998.0), Slope_divided_by_weight, np.nan).astype(np.float32)
         Slope_array = np.where((Slope_array <= 0), 0.0002, Slope_array).astype(np.float32)
-        # return Flooded_array[1:-1, 1:-1], Depth_array[1:-1, 1:-1], WSE_array[1:-1, 1:-1], V_array[1:-1, 1:-1], Slope_array[1:-1, 1:-1]
-        return Flooded_array[1:-1, 1:-1], Depth_array[1:-1, 1:-1], Velocity_array[1:-1, 1:-1], Slope_array[1:-1, 1:-1]
+        return Flooded_array[1:-1, 1:-1], Depth_array[1:-1, 1:-1], Slope_array[1:-1, 1:-1]
 
 
-    return Flooded_array[1:-1, 1:-1], Depth_array[1:-1, 1:-1], Velocity_array[1:-1, 1:-1], None
+    return Flooded_array[1:-1, 1:-1], Depth_array[1:-1, 1:-1], None
 
 @njit("float32[:](float32)", cache=True)
 def create_gaussian_kernel_1d(sigma):
@@ -1245,7 +1422,7 @@ def Create_Topobathy_Dataset(
     # 10) Return interior (arrays are padded by 1)
     return filled[1:nrows+1, 1:ncols+1]
 
-def Calculate_Depth_TopWidth_TWMax_Velocity(E, CurveParamFileName, VDTDatabaseFileName, COMID_Unique_Flow, COMID_Unique, Q_Fraction, T_Rast, W_Rast, S_Rast, V_Rast, TW_MultFact, TopWidthPlausibleLimit, dx, dy, Set_Depth, quiet, linkno_to_twlimit=None):
+def Calculate_Depth_TopWidth_TWMax_Velocity(E, CurveParamFileName, VDTDatabaseFileName, COMID_Unique_Flow, COMID_Unique, Q_Fraction, T_Rast, W_Rast, S_Rast, TW_MultFact, TopWidthPlausibleLimit, dx, dy, Set_Depth, quiet, linkno_to_twlimit=None):
     # Initialize all dictionaries
     COMID_Unique_TW = {}
     COMID_Unique_Depth = {}
@@ -1270,9 +1447,9 @@ def Calculate_Depth_TopWidth_TWMax_Velocity(E, CurveParamFileName, VDTDatabaseFi
         TopWidthMax = TopWidthPlausibleLimit 
     #Mike switched to default to VDT Database instead of Curve.  We can change this in the future.
     elif len(VDTDatabaseFileName)>1:
-        (COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, TopWidthMax, T_Rast, W_Rast, S_Rast, V_Rast) = Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E, VDTDatabaseFileName, COMID_Unique_Flow, COMID_Unique, T_Rast, W_Rast, S_Rast, V_Rast, TW_MultFact)
+        (COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, TopWidthMax, T_Rast, W_Rast, S_Rast) = Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E, VDTDatabaseFileName, COMID_Unique_Flow, COMID_Unique, T_Rast, W_Rast, S_Rast, TW_MultFact)
     elif len(CurveParamFileName)>1:
-        (COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, TopWidthMax, T_Rast, W_Rast, S_Rast, V_Rast) = Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName, COMID_Unique_Flow, COMID_Unique,  T_Rast, W_Rast, S_Rast, V_Rast, TW_MultFact)
+        (COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, TopWidthMax, T_Rast, W_Rast, S_Rast) = Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName, COMID_Unique_Flow, COMID_Unique,  T_Rast, W_Rast, S_Rast, TW_MultFact)
 
     LOG.info('Maximum Top Width = ' + str(TopWidthMax))
     
@@ -1289,12 +1466,12 @@ def Calculate_Depth_TopWidth_TWMax_Velocity(E, CurveParamFileName, VDTDatabaseFi
     Y_cells = np.round(TopWidthMax/dy,0)
     TW = int(max(Y_cells,X_cells))  #This is how many cells we will be looking at surrounding our stream cell
     
-    return COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, TopWidthMax, TW, T_Rast, W_Rast, S_Rast, V_Rast
+    return COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, TopWidthMax, TW, T_Rast, W_Rast, S_Rast
 
-def Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, COMID_Unique_Flow, CurveParamFileName, VDTDatabaseFileName, Q_Fraction, TopWidthPlausibleLimit, TW_MultFact, WeightBox, TW_for_WeightBox_ElipseMask, LocalFloodOption, Set_Depth, quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast, V_Rast, OutDEP, OutWSE, OutVEL, linkno_to_twlimit=None):    
+def Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, COMID_Unique_Flow, CurveParamFileName, VDTDatabaseFileName, Q_Fraction, TopWidthPlausibleLimit, TW_MultFact, WeightBox, TW_for_WeightBox_ElipseMask, LocalFloodOption, Set_Depth, quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast, OutDEP, OutWSE, OutVEL, linkno_to_twlimit=None):    
     #Calculate an Average Top Width and Depth for each stream reach.
     #  The Depths are purposely adjusted to the DEM that you are using (this addresses issues with using the original or bathy dem)
-    (COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, TopWidthMax, TW, T_Rast, W_Rast, S_Rast, V_Rast) = Calculate_Depth_TopWidth_TWMax_Velocity(E, CurveParamFileName, VDTDatabaseFileName, COMID_Unique_Flow, COMID_Unique, Q_Fraction, T_Rast, W_Rast, S_Rast, V_Rast, TW_MultFact, TopWidthPlausibleLimit, dx, dy, Set_Depth, quiet, linkno_to_twlimit=linkno_to_twlimit)
+    (COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, TopWidthMax, TW, T_Rast, W_Rast, S_Rast) = Calculate_Depth_TopWidth_TWMax_Velocity(E, CurveParamFileName, VDTDatabaseFileName, COMID_Unique_Flow, COMID_Unique, Q_Fraction, T_Rast, W_Rast, S_Rast, TW_MultFact, TopWidthPlausibleLimit, dx, dy, Set_Depth, quiet, linkno_to_twlimit=linkno_to_twlimit)
     
     #Create a simple Flood Map Data
     search_dist_for_min_elev = 0
@@ -1312,9 +1489,9 @@ def Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, COMID_Unique_F
     COMID_Unique_Depth = create_numba_dict_from(keys_dep, vals_dep)
     COMID_Unique_Velocity = create_numba_dict_from(keys_vel, vals_vel)
 
-    Flood_array, Depth_array, Velocity_array, Slope_array  = CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, V_Rast, E, B, nrows, ncols, search_dist_for_min_elev, TopWidthMax, dx, dy, LocalFloodOption, COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, WeightBox, TW_for_WeightBox_ElipseMask, TW, TW_MultFact, TopWidthPlausibleLimit, Set_Depth, flood_vdt_cells, OutDEP, OutWSE, OutVEL)
+    Flood_array, Depth_array, Slope_array  = CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, E, B, nrows, ncols, search_dist_for_min_elev, TopWidthMax, dx, dy, LocalFloodOption, COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, WeightBox, TW_for_WeightBox_ElipseMask, TW, TW_MultFact, TopWidthPlausibleLimit, Set_Depth, flood_vdt_cells, OutDEP, OutWSE, OutVEL)
     
-    return Flood_array, Depth_array, Velocity_array, Slope_array
+    return Flood_array, Depth_array, Slope_array
 
 
 def Set_Stream_Locations(nrows: int, ncols: int, infilename: str):
@@ -1760,7 +1937,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
     yll = dem_geotransform[3] - nrows * abs(dem_geotransform[5])
     yur = dem_geotransform[3]
     
-    E = np.full((nrows+2, ncols+2), -9999.0)  #Create an array that is slightly larger than the STRM Raster Array and fill it with -9999.0
+    E = np.full((nrows+2, ncols+2), -9999.0, dtype=np.float32)  #Create an array that is slightly larger than the STRM Raster Array and fill it with -9999.0
     E[1:-1, 1:-1] = ds.ReadAsArray()
     ds = None  
 
@@ -1841,7 +2018,6 @@ def Curve2Flood_MainFunction(input_file: str = None,
     # Create initial rasters once, outside the loop
     T_Rast = np.empty((nrows,ncols), np.float32)
     W_Rast = np.empty((nrows,ncols), np.float32)
-    V_Rast = np.empty((nrows,ncols), np.float32)
     if OutVEL:
         S_Rast = np.empty((nrows,ncols), np.float32)
     else:
@@ -1852,7 +2028,6 @@ def Curve2Flood_MainFunction(input_file: str = None,
     Flood_array_list = []
     Depth_array_list = []
     Slope_array_list = []
-    Velocity_array_list = []
     for flow_event_num in range(num_flows):
         LOG.info('Working on Flow Event ' + str(flow_event_num))
         # clear out last event’s values
@@ -1861,11 +2036,11 @@ def Curve2Flood_MainFunction(input_file: str = None,
         #Get an Average Flow rate associated with each stream reach.
         if Set_Depth<=0.000000001:
             COMID_Unique_Flow = FindFlowRateForEachCOMID_Ensemble(FlowFileName, flow_event_num)
-        Flood_array, Depth_array, Velocity_array, Slope_array = Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, COMID_Unique_Flow, CurveParamFileName, VDTDatabaseFileName, Q_Fraction, TopWidthPlausibleLimit, TW_MultFact, WeightBox, TW_for_WeightBox_ElipseMask, LocalFloodOption, Set_Depth, quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast, V_Rast, OutDEP, OutWSE, OutVEL, linkno_to_twlimit=linkno_to_twlimit)        
+        Flood_array, Depth_array, Slope_array = Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, COMID_Unique_Flow, CurveParamFileName, VDTDatabaseFileName, Q_Fraction, TopWidthPlausibleLimit, TW_MultFact, WeightBox, TW_for_WeightBox_ElipseMask, LocalFloodOption, Set_Depth, quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast, OutDEP, OutWSE, OutVEL, linkno_to_twlimit=linkno_to_twlimit)        
+        Flood_array = remove_cells_not_connected(Flood_array, S)
         Flood_array_list.append(Flood_array)
         Depth_array_list.append(Depth_array)
         Slope_array_list.append(Slope_array)
-        Velocity_array_list.append(Velocity_array)
 
     # Combine all flow events into a single ensemble
     #Turn into a percentage
@@ -1930,7 +2105,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
     if OutVEL and OutDEP:
         # Create the velocity output raster
         # VEL_Array = create_depth_or_wse(num_flows, Velocity_array_list, Flood_Ensemble, S, dem_geotransform, dem_projection, ncols, nrows, OutVEL)
-        create_velocity(OutVEL, Depth_Array, LU_Manning_n, LC_array, Slope_array_list, dem_geotransform, dem_projection, ncols, nrows, Flood_Ensemble, Velocity_array_list, S)
+        create_velocity(OutVEL, Depth_Array, LU_Manning_n, LC_array, Slope_array_list, dem_geotransform, dem_projection, ncols, nrows, Flood_Ensemble, S)
 
 
     if StrmShp_File:
