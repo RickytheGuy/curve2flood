@@ -671,12 +671,15 @@ def GetListOfDEMs(inputfolder):
             DEM_Files.append(file)
     return DEM_Files
 
-def Write_Output_Raster(s_output_filename, raster_data, ncols, nrows, dem_geotransform, dem_projection, s_file_format, s_output_type):   
+def Write_Output_Raster(s_output_filename, raster_data, ncols, nrows, dem_geotransform, dem_projection, s_file_format, s_output_type, creation_options: list[str] = None):   
     o_driver = gdal.GetDriverByName(s_file_format)  #Typically will be a GeoTIFF "GTiff"
     #o_metadata = o_driver.GetMetadata()
+
+    if creation_options is None:
+        creation_options = ["COMPRESS=DEFLATE", 'PREDICTOR=2']
     
     # Construct the file with the appropriate data shape
-    o_output_file = o_driver.Create(s_output_filename, xsize=ncols, ysize=nrows, bands=1, eType=s_output_type, options=["COMPRESS=LZW", 'PREDICTOR=2'])    
+    o_output_file = o_driver.Create(s_output_filename, xsize=ncols, ysize=nrows, bands=1, eType=s_output_type, options=creation_options)    
 
     # Set the geotransform
     o_output_file.SetGeoTransform(dem_geotransform)
@@ -1815,7 +1818,8 @@ def create_numba_dict_from(keys: np.ndarray, values: np.ndarray) -> dict[int, fl
         d[keys[i]] = values[i]
     return d
 
-def create_bathymetry(E: np.ndarray, nrows: int, ncols: int, dem_geotransform: tuple, dem_projection: str, BathyFromARFileName: str, BathyWaterMaskFileName: str, Flood_Ensemble: np.ndarray, BathyOutputFileName: str, WeightBox: np.ndarray, TW_for_WeightBox_ElipseMask: int, Bathy_Use_Banks: bool):
+def create_bathymetry(E: np.ndarray, nrows: int, ncols: int, dem_geotransform: tuple, dem_projection: str, BathyFromARFileName: str, BathyWaterMaskFileName: str, 
+                      Flood_Ensemble: np.ndarray, BathyOutputFileName: str, WeightBox: np.ndarray, TW_for_WeightBox_ElipseMask: int, Bathy_Use_Banks: bool, bathymetry_creation_options: list[str] = None):
     LOG.info('Working on Bathymetry')
     ds: gdal.Dataset = gdal.Open(BathyFromARFileName)
     ARBathy = np.full((nrows+2, ncols+2), -9999.0, dtype=np.float32)  #Create an array that is slightly larger than the Bathy Raster Array
@@ -1838,12 +1842,13 @@ def create_bathymetry(E: np.ndarray, nrows: int, ncols: int, dem_geotransform: t
     ARBathy = Create_Topobathy_Dataset(E, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, ARBathy, ARBathyMask, Bathy_Use_Banks).astype(np.float32)  # enforce again just in case
 
     # write the Bathy output raster
-    Write_Output_Raster(BathyOutputFileName, ARBathy, ncols, nrows, dem_geotransform, dem_projection, "GTiff", gdal.GDT_Float32)
+    Write_Output_Raster(BathyOutputFileName, ARBathy, ncols, nrows, dem_geotransform, dem_projection, "GTiff", gdal.GDT_Float32, bathymetry_creation_options)
 
 def Curve2Flood_MainFunction(input_file: str = None,
                              args: dict = None, 
                              quiet: bool = False,
-                             flood_vdt_cells: bool = True):
+                             flood_vdt_cells: bool = True,
+                             bathymetry_creation_options: list[str] = None,):
 
     """
     Main function that takes runs the flood mapping. If an input file is provided, it reads the parameters from the file.
@@ -1860,6 +1865,8 @@ def Curve2Flood_MainFunction(input_file: str = None,
         If True, suppresses warning messages and progress bars.
     flood_vdt_cells : bool
         If True, includes VDT cells in the flood map.
+    bathymetry_creation_options : list[str]
+        List of options for bathymetry raster creation.
     """
     if input_file:
         #Open the Input File
@@ -2119,7 +2126,10 @@ def Curve2Flood_MainFunction(input_file: str = None,
         flood_gdf.to_file(shp_output_filename)
 
     if BathyFromARFileName and os.path.exists(BathyFromARFileName) and BathyOutputFileName:
-        create_bathymetry(E, nrows, ncols, dem_geotransform, dem_projection, BathyFromARFileName, BathyWaterMaskFileName, Flood_Ensemble, BathyOutputFileName, WeightBox, TW_for_WeightBox_ElipseMask, Bathy_Use_Banks)
+        create_bathymetry(E, nrows, ncols, dem_geotransform, dem_projection, 
+                          BathyFromARFileName, BathyWaterMaskFileName, Flood_Ensemble, 
+                          BathyOutputFileName, WeightBox, TW_for_WeightBox_ElipseMask, 
+                          Bathy_Use_Banks, bathymetry_creation_options)
 
     # Example of simulated execution
     LOG.info("Flood mapping completed.")
