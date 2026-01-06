@@ -20,7 +20,7 @@ except:
     from osgeo import ogr
     #from osgeo.gdalconst import GA_ReadOnly
 
-from numba import njit
+from numba import njit, prange
 from numba.core import types
 from numba.typed import Dict
     
@@ -36,7 +36,7 @@ from curve2flood import LOG
 
 gdal.UseExceptions()
 
-COMID_FLOW_DICT_TYPE = types.DictType(types.int32, types.float32)
+COMID_FLOW_DICT_TYPE = dict[np.int32, np.float32]
 
 def read_manning_table(s_manning_path: str, da_input_mannings: np.ndarray):
     """
@@ -1094,15 +1094,12 @@ def hydraulic_flood_fill(
 
 @njit(cache=True)
 def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, E, B, nrows, ncols, sd, TW_m, dx, dy, LocalFloodOption, 
-                         COMID_Unique_TW: COMID_FLOW_DICT_TYPE,   # <--- FIX THIS
-                         COMID_Unique_Depth: COMID_FLOW_DICT_TYPE, # <--- FIX THIS
-                         COMID_Unique_Velocity: COMID_FLOW_DICT_TYPE, # <--- FIX THIS
+                         COMID_Unique_TW: COMID_FLOW_DICT_TYPE,  
+                         COMID_Unique_Depth: COMID_FLOW_DICT_TYPE,
+                         COMID_Unique_Velocity: COMID_FLOW_DICT_TYPE,
                          WeightBox, TW_for_WeightBox_ElipseMask, TW, TW_MultFact, TopWidthPlausibleLimit, Set_Depth, flood_vdt_cells, OutDEP, OutWSE, OutVEL):
        
     COMID_Averaging_Method = 0
-
-
-
     
     WSE_Times_Weight = np.zeros((nrows+2,ncols+2), dtype=np.float32)
     # make the slope times weight array only if S_Rast is provided
@@ -1321,7 +1318,7 @@ def gaussian_blur_separable(image, sigma):
     return blurred
 
 
-# @njit(cache=True)
+@njit(cache=True, parallel=True)
 def Create_Topobathy_Dataset(
     E: np.ndarray,
     nrows: int,
@@ -1341,9 +1338,13 @@ def Create_Topobathy_Dataset(
     # ------------------------------------------------------------
     # 1) PRE-CLEANUP: Outside ARBathyMask, Bathy = DEM BEFORE weighting
     # ------------------------------------------------------------
-    Bathy = Bathy.astype(np.float32).copy()
-    revised_bathy_locations = (ARBathyMask == 1) & (Bathy < -98.99)
-    Bathy[revised_bathy_locations] = E[revised_bathy_locations]
+    Bathy = Bathy.astype(np.float32)
+    # revised_bathy_locations = (ARBathyMask == 1) & (Bathy < -98.99)
+    # Bathy[revised_bathy_locations] = E[revised_bathy_locations]
+    for r in prange(nrows + 2):
+        for c in prange(ncols + 2):
+            if ARBathyMask[r, c] != 1 and Bathy[r, c] < -98.99:
+                Bathy[r, c] = E[r, c]
 
     # 2) Identify valid bathy donors inside the water mask
     #    (same nodata threshold as before: > -98.99)
@@ -1398,29 +1399,44 @@ def Create_Topobathy_Dataset(
     invalid_mask = (Bathy <= -98.99) | (Bathy < -9998.0) | np.isnan(Bathy)
 
     # where we have weight support, use the weighted bathy
-    has_weight = invalid_mask & (total_weight > 1e-10)
-    filled[has_weight] = Bathy_weighted[has_weight]
+    # has_weight = invalid_mask & (total_weight > 1e-10)
+    # filled[has_weight] = Bathy_weighted[has_weight]
+    for r in prange(nrows + 2):
+        for c in prange(ncols + 2):
+            if invalid_mask[r, c] and total_weight[r, c] > 1e-10:
+                filled[r, c] = Bathy_weighted[r, c]
 
-    # where we still have invalid or zero weight, fall back to DEM
-    still_bad = ( (Bathy <= -98.99) | (Bathy < -9998.0) | np.isnan(Bathy) ) & ~has_weight
-    filled[still_bad] = E[still_bad]
+            if ( (Bathy[r, c] <= -98.99) | (Bathy[r, c] < -9998.0) | np.isnan(Bathy[r, c]) ) and not (invalid_mask[r, c] and total_weight[r, c] > 1e-10):
+                filled[r, c] = E[r, c]
 
     # 6) Optional extra smoothing (you can keep or weaken this)
     sigma_value = 1.0
     filled = gaussian_blur_separable(filled.astype(np.float32), sigma=sigma_value)
 
     # 7) Outside the AR bathy mask, always use DEM
-    mask_not_water = (ARBathyMask != 1)
-    filled[mask_not_water] = E[mask_not_water]
+    # mask_not_water = (ARBathyMask != 1)
+    # filled[mask_not_water] = E[mask_not_water]
+    for r in prange(nrows + 2):
+        for c in prange(ncols + 2):
+            if ARBathyMask[r, c] != 1:
+                filled[r, c] = E[r, c]
 
-    # 8) Final safety net: any remaining bad values → DEM
-    bad_mask = (filled <= -98.99) | (filled < -9998.0) | np.isnan(filled)
-    filled[bad_mask] = E[bad_mask]
+    # # 8) Final safety net: any remaining bad values → DEM
+    # bad_mask = (filled <= -98.99) | (filled < -9998.0) | np.isnan(filled)
+    # # filled[bad_mask] = E[bad_mask]
+    # for r in prange(nrows + 2):
+    #     for c in prange(ncols + 2):
+            if (filled[r, c] <= -98.99) | (filled[r, c] < -9998.0) | np.isnan(filled[r, c]):
+                filled[r, c] = E[r, c]
 
     # 9) Honor Bathy_Use_Banks: keep bathy from being above DEM if requested
     if Bathy_Use_Banks == False:
         above_dem = filled > E
-        filled[above_dem] = E[above_dem]
+        # filled[above_dem] = E[above_dem]
+        for r in prange(nrows + 2):
+            for c in prange(ncols + 2):
+                if above_dem[r, c]:
+                    filled[r, c] = E[r, c]
 
     # 10) Return interior (arrays are padded by 1)
     return filled[1:nrows+1, 1:ncols+1]
@@ -1999,13 +2015,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
     
     # COMID Flow File Read-in
     LOG.info('Opening and Reading ' + FlowFileName)
-    with open(FlowFileName, 'r') as infile:
-        header = infile.readline()
-        line = infile.readline()
-    
-    #Order from highest to lowest flow
-    ls = line.split(',')
-    num_flows = len(ls)-1
+    num_flows = pd.read_csv(FlowFileName, nrows=0).shape[1] - 1  #Subtract 1 for the COMID Column
     LOG.info('Evaluating ' + str(num_flows) + ' Flow Events')
     
     #Creating the initial Weight and Eclipse Boxes
@@ -2125,7 +2135,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
         # save the geodataframe (do not specify the driver, it will be inferred from the file extension)
         flood_gdf.to_file(shp_output_filename)
 
-    if BathyFromARFileName and os.path.exists(BathyFromARFileName) and BathyOutputFileName:
+    if BathyFromARFileName and BathyOutputFileName:
         create_bathymetry(E, nrows, ncols, dem_geotransform, dem_projection, 
                           BathyFromARFileName, BathyWaterMaskFileName, Flood_Ensemble, 
                           BathyOutputFileName, WeightBox, TW_for_WeightBox_ElipseMask, 
