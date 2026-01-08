@@ -358,7 +358,7 @@ def Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName: str, COMID_Uniqu
 
     # TO DO!!!  This needs to be redone to focus the bounds based on the COMID. This is taking out too many values (I think)
     # Apply the outlier filtering function to each COMID group
-    curve_df = curve_df.groupby('COMID', group_keys=False).apply(filter_outliers, include_groups=True)
+    curve_df = curve_df.groupby('COMID', group_keys=False).apply(filter_outliers, include_groups=False)
 
     # Fill in the T_Rast and W_Rast
     for index, row in curve_df.iterrows():
@@ -572,7 +572,7 @@ def Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E_DEM, VDTDatabaseFileName: str, C
 
     # TO DO!!!  This needs to be redone to focus the bounds based on the COMID. This is taking out too many values (I think)
     # Apply the outlier filtering function to each COMID group
-    vdt_df = vdt_df.groupby('COMID', group_keys=False).apply(filter_outliers, include_groups=True)
+    vdt_df: pd.DataFrame = vdt_df.groupby('COMID', group_keys=False).apply(lambda df: filter_outliers(df).assign(COMID=df.name), include_groups=False)
     
     # Fill T_Rast, W_Rast, and S_Rast
     T_Rast[vdt_df['Row'], vdt_df['Col']] = vdt_df['TopWidth']
