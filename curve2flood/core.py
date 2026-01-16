@@ -76,77 +76,15 @@ def create_velocity(OutVEL, Depth_Array, LU_Manning_n, LC_array, Slope_array_lis
     """
     """
 
-    # # --- 1) Ensemble-average velocity (unchanged) ---
-    # sum_arr = np.nansum(Velocity_array_list, axis=0).astype(np.float32)
-    # valid_count = np.sum(~np.isnan(Velocity_array_list), axis=0)
-
-    # avg = np.full_like(Flood_Ensemble, np.nan, dtype=np.float32)
-    # np.divide(sum_arr, valid_count, out=avg, where=(valid_count > 0)).astype(np.float32)
-
-    # VEL_Array = avg.astype(np.float32)
-
-    # # # ------------------------------------------------------------------
-    # # # 3) PER-SEGMENT NORMALIZATION of (1/n) * depth
-    # # # ------------------------------------------------------------------
-
-    # # raw weight field: (1/n) * depth  (you can use depth**(2/3) if you prefer)
-    # weight = (1.0 / da_input_mannings) * Depth_Array
-    # # ignore non-wet / non-stream-assigned cells when computing per-segment stats
-    # weight[~wet | (SegID_Array <= 0)] = np.nan
-
-    # # list of segment IDs ( >0 )
-    # seg_ids = np.unique(SegID_Array)
-    # seg_ids = seg_ids[seg_ids > 0]
-
-    # if seg_ids.size > 0:
-    #     # per-segment maximum of weight using labeled maximum
-    #     # seg_max[k] is the max of "weight" over all cells where SegID_Array == seg_ids[k]
-    #     seg_max = ndi.maximum(weight, labels=SegID_Array, index=seg_ids)
-
-    #     # build a lookup table seg_id -> max_weight
-    #     # (max seg id may not equal len(seg_ids), so we use a LUT indexed by seg_id)
-    #     lut = np.full(int(seg_ids.max()) + 1, np.nan, dtype=np.float32)
-    #     lut[seg_ids] = np.log10(seg_max.astype(np.float32))
-
-    #     # map per-cell denominator using segment IDs
-    #     denom = lut[SegID_Array]
-    #     eps = 1e-6
-
-    #     # normalized weight per cell: (1/n * depth) / max_segment(1/n * depth)
-    #     # -> within each segment this is ~[0,1]
-    #     norm_weight = np.divide(
-    #         np.log10((1.0 / da_input_mannings) * Depth_Array),
-    #         denom + eps
-    #     ).astype(np.float32)
-
-    #     # where there is no valid denom (non-wet/non-stream), keep NaN so it can be filled later
-    #     norm_weight[~np.isfinite(norm_weight)] = np.nan
-
-    #     # apply per-segment weighting to ensemble mean velocity
-    #     VEL_Array = (VEL_Array * norm_weight).astype(np.float32)
-    # else:
-    #     # no segments found; fall back to original behavior or leave VEL_Array as-is
-    #     pass
-
     # find the maximum slope across ensembles, ignoring NaNs when calculating an average with NaNs mixed in
     # Stack them into one 3D array
     Slope_Array = create_positive_max_array(Slope_array_list)
 
-
-    # --- 2) Manning's n raster ---
+    # Read Manning's n raster ---
     da_input_mannings = read_manning_table(LU_Manning_n, LC_array).astype(np.float32)
 
-    # # test using Manning's solutions that assumes each pixel is a rectangular channel
+    # use Manning's solutions that assumes each pixel is a rectangular channel
     VEL_Array = (1/(da_input_mannings))*((Depth_Array)**(2/3))*((Slope_Array)**(1/2))
-
-    # # # test using Mike's Chezy-Manning solution.
-    # VEL_Array = ((1/da_input_mannings)*((Depth_Array)**(1/6)))*((Depth_Array*Slope_Array)**(1/2))
-
-    # # ------------------------------------------------------------------
-    # # 4) Fill missing velocities and write out
-    # # ------------------------------------------------------------------
-
-
 
     VEL_Array = Flood_Flooded_Cells_in_Map(VEL_Array, Flood_Ensemble, eps=0.01)
 
@@ -376,10 +314,13 @@ def Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName: str, COMID_Uniqu
         'Row': 'first',
         'Col': 'first'
     })
+
+    wse_stats = curve_df.groupby('COMID')['WSE'].agg(['mean', 'std'])
     
     # Map results back to the unique COMID list
     comid_result_df = pd.DataFrame({'COMID': COMID_Unique})
     comid_result_df = comid_result_df.merge(median_values, on='COMID', how='left').fillna(0)
+    comid_wse_stats = comid_result_df[['COMID']].merge(wse_stats, on='COMID', how='left').fillna(0)
 
     # Create dicts
     comid_result_df['COMID'] = comid_result_df['COMID'].astype(np.int32)
@@ -391,11 +332,23 @@ def Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName: str, COMID_Uniqu
     COMID_Unique_TW = comid_result_df.set_index('COMID')['TopWidth'].to_dict()
     COMID_Unique_Depth = comid_result_df.set_index('COMID')['Depth'].to_dict()
     COMID_Unique_Velocity = comid_result_df.set_index('COMID')['Velocity'].to_dict()
+    COMID_Unique_WSE_Mean = comid_wse_stats.set_index('COMID')['mean'].astype(np.float32).to_dict()
+    COMID_Unique_WSE_Std = comid_wse_stats.set_index('COMID')['std'].astype(np.float32).to_dict()
     
     # Get the maximum TopWidth for all COMIDs
     TopWidthMax = comid_result_df['TopWidth'].max()
 
-    return (COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, TopWidthMax, T_Rast, W_Rast, S_Rast)
+    return (
+        COMID_Unique_TW,
+        COMID_Unique_Depth,
+        COMID_Unique_Velocity,
+        COMID_Unique_WSE_Mean,
+        COMID_Unique_WSE_Std,
+        TopWidthMax,
+        T_Rast,
+        W_Rast,
+        S_Rast,
+    )
 
 # @njit(cache=True)
 @njit("float32(float32, float32[:], float32[:])", cache=True)
@@ -587,10 +540,13 @@ def Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E_DEM, VDTDatabaseFileName: str, C
         'WSE': 'median',
         'Velocity': 'median',
     })
+
+    wse_stats = vdt_df.groupby('COMID')['WSE'].agg(['mean', 'std'])
     
     # Map results back to the unique COMID list
     comid_result_df = pd.DataFrame({'COMID': COMID_Unique})
     comid_result_df = comid_result_df.merge(mean_values, on='COMID', how='left').fillna(0)
+    comid_wse_stats = comid_result_df[['COMID']].merge(wse_stats, on='COMID', how='left').fillna(0)
     comid_result_df['COMID'] = comid_result_df['COMID'].astype(np.int32)
     comid_result_df['TopWidth'] = comid_result_df['TopWidth'].astype(np.float32)
     comid_result_df['Depth'] = comid_result_df['Depth'].astype(np.float32)
@@ -600,6 +556,8 @@ def Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E_DEM, VDTDatabaseFileName: str, C
     COMID_Unique_TW = comid_result_df.set_index('COMID')['TopWidth'].to_dict()
     COMID_Unique_Depth = comid_result_df.set_index('COMID')['Depth'].to_dict()
     COMID_Unique_Velocity = comid_result_df.set_index('COMID')['Velocity'].to_dict()
+    COMID_Unique_WSE_Mean = comid_wse_stats.set_index('COMID')['mean'].astype(np.float32).to_dict()
+    COMID_Unique_WSE_Std = comid_wse_stats.set_index('COMID')['std'].astype(np.float32).to_dict()
 
     # Get the maximum TopWidth for all COMIDs
     TopWidthMax = comid_result_df['TopWidth'].max()
@@ -608,6 +566,8 @@ def Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E_DEM, VDTDatabaseFileName: str, C
         COMID_Unique_TW,
         COMID_Unique_Depth,
         COMID_Unique_Velocity,
+        COMID_Unique_WSE_Mean,
+        COMID_Unique_WSE_Std,
         TopWidthMax,
         T_Rast,
         W_Rast,
@@ -911,198 +871,651 @@ def create_weightbox(tw: int, dx: float, dy: float):
 
     return (WeightBox).astype(np.float32)
 
+@njit(cache=True)
+def get_owner_stats_all(WSE: np.ndarray, owner: np.ndarray, nrows: int, ncols: int):
+    """Compute median and std-dev of WSE values for *each* owner id.
+
+    This avoids calling get_local_stats for every cell (O(N^3)) and
+    trades memory for CPU by scanning the grid per owner.
+
+    Returns
+    -------
+    owner_median, owner_std : 1D float32 arrays of length (max_owner + 1)
+        owner_median[i] / owner_std[i] are NaN when that owner has <2 valid values.
+    """
+    # Find the maximum owner id so we can size lookup tables
+    max_owner = 0
+    for r in range(nrows):
+        for c in range(ncols):
+            oid = owner[r, c]
+            if oid > max_owner:
+                max_owner = oid
+
+    # Count valid (non-NaN) values per owner
+    counts = np.zeros(max_owner + 1, dtype=np.int32)
+    for r in range(nrows):
+        for c in range(ncols):
+            oid = owner[r, c]
+            if oid <= 0:
+                continue
+            val = WSE[r, c]
+            if not np.isnan(val):
+                counts[oid] += 1
+
+    # Compute stats per owner
+    owner_median = np.full(max_owner + 1, np.nan, dtype=np.float32)
+    owner_std    = np.full(max_owner + 1, np.nan, dtype=np.float32)
+
+    for oid in range(1, max_owner + 1):
+        n = counts[oid]
+        if n < 2:
+            continue
+        vals = np.empty(n, dtype=np.float32)
+        idx = 0
+        for r in range(nrows):
+            for c in range(ncols):
+                if owner[r, c] != oid:
+                    continue
+                val = WSE[r, c]
+                if not np.isnan(val):
+                    vals[idx] = val
+                    idx += 1
+
+        vals = np.sort(vals)
+
+        # Median
+        if n % 2 == 1:
+            med = vals[n // 2]
+        else:
+            med = 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+
+        # Mean
+        mean_val = 0.0
+        for i in range(n):
+            mean_val += vals[i]
+        mean_val /= n
+
+        # Std (population std to match previous implementation)
+        sum_sq = 0.0
+        for i in range(n):
+            diff = vals[i] - mean_val
+            sum_sq += diff * diff
+        std = np.sqrt(sum_sq / n)
+
+        owner_median[oid] = np.float32(med)
+        owner_std[oid]    = np.float32(std)
+
+    return owner_median, owner_std
 
 @njit(cache=True)
-def propagate_wse_fast_convergent(WSE_Divided_by_weight, E, nrows, ncols):
+def get_local_stats(r, c, WSE, nrows, ncols):
     """
-    Iteratively spreads the Water Surface Elevation (WSE) until convergence,
-    using fixed-size buffers for Numba stability.
+    Calculates the median and standard deviation of valid (non-NaN) WSE values
+    in the 3x3 neighborhood of (r, c).
     """
-    WSE_Out = WSE_Divided_by_weight.copy()
-    
-    # Calculate maximum domain size for fixed buffers
-    max_domain_size = (nrows + 2) * (ncols + 2)
-    
-    # 1. Initialize Active Set
-    # (WSE_Out > E) checks where water exists above ground
-    initial_wet_mask = (WSE_Out > E) & (E > -9998.0)
-    
-    # Cast to int32 explicitly for Numba
-    wet_rows_64, wet_cols_64 = np.where(initial_wet_mask)
-    active_rows = wet_rows_64.astype(np.int32)
-    active_cols = wet_cols_64.astype(np.int32)
-    
-    # Pre-allocate fixed buffers
-    next_rows_buffer = np.empty(max_domain_size, dtype=np.int32)
-    next_cols_buffer = np.empty(max_domain_size, dtype=np.int32)
-    
-    neighbor_offsets = np.array([
-        [-1, -1], [-1, 0], [-1, 1],
-        [0, -1], [0, 1],
-        [1, -1], [1, 0], [1, 1]
-    ], dtype=np.int32)
-    
-    iteration = 0
-    
-    while active_rows.size > 0:
-        iteration += 1
-        current_active_size = active_rows.size
-        next_active_count = 0
-                   
-        for i in range(current_active_size):
-            r, c = active_rows[i], active_cols[i]
-            WSE_source = WSE_Out[r, c]
+    vals = np.empty(9, dtype=np.float32)
+    count = 0
 
-            for j in range(8):
-                dr = neighbor_offsets[j, 0]
-                dc = neighbor_offsets[j, 1]
-                r_adj, c_adj = r + dr, c + dc
-                
-                # Boundary check
-                if 0 <= r_adj < nrows + 2 and 0 <= c_adj < ncols + 2:
-                    E_adj = E[r_adj, c_adj]
-                    WSE_adj = WSE_Out[r_adj, c_adj]
-                    
-                    # Only process valid DEM cells
-                    if E_adj > -9998.0:
-                        # Only dry cells
-                        if WSE_adj <= E_adj:
-                            # Only flood if source water level is above this ground
-                            if WSE_source > E_adj:
-                                # New water level is source level
-                                WSE_Out[r_adj, c_adj] = WSE_source
-                                
-                                # Now it's newly wet -> add to queue
-                                if next_active_count < max_domain_size:
-                                    next_rows_buffer[next_active_count] = r_adj
-                                    next_cols_buffer[next_active_count] = c_adj
-                                    next_active_count += 1
-                        
+    for rr in range(r - 1, r + 2):
+        for cc in range(c - 1, c + 2):
+            if 0 <= rr < nrows and 0 <= cc < ncols:
+                val = WSE[rr, cc]
+                if not np.isnan(val):
+                    vals[count] = val
+                    count += 1
 
-        if next_active_count > 0:
-            active_rows = next_rows_buffer[:next_active_count].copy()
-            active_cols = next_cols_buffer[:next_active_count].copy()
+    if count < 2:
+        return np.nan, np.nan
+
+    valid_vals = vals[:count]
+    for i in range(count):
+        for j in range(0, count - i - 1):
+            if valid_vals[j] > valid_vals[j + 1]:
+                tmp = valid_vals[j]
+                valid_vals[j] = valid_vals[j + 1]
+                valid_vals[j + 1] = tmp
+
+    if count % 2 == 1:
+        median = valid_vals[count // 2]
+    else:
+        median = 0.5 * (valid_vals[count // 2 - 1] + valid_vals[count // 2])
+
+    sum_sq_diff = 0.0
+    mean_val = 0.0
+    for i in range(count):
+        mean_val += valid_vals[i]
+    mean_val /= count
+
+    for i in range(count):
+        sum_sq_diff += (valid_vals[i] - mean_val) ** 2
+
+    std = np.sqrt(sum_sq_diff / count)
+
+    return median, std
+@njit(cache=True)
+def _heap_push(r_heap, c_heap, p_heap, size, r, c, p):
+    i = size
+    size += 1
+    r_heap[i] = r
+    c_heap[i] = c
+    p_heap[i] = p
+
+    while i > 0:
+        parent = (i - 1) // 2
+        if p_heap[parent] <= p_heap[i]:
+            break
+        # swap parent and child
+        tmp_r = r_heap[parent]
+        tmp_c = c_heap[parent]
+        tmp_p = p_heap[parent]
+        r_heap[parent] = r_heap[i]
+        c_heap[parent] = c_heap[i]
+        p_heap[parent] = p_heap[i]
+        r_heap[i] = tmp_r
+        c_heap[i] = tmp_c
+        p_heap[i] = tmp_p
+        i = parent
+
+    return size
+
+@njit(cache=True)
+def _heap_pop(r_heap, c_heap, p_heap, size):
+    r = r_heap[0]
+    c = c_heap[0]
+    p = p_heap[0]
+    size -= 1
+    if size > 0:
+        r_heap[0] = r_heap[size]
+        c_heap[0] = c_heap[size]
+        p_heap[0] = p_heap[size]
+
+        i = 0
+        while True:
+            left = 2 * i + 1
+            right = left + 1
+            if left >= size:
+                break
+            smallest = left
+            if right < size and p_heap[right] < p_heap[left]:
+                smallest = right
+            if p_heap[i] <= p_heap[smallest]:
+                break
+            # swap
+            tmp_r = r_heap[i]
+            tmp_c = c_heap[i]
+            tmp_p = p_heap[i]
+            r_heap[i] = r_heap[smallest]
+            c_heap[i] = c_heap[smallest]
+            p_heap[i] = p_heap[smallest]
+            r_heap[smallest] = tmp_r
+            c_heap[smallest] = tmp_c
+            p_heap[smallest] = tmp_p
+            i = smallest
+
+    return r, c, p, size
+
+@njit(cache=True)
+def propagate_wse_fast_convergent(WSE_Initial, E, owner, owner_order, flowdir, nrows, ncols, cellsize, decay_per_meter=0.0001, prefer_low_wse=True, depth_cap=10.0):
+    """
+    Priority-driven propagation with stream-ownership gating.
+
+    1. Captures all IDW seeds (even shallow ones).
+    2. Finalizes cells in priority order (low WSE first by default).
+    3. Prevents cross-basin overwrites by enforcing nearest-stream ownership.
+    4. Uses gentle decay to allow spreading on flat terrain.
+    """
+    WSE_Out = WSE_Initial.copy()
+
+    # Clamp dry-cell WSE to the max of its 4-connected neighbors
+    for r in range(nrows):
+        for c in range(ncols):
+            if E[r, c] <= -9998.0:
+                continue
+            val = WSE_Out[r, c]
+            if np.isnan(val):
+                continue
+            if val >= E[r, c] - 0.1:
+                continue
+
+            max_n = -1.0e20
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr = r + dr
+                nc = c + dc
+                if 0 <= nr < nrows and 0 <= nc < ncols:
+                    nval = WSE_Out[nr, nc]
+                    if not np.isnan(nval) and nval > max_n:
+                        max_n = nval
+
+            if max_n > -1.0e19 and val > max_n:
+                WSE_Out[r, c] = max_n
+    # owner_median, owner_std = get_owner_stats_all(WSE_Out, owner, nrows, ncols)
+
+    # owner_median, owner_std = get_owner_stats_all(WSE_Work, owner, nrows, ncols)
+
+    # for r in range(nrows):
+    #     for c in range(ncols):
+    #         oid = owner[r, c]
+    #         if oid <= 0:
+    #             continue
+    #         val = WSE_Work[r, c]
+    #         if np.isnan(val):
+    #             continue
+
+    #         med = owner_median[oid]
+    #         std = owner_std[oid]
+
+    #         if not np.isnan(std) and std > 0.0:
+    #             if abs(val - med) > 2.0 * std:
+    #                 WSE_Work[r, c] = med
+    #         if not np.isnan(med) and WSE_Work[r, c] > med:
+    #             WSE_Work[r, c] = med
+
+    # WSE_Out = WSE_Work.copy()
+
+    # 1. DEFINE SOURCE (Relaxed Definition)
+    # Check if WSE is effectively at or above ground (allow -0.1m tolerance for float errors)
+    wet_seed = (WSE_Out >= E - 0.1) & (E > -9998.0) & (~np.isnan(WSE_Out))
+
+    max_q = nrows * ncols
+    heap_r = np.empty(max_q, dtype=np.int32)
+    heap_c = np.empty(max_q, dtype=np.int32)
+    heap_p = np.empty(max_q, dtype=np.float32)
+    heap_size = 0
+
+    finalized = np.zeros((nrows, ncols), dtype=np.uint8)
+    if prefer_low_wse:
+        best = np.full((nrows, ncols), 1e20, dtype=np.float32)
+    else:
+        best = np.full((nrows, ncols), -1e20, dtype=np.float32)
+
+    # 2. SEEDING
+    for r in range(nrows):
+        for c in range(ncols):
+            if wet_seed[r, c]:
+            # if wet_seed[r, c] and owner[r, c] > 0:
+                wse = WSE_Out[r, c]
+                if prefer_low_wse:
+                    if wse < best[r, c]:
+                        best[r, c] = wse
+                        heap_size = _heap_push(heap_r, heap_c, heap_p, heap_size, r, c, wse)
+                else:
+                    if wse > best[r, c]:
+                        best[r, c] = wse
+                        heap_size = _heap_push(heap_r, heap_c, heap_p, heap_size, r, c, -wse)
+
+    # 3. PROPAGATION
+    while heap_size > 0:
+        r, c, p, heap_size = _heap_pop(heap_r, heap_c, heap_p, heap_size)
+        if prefer_low_wse:
+            current_wse = p
         else:
-            active_rows = np.empty(0, dtype=np.int32) 
+            current_wse = -p
+
+        if finalized[r, c]:
+            continue
+        if abs(current_wse - best[r, c]) > 1e-6:
+            continue
+
+        # oid = owner[r, c]
+        # if oid > 0:
+        #     med = owner_median[oid]
+        #     std = owner_std[oid]
+        #     if not np.isnan(std) and std > 0.0:
+        #         if current_wse < (med - 2.0 * std) or current_wse > (med + 2.0 * std):
+        #             continue
+
+        finalized[r, c] = 1
+        WSE_Out[r, c] = current_wse
+
+        local_median, local_std = get_local_stats(r, c, WSE_Out, nrows, ncols)
+
+        # # Gentle Decay (default 10cm/km)
+        # drop = cellsize * decay_per_meter
+
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = r + dr, c + dc
+
+            if 0 <= nr < nrows and 0 <= nc < ncols:
+                if E[nr, nc] <= -9998.0:
+                    continue
+                if finalized[nr, nc]:
+                    continue
+                # if owner[nr, nc] != owner[r, c]:
+                #     continue
+                fd = flowdir[r, c]
+                if fd > 0:
+                    if not (
+                        (fd == 1 and dr == 0 and dc == 1) or
+                        (fd == 2 and dr == 1 and dc == 1) or
+                        (fd == 4 and dr == 1 and dc == 0) or
+                        (fd == 8 and dr == 1 and dc == -1) or
+                        (fd == 16 and dr == 0 and dc == -1) or
+                        (fd == 32 and dr == -1 and dc == -1) or
+                        (fd == 64 and dr == -1 and dc == 0) or
+                        (fd == 128 and dr == -1 and dc == 1)
+                    ):
+                        continue
+
+                # --- HYDRAULIC CHECK ---
+                # check if current WSE is above local median plus or minus 2 std-devs (if we have that info)
+                if not np.isnan(local_std) and local_std > 0.0:
+                    if current_wse < (local_median - local_std) or current_wse > (local_median + local_std):
+                        max_allowed_wse = local_median  # <-- This is a hard cap to prevent outliers from spreading too much
+                    else:
+                        max_allowed_wse = current_wse
+                # max_allowed_wse = current_wse - drop
+
+                # Check if water fits
+                if max_allowed_wse > E[nr, nc]:
+                    # Ensure we don't accidentally set WSE below ground
+                    final_wse = max(max_allowed_wse, E[nr, nc])
+                    if depth_cap > 0.0:
+                        if (final_wse - E[nr, nc]) > depth_cap:
+                            continue
+                    # cap = owner_median[owner[r, c]]
+                    # if not np.isnan(cap) and final_wse > cap:
+                    #     final_wse = cap
+
+                    # if owner[nr, nc] != owner[r, c]:
+                    #     continue
+                        # # Allow higher-order owner to overwrite near confluences
+                        # if owner_order[r, c] <= owner_order[nr, nc]:
+                        #     continue
+                        # if mix_zone[nr, nc] == 0:
+                        #     continue
+
+                        # seed_val = WSE_Out[nr, nc]
+                        # seed_val = WSE_Work[nr, nc]
+                        # if not np.isnan(seed_val) and final_wse > seed_val:
+                        #     continue
+
+                    if prefer_low_wse:
+                        if final_wse < best[nr, nc]:
+                            best[nr, nc] = final_wse
+                            heap_size = _heap_push(heap_r, heap_c, heap_p, heap_size, nr, nc, final_wse)
+                    else:
+                        if final_wse > best[nr, nc]:
+                            best[nr, nc] = final_wse
+                            heap_size = _heap_push(heap_r, heap_c, heap_p, heap_size, nr, nc, -final_wse)
 
     return WSE_Out
 
 @njit(cache=True)
-def hydraulic_flood_fill(
-    E,
-    WSE_channel,
-    is_channel,
-    nrows,
-    ncols,
-    cellsize,
-    loss_per_meter,
-    nodata_elev=-9998.0,
-    nodata_wse=-9999.0
-):
+def fldpln(WSE_Initial, E, flowdir, stream_id, order_lookup, downstream_lookup, nrows, ncols, fldmn, fldmx, dh, mxht0, ssflg):
     """
-    Compute domain-wide WSE by hydraulic flood-fill from channel WSE,
-    using a BFS-style active set (Numba-friendly).
+    This function is meant to mimic the FLDPLN model developed at the University of Kansas, translated iteratively
+    using Codex-ChatGPT and this repository: https://github.com/AlabamaWaterInstitute/fldpln
 
-    E           : (nrows+2, ncols+2) DEM (padded)
-    WSE_channel : (nrows+2, ncols+2) WSE only at channel cells (else nodata_wse)
-    is_channel  : (nrows+2, ncols+2) 0/1 mask of channel cells
+    Expand water surface elevation (WSE) from seeded cells using stage-based backfill.
+
+    Starting from WSE_Initial, this routine grows flooding in discrete stage heights
+    (fldmn..fldmx, step dh). For each stage, it identifies boundary wet cells, backfills
+    adjacent inflowing neighbors, and follows the downstream flow path to allow spillover
+    before lateral backfill. It tracks the flooding source stream (fsp) and the stage at
+    first inundation (dtf) for each cell.
+
+    Returns WSE_Out (final WSE), fsp (flood source pixel id), and dtf (depth-to-flood).
     """
+    # Stage-based flood propagation using D8 flow direction and a depth cap per stage.
+    # Uses boundary queues for backfill and a downstream spillover path per boundary cell.
+    WSE_Out = WSE_Initial.copy()
+    # Start with the provided WSE; each stage only grows flooding, never shrinks it.
+    # Seeded wet mask uses initial WSE vs. terrain (nodata filtered).
+    wet = (WSE_Out >= E - 0.1) & (E > -9998.0) & (~np.isnan(WSE_Out))
+    # Track flood source pixel (FSP) and depth-to-flood (DTF) per cell.
+    # FSP stores the stream id that flooded a cell; DTF stores the stage height when it first flooded.
+    fsp = np.zeros((nrows, ncols), dtype=np.int32)
+    dtf = np.full((nrows, ncols), np.float32(1.0e20))
 
-    # Initialize output
-    WSE_out = np.full(E.shape, nodata_wse, dtype=np.float64)
+    # Initialize FSP/DTF for seed cells.
+    for r in range(nrows):
+        for c in range(ncols):
+            if wet[r, c]:
+                if stream_id[r, c] > 0:
+                    fsp[r, c] = stream_id[r, c]
+                dtf[r, c] = fldmn
 
-    max_domain_size = (nrows + 2) * (ncols + 2)
-    active_rows = np.empty(max_domain_size, dtype=np.int32)
-    active_cols = np.empty(max_domain_size, dtype=np.int32)
-    active_count = 0
+    max_q = nrows * ncols
+    q_r = np.empty(max_q, dtype=np.int32)
+    q_c = np.empty(max_q, dtype=np.int32)
+    inq = np.zeros((nrows, ncols), dtype=np.uint8)
 
-    # --- 1. Seed from channel cells ---
-    for r in range(nrows + 2):
-        for c in range(ncols + 2):
-            if is_channel[r, c] != 0 and E[r, c] > nodata_elev:
-                wse_ch = WSE_channel[r, c]
-                if wse_ch > E[r, c]:
-                    WSE_out[r, c] = wse_ch
-                    active_rows[active_count] = r
-                    active_cols[active_count] = c
-                    active_count += 1
+    b_r = np.empty(max_q, dtype=np.int32)
+    b_c = np.empty(max_q, dtype=np.int32)
 
-    # If no seeds, return nodata_wse everywhere
-    if active_count == 0:
-        return WSE_out
-
-    # 4-neighbor connectivity (you can expand to 8-neighbor if you want)
-    neighbor_offsets = np.array([
-        [-1, 0],
-        [ 1, 0],
-        [ 0,-1],
-        [ 0, 1]
-    ], dtype=np.int32)
-
-    # Working buffers for next frontier
-    next_rows = np.empty(max_domain_size, dtype=np.int32)
-    next_cols = np.empty(max_domain_size, dtype=np.int32)
-
-    # --- 2. BFS-style propagation ---
-    while active_count > 0:
-        next_count = 0
-
-        for i in range(active_count):
-            r = active_rows[i]
-            c = active_cols[i]
-            WSE_source = WSE_out[r, c]
-
-            for k in range(4):
-                rr = r + neighbor_offsets[k, 0]
-                cc = c + neighbor_offsets[k, 1]
-
-                # Boundary
-                if rr < 0 or rr >= (nrows + 2) or cc < 0 or cc >= (ncols + 2):
+    # Iterate flood stage heights from minimum to maximum.
+    # Each stage expands from boundary cells, prioritizing higher-order streams.
+    fldht = fldmn
+    while fldht <= fldmx + 1e-6:
+        # Build boundary list: wet cells that touch at least one dry neighbor (8-neighbor check).
+        b_count = 0
+        b_count_low = 0
+        for r in range(1, nrows - 1):
+            for c in range(1, ncols - 1):
+                if not wet[r, c]:
                     continue
+                if (
+                    (not wet[r - 1, c]) or (not wet[r + 1, c]) or
+                    (not wet[r, c - 1]) or (not wet[r, c + 1]) or
+                    (not wet[r - 1, c - 1]) or (not wet[r - 1, c + 1]) or
+                    (not wet[r + 1, c - 1]) or (not wet[r + 1, c + 1])
+                ):
+                    sid = stream_id[r, c]
+                    # Higher-order streams go to the front of the queue.
+                    if sid > 0 and order_lookup[sid] > 0:
+                        b_r[b_count] = r
+                        b_c[b_count] = c
+                        b_count += 1
+                    else:
+                        b_r[max_q - 1 - b_count_low] = r
+                        b_c[max_q - 1 - b_count_low] = c
+                        b_count_low += 1
 
-                E_adj = E[rr, cc]
-                if E_adj <= nodata_elev:
-                    continue
+        # Initialize queue with boundary cells for this stage (higher order first).
+        q_read = 0
+        q_write = 0
+        inq[:, :] = 0
+        for i in range(b_count):
+            r = b_r[i]
+            c = b_c[i]
+            q_r[q_write] = r
+            q_c[q_write] = c
+            inq[r, c] = 1
+            q_write += 1
+        for i in range(b_count_low):
+            r = b_r[max_q - 1 - i]
+            c = b_c[max_q - 1 - i]
+            if inq[r, c] == 0:
+                q_r[q_write] = r
+                q_c[q_write] = c
+                inq[r, c] = 1
+                q_write += 1
 
-                # Distance (4-neighbors => cellsize)
-                dist = cellsize
+        # Process boundary cells; allow spillover along downstream flow path.
+        while q_read < q_write:
+            r = q_r[q_read]
+            c = q_c[q_read]
+            q_read += 1
+            inq[r, c] = 0
 
-                # Monotone-decay water surface
-                candidate_wse = WSE_source - loss_per_meter * dist
+            current_wse = WSE_Out[r, c]
+            if mxht0 > 0.0 and current_wse > mxht0:
+                continue
+            # Stage cap for this boundary cell at current step.
+            bnd_cap = current_wse + fldht
 
-                # Must be above ground to flood
-                if candidate_wse <= E_adj:
-                    continue
+            # Local backfill around the boundary cell (only inflowing neighbors).
+            # This grows flooding into adjacent cells that drain into the boundary cell.
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1),
+                           (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+                nr = r + dr
+                nc = c + dc
+                if 0 <= nr < nrows and 0 <= nc < ncols:
+                    if E[nr, nc] <= -9998.0:
+                        continue
+                    if wet[nr, nc]:
+                        continue
+                    # Only accept neighbors whose flowdir points into (r, c).
+                    fd_in = flowdir[nr, nc]
+                    if fd_in > 0:
+                        if not (
+                            (dr == -1 and dc == 0 and fd_in == 4) or    # neighbor above flows south
+                            (dr == 1 and dc == 0 and fd_in == 64) or    # neighbor below flows north
+                            (dr == 0 and dc == -1 and fd_in == 1) or    # neighbor left flows east
+                            (dr == 0 and dc == 1 and fd_in == 16) or    # neighbor right flows west
+                            (dr == -1 and dc == -1 and fd_in == 2) or   # neighbor up-left flows SE
+                            (dr == -1 and dc == 1 and fd_in == 8) or    # neighbor up-right flows SW
+                            (dr == 1 and dc == -1 and fd_in == 128) or  # neighbor down-left flows NE
+                            (dr == 1 and dc == 1 and fd_in == 32)       # neighbor down-right flows NW
+                        ):
+                            continue
+                    if (current_wse - E[nr, nc]) > fldht:
+                        continue
+                    final_wse = max(current_wse, E[nr, nc])
+                    if final_wse > bnd_cap:
+                        final_wse = bnd_cap
+                    if mxht0 > 0.0 and final_wse > mxht0:
+                        continue
+                    WSE_Out[nr, nc] = final_wse
+                    wet[nr, nc] = True
+                    if dtf[nr, nc] > fldht:
+                        src = fsp[r, c]
+                        if src == 0 and stream_id[r, c] > 0:
+                            src = stream_id[r, c]
+                        fsp[nr, nc] = src
+                        dtf[nr, nc] = fldht
+                    if ssflg == 1 and inq[nr, nc] == 0:
+                        q_r[q_write] = nr
+                        q_c[q_write] = nc
+                        inq[nr, nc] = 1
+                        q_write += 1
 
-                # Only update if we improve neighbor WSE
-                if candidate_wse > WSE_out[rr, cc]:
-                    WSE_out[rr, cc] = candidate_wse
+            # Spillover: follow downstream path from this boundary pixel.
+            # This allows propagation along the channel before backfilling laterally.
+            rr = r
+            cc = c
+            cur_sid = stream_id[r, c]
+            down_sid = 0
+            if cur_sid > 0:
+                down_sid = downstream_lookup[cur_sid]
+            steps = 0
+            while steps < max_q:
+                fd = flowdir[rr, cc]
+                if fd <= 0:
+                    break
+                # D8 step downstream from current cell.
+                if fd == 1:
+                    dr, dc = 0, 1
+                elif fd == 2:
+                    dr, dc = 1, 1
+                elif fd == 4:
+                    dr, dc = 1, 0
+                elif fd == 8:
+                    dr, dc = 1, -1
+                elif fd == 16:
+                    dr, dc = 0, -1
+                elif fd == 32:
+                    dr, dc = -1, -1
+                elif fd == 64:
+                    dr, dc = -1, 0
+                else:
+                    dr, dc = -1, 1
 
-                    # Add neighbor to next active list
-                    next_rows[next_count] = rr
-                    next_cols[next_count] = cc
-                    next_count += 1
+                rr = rr + dr
+                cc = cc + dc
+                if rr < 0 or rr >= nrows or cc < 0 or cc >= ncols:
+                    break
+                if E[rr, cc] <= -9998.0:
+                    break
+                sid = stream_id[rr, cc]
+                if down_sid > 0 and sid > 0 and sid != down_sid and sid != cur_sid:
+                    break
+                if wet[rr, cc]:
+                    break
+                if mxht0 > 0.0 and current_wse > mxht0:
+                    break
+                if (current_wse - E[rr, cc]) > fldht:
+                    break
+                final_wse = max(current_wse, E[rr, cc])
+                if final_wse > bnd_cap:
+                    final_wse = bnd_cap
+                if mxht0 > 0.0 and final_wse > mxht0:
+                    break
+                WSE_Out[rr, cc] = final_wse
+                wet[rr, cc] = True
+                if dtf[rr, cc] > fldht:
+                    src = fsp[r, c]
+                    if src == 0 and stream_id[r, c] > 0:
+                        src = stream_id[r, c]
+                    fsp[rr, cc] = src
+                    dtf[rr, cc] = fldht
+                if ssflg == 1 and inq[rr, cc] == 0:
+                    q_r[q_write] = rr
+                    q_c[q_write] = cc
+                    inq[rr, cc] = 1
+                    q_write += 1
+                steps += 1
 
-        # Advance frontier
-        active_count = next_count
-        for i in range(active_count):
-            active_rows[i] = next_rows[i]
-            active_cols[i] = next_cols[i]
+                # Backfill around spillover path point using inflowing neighbors.
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1),
+                               (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+                    nr = rr + dr
+                    nc = cc + dc
+                    if 0 <= nr < nrows and 0 <= nc < ncols:
+                        if E[nr, nc] <= -9998.0:
+                            continue
+                        if wet[nr, nc]:
+                            continue
+                        fd_in = flowdir[nr, nc]
+                        if fd_in > 0:
+                            if not (
+                                (dr == -1 and dc == 0 and fd_in == 4) or
+                                (dr == 1 and dc == 0 and fd_in == 64) or
+                                (dr == 0 and dc == -1 and fd_in == 1) or
+                                (dr == 0 and dc == 1 and fd_in == 16) or
+                                (dr == -1 and dc == -1 and fd_in == 2) or
+                                (dr == -1 and dc == 1 and fd_in == 8) or
+                                (dr == 1 and dc == -1 and fd_in == 128) or
+                                (dr == 1 and dc == 1 and fd_in == 32)
+                            ):
+                                continue
+                            if (current_wse - E[nr, nc]) > fldht:
+                                continue
+                            final_wse = max(current_wse, E[nr, nc])
+                            if final_wse > bnd_cap:
+                                final_wse = bnd_cap
+                            if mxht0 > 0.0 and final_wse > mxht0:
+                                continue
+                            WSE_Out[nr, nc] = final_wse
+                            wet[nr, nc] = True
+                            if dtf[nr, nc] > fldht:
+                                src = fsp[r, c]
+                                if src == 0 and stream_id[r, c] > 0:
+                                    src = stream_id[r, c]
+                                fsp[nr, nc] = src
+                                dtf[nr, nc] = fldht
+                        if ssflg == 1 and inq[nr, nc] == 0:
+                            q_r[q_write] = nr
+                            q_c[q_write] = nc
+                            inq[nr, nc] = 1
+                            q_write += 1
 
-    return WSE_out
+        # Advance to the next stage height.
+        fldht += dh
 
+    return WSE_Out, fsp, dtf
 
 @njit(cache=True)
-def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, E, B, nrows, ncols, sd, TW_m, dx, dy, LocalFloodOption, 
+def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, E, B, owner, owner_order, flowdir, order_lookup, downstream_lookup, nrows, ncols, sd, TW_m, dx, dy, LocalFloodOption, 
                          COMID_Unique_TW: COMID_FLOW_DICT_TYPE,   # <--- FIX THIS
                          COMID_Unique_Depth: COMID_FLOW_DICT_TYPE, # <--- FIX THIS
                          COMID_Unique_Velocity: COMID_FLOW_DICT_TYPE, # <--- FIX THIS
-                         WeightBox, TW_for_WeightBox_ElipseMask, TW, TW_MultFact, TopWidthPlausibleLimit, Set_Depth, flood_vdt_cells, OutDEP, OutWSE, OutVEL):
+                         COMID_Unique_WSE_Mean: COMID_FLOW_DICT_TYPE,
+                         COMID_Unique_WSE_Std: COMID_FLOW_DICT_TYPE,
+                         WeightBox, TW_for_WeightBox_ElipseMask, TW, TW_MultFact, TopWidthPlausibleLimit, Set_Depth, flood_vdt_cells, OutDEP, OutWSE, OutVEL,
+                         use_fldpln_model, fldmn, fldmx, dh, mxht0, ssflg):
        
     COMID_Averaging_Method = 0
-
-
-
     
     WSE_Times_Weight = np.zeros((nrows+2,ncols+2), dtype=np.float32)
     # make the slope times weight array only if S_Rast is provided
@@ -1110,120 +1523,217 @@ def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, E, B, nrows, ncols, sd,
         # make the NaN values NaN in the Slope_Times_Weight array
         Slope_Times_Weight = np.zeros((nrows+2,ncols+2), dtype=np.float32)
     Total_Weight = np.zeros((nrows+2,ncols+2), dtype=np.float32)
+
     
-    #Now go through each cell
-    num_nonzero = len(RR)
-    for i in range(num_nonzero):
-        r = RR[i]
-        c = CC[i]
-        r_use = r
-        c_use = c
-        E_Min = E[r,c]
-        
-        COMID_Value = B[r,c]
-        # Flow_Value = float(COMID_Unique_Flow[COMID_Value])
-        #Now start with rows and start flooding everything in site
-        if Set_Depth>0.0:
-            WSE = float(E[r_use,c_use] + Set_Depth)
-            if S_Rast is not None:
-                SLOPE = float(S_Rast[r_use,c_use])
-            COMID_TW_m = TopWidthPlausibleLimit
-        elif COMID_Averaging_Method!=0 or W_Rast[r-1,c-1]<0.001 or T_Rast[r-1,c-1]<0.00001:
-            #Get COMID, TopWidth, and Depth Information for this cell
-            COMID_Value = B[r,c]
-            # keys are int32, values are float32
-            if COMID_Value in COMID_Unique_TW:
-                COMID_TW_m = COMID_Unique_TW[COMID_Value]
-            else:
-                COMID_TW_m = np.float32(0.0)
+    if use_fldpln_model:
+        # # Initialize stage-based flooding from seed locations (FLDPLN-style).
+        # WSE_divided_by_weight = np.full((nrows + 2, ncols + 2), np.nan, dtype=np.float32)
+        # for r in range(nrows + 2):
+        #     for c in range(ncols + 2):
+        #         if E[r, c] <= -9998.0:
+        #             WSE_divided_by_weight[r, c] = np.nan
 
-            if COMID_Value in COMID_Unique_Depth:
-                COMID_D = COMID_Unique_Depth[COMID_Value]
-            else:
-                COMID_D = np.float32(0.0)
-            WSE = float(E[r_use,c_use] + COMID_D)
-            if S_Rast is not None:
-                SLOPE = float(S_Rast[r_use,c_use])
+        # for r in range(nrows + 2):
+        #     for c in range(ncols + 2):
+        #         if seed_mask[r, c] > 0:
+        #             WSE = np.float32(W_Rast[r-1,c-1])
+        #             WSE_divided_by_weight[r, c] = WSE
+        # if using Set_Depth, we want to seed all stream cells with WSE = E + Set_Depth, and then let the FLDPLN model expand from there.
+        if Set_Depth > 0.0:
+            W_Rast_Padded = np.full((nrows + 2, ncols + 2), np.nan, dtype=np.float32)
+            for r in range(nrows):
+                for c in range(ncols):
+                    if B[r, c] > 0:
+                        W_Rast_Padded[r + 1, c + 1] = E[r, c] + Set_Depth
+                    else:
+                        W_Rast_Padded[r + 1, c + 1] = np.nan
+
         else:
-            #These are Based on the AutoRoute Results, not averaged for COMID
-            WSE = W_Rast[r-1,c-1]  #Have to have the '-1' because of the Row and Col being inset on the B raster.
-            COMID_TW_m = T_Rast[r-1,c-1]
-            if S_Rast is not None:
-                SLOPE = S_Rast[r-1,c-1]
-            #print(str(WSE) + '  ' + str(COMID_TW_m))
-        
+            # pad the W_Rast to make it match E and the other arrays that are all nrows+2 by ncols+2
+            W_Rast_Padded = np.full((nrows + 2, ncols + 2), np.nan, dtype=np.float32)
+            for r in range(nrows):
+                for c in range(ncols):
+                    if W_Rast[r, c] > -9998.0:
+                        W_Rast_Padded[r + 1, c + 1] = W_Rast[r, c]
+                    else:
+                        W_Rast_Padded[r + 1, c + 1] = np.nan
 
-        if WSE < 0.001 or COMID_TW_m < 0.00001 or (WSE - E[r,c]) < 0.001:
-            continue
-
-        
-        if COMID_TW_m > TW_m:
-            COMID_TW_m = TW_m
-
-        COMID_TW = int(max(np.round(COMID_TW_m / dx), np.round(COMID_TW_m / dy)))
-          #This is how many cells we will be looking at surrounding our stream cell
-
-
-        
-        # Find minimum elevation within the search box
-        if sd >= 1:
-            for rr in range(max(r - sd, 0), min(r + sd + 1, nrows - 1)):
-                for cc in range(max(c - sd, 1), min(c + sd + 1, ncols - 1)):
-                    if E[rr,cc] > 0.1 and E[rr,cc] < E_Min:
-                        E_Min = E[rr,cc]
-                        r_use = rr
-                        c_use = cc
+        # ------------------------------------------------------------------
+        # EXPAND FLOOD EXTENT using the FLDPLN methodology
+        # ------------------------------------------------------------------
+        # This spreads WSE outward from currently-flooded cells to dry cells as long as
+        # neighboring ground elevation E can be overtopped.
+        WSE_divided_by_weight, fsp_map, dtf_map = fldpln(
+                                                          W_Rast_Padded, E, flowdir, B, order_lookup, 
+                                                          downstream_lookup, nrows + 2, ncols + 2, 
+                                                          fldmn, fldmx, dh, mxht0, ssflg
+        )
+        WSE_divided_by_weight = WSE_divided_by_weight.astype(np.float32)
+    else:
+        #Now go through each cell
+        num_nonzero = len(RR)
+        for i in range(num_nonzero):
+            r = RR[i]
+            c = CC[i]
+            r_use = r
+            c_use = c
+            E_Min = E[r,c]
             
-        r_min = max(r_use - COMID_TW, 1)
-        r_max = min(r_use + COMID_TW + 1, nrows + 1)
-        c_min = max(c_use - COMID_TW, 1)
-        c_max = min(c_use + COMID_TW + 1, ncols + 1)
-        
-        # This uses the weighting method from FloodSpreader to create a flood map
-        # Here we use TW instead of COMID_TW.  This is because we are trying to find the center of the weight raster, which was set based on TW (not COMID_TW).  
-        # COMID_TW mainly applies to the r_min, r_max, c_min, c_max
-        w_r_min = TW_for_WeightBox_ElipseMask - (r_use - r_min)
-        w_r_max = TW_for_WeightBox_ElipseMask + (r_max - r_use)
-        w_c_min = TW_for_WeightBox_ElipseMask - (c_use - c_min)
-        w_c_max = TW_for_WeightBox_ElipseMask + (c_max - c_use)
-    
-        weight_slice = WeightBox[w_r_min:w_r_max, w_c_min:w_c_max]
-        if LocalFloodOption:
-            #Find what would flood local
-            E_Box = E[r_min:r_max,c_min:c_max]
-            FloodLocalMask = FloodAllLocalAreas(WSE, E_Box, r_min, r_max, c_min, c_max, r_use, c_use)
-            WSE_Times_Weight[r_min:r_max, c_min:c_max] += (WSE * weight_slice * FloodLocalMask)
-            if S_Rast is not None:
-                Slope_Times_Weight[r_min:r_max, c_min:c_max] += (SLOPE * weight_slice * FloodLocalMask)
-        else:
-            WSE_Times_Weight[r_min:r_max, c_min:c_max] += (WSE * weight_slice)
-            if S_Rast is not None:
-                Slope_Times_Weight[r_min:r_max, c_min:c_max] += (SLOPE * weight_slice)
+            COMID_Value = B[r,c]
+            owner_id = owner[r, c]
+            # if owner_id <= 0:
+            #     continue
+            # Flow_Value = float(COMID_Unique_Flow[COMID_Value])
+            #Now start with rows and start flooding everything in site
+            if Set_Depth>0.0:
+                WSE = np.float32(E[r_use,c_use] + Set_Depth)
+                if S_Rast is not None:
+                    SLOPE = np.float32(S_Rast[r_use,c_use])
+                COMID_TW_m = TopWidthPlausibleLimit
+            elif COMID_Averaging_Method!=0 or W_Rast[r-1,c-1]<0.001 or T_Rast[r-1,c-1]<0.00001:
+                #Get COMID, TopWidth, and Depth Information for this cell
+                COMID_Value = B[r,c]
+                # keys are int32, values are float32
+                if COMID_Value in COMID_Unique_TW:
+                    COMID_TW_m = COMID_Unique_TW[COMID_Value]
+                else:
+                    COMID_TW_m = np.float32(0.0)
 
-        Total_Weight[r_min:r_max,c_min:c_max] += weight_slice
+                if COMID_Value in COMID_Unique_Depth:
+                    COMID_D = COMID_Unique_Depth[COMID_Value]
+                else:
+                    COMID_D = np.float32(0.0)
+                WSE = np.float32(E[r_use,c_use] + COMID_D)
+                if S_Rast is not None:
+                    SLOPE = np.float32(S_Rast[r_use,c_use])
+            else:
+                #These are Based on the AutoRoute Results, not averaged for COMID
+                WSE = np.float32(W_Rast[r-1,c-1])  #Have to have the '-1' because of the Row and Col being inset on the B raster.
+                COMID_TW_m = T_Rast[r-1,c-1]
+                if S_Rast is not None:
+                    SLOPE = np.float32(S_Rast[r-1,c-1])
+                #print(str(WSE) + '  ' + str(COMID_TW_m))
+            
 
-    is_channel = np.where(B > 0, 1, 0).astype(np.uint8)
+            if WSE < 0.001 or COMID_TW_m < 0.00001 or (WSE - E[r,c]) < 0.001:
+                continue
 
-    # divide the values in WSE_Times_Weight by the 
-    # values in Total_Weight   
-    Total_Weight = np.where(Total_Weight == 0, 1e-12, Total_Weight)  # Avoid division by zero
-    WSE_divided_by_weight = WSE_Times_Weight / Total_Weight
-    # loss_per_meter = 1e-4  # for pure bathtub; try 1e-4 or 1e-3 for decay
-    # WSE_divided_by_weight = hydraulic_flood_fill(
-    #     E,
-    #     W_Rast,
-    #     is_channel,
-    #     nrows,
-    #     ncols,
-    #     max(dx, dy),        # your grid resolution
-    #     loss_per_meter
-    # )
+            
+            if COMID_TW_m > TW_m:
+                COMID_TW_m = TW_m
 
-    # # iteratively fill in the WSE values until convergence
-    # WSE_divided_by_weight = propagate_wse_fast_convergent(WSE_divided_by_weight, E, nrows, ncols)
+            COMID_TW = int(max(np.round(COMID_TW_m / dx), np.round(COMID_TW_m / dy)))
+              #This is how many cells we will be looking at surrounding our stream cell
 
-    # Create the Flooded array
-    Flooded_array = np.where((WSE_divided_by_weight>E)&(E>-9998.0), 1, 0).astype(np.uint8)
+
+            
+            # Find minimum elevation within the search box
+            if sd >= 1:
+                for rr in range(max(r - sd, 0), min(r + sd + 1, nrows - 1)):
+                    for cc in range(max(c - sd, 1), min(c + sd + 1, ncols - 1)):
+                        if E[rr,cc] > 0.1 and E[rr,cc] < E_Min:
+                            E_Min = E[rr,cc]
+                            r_use = rr
+                            c_use = cc
+                
+            r_min = max(r_use - COMID_TW, 1)
+            r_max = min(r_use + COMID_TW + 1, nrows + 1)
+            c_min = max(c_use - COMID_TW, 1)
+            c_max = min(c_use + COMID_TW + 1, ncols + 1)
+            
+            # This uses the weighting method from FloodSpreader to create a flood map
+            # Here we use TW instead of COMID_TW.  This is because we are trying to find the center of the weight raster, which was set based on TW (not COMID_TW).  
+            # COMID_TW mainly applies to the r_min, r_max, c_min, c_max
+            w_r_min = TW_for_WeightBox_ElipseMask - (r_use - r_min)
+            w_r_max = TW_for_WeightBox_ElipseMask + (r_max - r_use)
+            w_c_min = TW_for_WeightBox_ElipseMask - (c_use - c_min)
+            w_c_max = TW_for_WeightBox_ElipseMask + (c_max - c_use)
+
+            weight_slice = WeightBox[w_r_min:w_r_max, w_c_min:w_c_max]
+            if LocalFloodOption:
+                # Find what would flood local
+                E_Box = E[r_min:r_max, c_min:c_max]
+                FloodLocalMask = FloodAllLocalAreas(WSE, E_Box, r_min, r_max, c_min, c_max, r_use, c_use)
+                for rr in range(r_min, r_max):
+                    w_r = rr - r_min
+                    for cc in range(c_min, c_max):
+                        # if owner[rr, cc] != owner_id:
+                        #     continue
+                        w_c = cc - c_min
+                        w = weight_slice[w_r, w_c]
+                        Total_Weight[rr, cc] += w
+                        if FloodLocalMask[w_r, w_c] == 0:
+                            continue
+                        WSE_Times_Weight[rr, cc] += (WSE * w)
+                        if S_Rast is not None:
+                            Slope_Times_Weight[rr, cc] += (SLOPE * w)
+            else:
+                for rr in range(r_min, r_max):
+                    w_r = rr - r_min
+                    for cc in range(c_min, c_max):
+                        # if owner[rr, cc] != owner_id:
+                        #     continue
+                        w_c = cc - c_min
+                        w = weight_slice[w_r, w_c]
+                        WSE_Times_Weight[rr, cc] += (WSE * w)
+                        if S_Rast is not None:
+                            Slope_Times_Weight[rr, cc] += (SLOPE * w)
+                        Total_Weight[rr, cc] += w
+
+        # divide the values in WSE_Times_Weight by the 
+        # values in Total_Weight   
+        Total_Weight = np.where(Total_Weight == 0, np.float32(1e-12), Total_Weight)  # Avoid division by zero
+        WSE_divided_by_weight = WSE_Times_Weight / Total_Weight
+
+
+
+    # # Filter WSE per COMID using mean ± 2*std
+    # for r in range(1, nrows + 1):
+    #     for c in range(1, ncols + 1):
+    #         comid = owner[r, c]
+    #         if comid <= 0:
+    #             continue
+    #         if comid in COMID_Unique_WSE_Mean:
+    #             mean_val = COMID_Unique_WSE_Mean[comid]
+    #             std_val = COMID_Unique_WSE_Std[comid]
+    #             if std_val > 0:
+    #                 val = WSE_divided_by_weight[r, c]
+    #                 if not np.isnan(val):
+    #                     if val < (mean_val - 2.0 * std_val) or val > (mean_val + 2.0 * std_val):
+    #                         WSE_divided_by_weight[r, c] = mean_val
+
+    # owner_median, owner_std = get_owner_stats_all(WSE_divided_by_weight, owner, nrows, ncols)
+
+    # for r in range(nrows):
+    #     for c in range(ncols):
+    #         oid = owner[r, c]
+    #         if oid <= 0:
+    #             continue
+    #         val = WSE_divided_by_weight[r, c]
+    #         if np.isnan(val):
+    #             continue
+
+    #         med = owner_median[oid]
+    #         std = owner_std[oid]
+
+    #         if not np.isnan(std) and std > 0.0:
+    #             if abs(val - med) > 2.0 * std:
+    #                 WSE_divided_by_weight[r, c] = med
+
+    # owner_median, owner_std = None, None  # Free memory
+
+
+    # else:
+    #     WSE_divided_by_weight = propagate_wse_fast_convergent(
+    #         WSE_divided_by_weight, E, owner, owner_order, flowdir, nrows, ncols, cellsize=dx, decay_per_meter=0.1, prefer_low_wse=True
+    #     ).astype(np.float32)
+
+    # Rebuild Flooded_array after propagation
+    Flooded_array = np.where(
+        (WSE_divided_by_weight > E) & (E > -9998.0),
+        1, 0
+    ).astype(np.uint8)
+
 
     # Also make sure all the Cells that have Stream are counted as flooded.
     if flood_vdt_cells:
@@ -1429,7 +1939,9 @@ def Calculate_Depth_TopWidth_TWMax_Velocity(E, CurveParamFileName, VDTDatabaseFi
     # Initialize all dictionaries
     COMID_Unique_TW = {}
     COMID_Unique_Depth = {}
-    COMID_Unique_Velocity = {}    
+    COMID_Unique_Velocity = {}
+    COMID_Unique_WSE_Mean = {}
+    COMID_Unique_WSE_Std = {}
     
     if Set_Depth>0.0:
         # Initialize all to -9999
@@ -1450,9 +1962,9 @@ def Calculate_Depth_TopWidth_TWMax_Velocity(E, CurveParamFileName, VDTDatabaseFi
         TopWidthMax = TopWidthPlausibleLimit 
     #Mike switched to default to VDT Database instead of Curve.  We can change this in the future.
     elif len(VDTDatabaseFileName)>1:
-        (COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, TopWidthMax, T_Rast, W_Rast, S_Rast) = Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E, VDTDatabaseFileName, COMID_Unique_Flow, COMID_Unique, T_Rast, W_Rast, S_Rast, TW_MultFact)
+        (COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, COMID_Unique_WSE_Mean, COMID_Unique_WSE_Std, TopWidthMax, T_Rast, W_Rast, S_Rast) = Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E, VDTDatabaseFileName, COMID_Unique_Flow, COMID_Unique, T_Rast, W_Rast, S_Rast, TW_MultFact)
     elif len(CurveParamFileName)>1:
-        (COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, TopWidthMax, T_Rast, W_Rast, S_Rast) = Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName, COMID_Unique_Flow, COMID_Unique,  T_Rast, W_Rast, S_Rast, TW_MultFact)
+        (COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, COMID_Unique_WSE_Mean, COMID_Unique_WSE_Std, TopWidthMax, T_Rast, W_Rast, S_Rast) = Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName, COMID_Unique_Flow, COMID_Unique,  T_Rast, W_Rast, S_Rast, TW_MultFact)
 
     LOG.info('Maximum Top Width = ' + str(TopWidthMax))
     
@@ -1469,12 +1981,12 @@ def Calculate_Depth_TopWidth_TWMax_Velocity(E, CurveParamFileName, VDTDatabaseFi
     Y_cells = np.round(TopWidthMax/dy,0)
     TW = int(max(Y_cells,X_cells))  #This is how many cells we will be looking at surrounding our stream cell
     
-    return COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, TopWidthMax, TW, T_Rast, W_Rast, S_Rast
+    return COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, COMID_Unique_WSE_Mean, COMID_Unique_WSE_Std, TopWidthMax, TW, T_Rast, W_Rast, S_Rast
 
-def Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, COMID_Unique_Flow, CurveParamFileName, VDTDatabaseFileName, Q_Fraction, TopWidthPlausibleLimit, TW_MultFact, WeightBox, TW_for_WeightBox_ElipseMask, LocalFloodOption, Set_Depth, quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast, OutDEP, OutWSE, OutVEL, linkno_to_twlimit=None):    
+def Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, COMID_Unique_Flow, CurveParamFileName, VDTDatabaseFileName, Q_Fraction, TopWidthPlausibleLimit, TW_MultFact, WeightBox, TW_for_WeightBox_ElipseMask, LocalFloodOption, Set_Depth, quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast, OutDEP, OutWSE, OutVEL, flowdir, use_fldpln_model, fldmn, fldmx, dh, mxht0, ssflg, linkno_to_twlimit=None, linkno_to_order=None, linkno_to_downstream=None):    
     #Calculate an Average Top Width and Depth for each stream reach.
     #  The Depths are purposely adjusted to the DEM that you are using (this addresses issues with using the original or bathy dem)
-    (COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, TopWidthMax, TW, T_Rast, W_Rast, S_Rast) = Calculate_Depth_TopWidth_TWMax_Velocity(E, CurveParamFileName, VDTDatabaseFileName, COMID_Unique_Flow, COMID_Unique, Q_Fraction, T_Rast, W_Rast, S_Rast, TW_MultFact, TopWidthPlausibleLimit, dx, dy, Set_Depth, quiet, linkno_to_twlimit=linkno_to_twlimit)
+    (COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, COMID_Unique_WSE_Mean, COMID_Unique_WSE_Std, TopWidthMax, TW, T_Rast, W_Rast, S_Rast) = Calculate_Depth_TopWidth_TWMax_Velocity(E, CurveParamFileName, VDTDatabaseFileName, COMID_Unique_Flow, COMID_Unique, Q_Fraction, T_Rast, W_Rast, S_Rast, TW_MultFact, TopWidthPlausibleLimit, dx, dy, Set_Depth, quiet, linkno_to_twlimit=linkno_to_twlimit)
     
     #Create a simple Flood Map Data
     search_dist_for_min_elev = 0
@@ -1487,15 +1999,37 @@ def Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, COMID_Unique_F
     vals_dep = np.asarray(list(COMID_Unique_Depth.values()), dtype=np.float32)
     keys_vel = np.asarray(list(COMID_Unique_Velocity.keys()), dtype=np.int32)
     vals_vel = np.asarray(list(COMID_Unique_Velocity.values()), dtype=np.float32)
+    keys_wse = np.asarray(list(COMID_Unique_WSE_Mean.keys()), dtype=np.int32)
+    vals_wse_mean = np.asarray(list(COMID_Unique_WSE_Mean.values()), dtype=np.float32)
+    vals_wse_std = np.asarray(list(COMID_Unique_WSE_Std.values()), dtype=np.float32)
 
     COMID_Unique_TW    = create_numba_dict_from(keys_tw,  vals_tw)
     COMID_Unique_Depth = create_numba_dict_from(keys_dep, vals_dep)
     COMID_Unique_Velocity = create_numba_dict_from(keys_vel, vals_vel)
+    COMID_Unique_WSE_Mean = create_numba_dict_from(keys_wse, vals_wse_mean)
+    COMID_Unique_WSE_Std = create_numba_dict_from(keys_wse, vals_wse_std)
 
-    Flood_array, Depth_array, Slope_array  = CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, E, B, nrows, ncols, search_dist_for_min_elev, TopWidthMax, dx, dy, LocalFloodOption, COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, WeightBox, TW_for_WeightBox_ElipseMask, TW, TW_MultFact, TopWidthPlausibleLimit, Set_Depth, flood_vdt_cells, OutDEP, OutWSE, OutVEL)
+    owner = compute_stream_ownership(B, E)
+    owner_order = compute_owner_order(owner, linkno_to_order)
+    max_id = int(np.max(B))
+    order_lookup = np.zeros(max_id + 1, dtype=np.int32)
+    downstream_lookup = np.zeros(max_id + 1, dtype=np.int32)
+    if linkno_to_order:
+        for key, val in linkno_to_order.items():
+            if key <= max_id:
+                order_lookup[int(key)] = int(val)
+    if linkno_to_downstream:
+        for key, val in linkno_to_downstream.items():
+            if key <= max_id:
+                downstream_lookup[int(key)] = int(val)
+    # mix_radius_cells = 0
+    # mix_zone = compute_owner_mix_zone(owner, mix_radius_cells)
+
+
+    Flood_array, Depth_array, Slope_array  = CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, E, B, owner, owner_order, flowdir, order_lookup, downstream_lookup, nrows, ncols, search_dist_for_min_elev, TopWidthMax, dx, dy, LocalFloodOption, COMID_Unique_TW, COMID_Unique_Depth, COMID_Unique_Velocity, COMID_Unique_WSE_Mean, COMID_Unique_WSE_Std, WeightBox, TW_for_WeightBox_ElipseMask, TW, TW_MultFact, TopWidthPlausibleLimit, Set_Depth, flood_vdt_cells, OutDEP, OutWSE, OutVEL, use_fldpln_model, fldmn, fldmx, dh, mxht0, ssflg)
     
     return Flood_array, Depth_array, Slope_array
-
+    
 
 def Set_Stream_Locations(nrows: int, ncols: int, infilename: str):
     S = np.full((nrows, ncols), -9999, dtype=np.int32)  #Create an array
@@ -1844,6 +2378,78 @@ def create_bathymetry(E: np.ndarray, nrows: int, ncols: int, dem_geotransform: t
     # write the Bathy output raster
     Write_Output_Raster(BathyOutputFileName, ARBathy, ncols, nrows, dem_geotransform, dem_projection, "GTiff", gdal.GDT_Float32, bathymetry_creation_options)
 
+def compute_stream_ownership(B: np.ndarray, E: np.ndarray) -> np.ndarray:
+    mask = B > 0
+    owner = np.zeros_like(B, dtype=np.int32)
+    if not np.any(mask):
+        return owner
+
+    _, indices = ndi.distance_transform_edt(~mask, return_indices=True)
+    r_idx = indices[0]
+    c_idx = indices[1]
+    owner = B[r_idx, c_idx].astype(np.int32)
+    owner[E <= -9998.0] = 0
+
+    return owner
+
+def compute_owner_order(owner: np.ndarray, linkno_to_order: dict | None) -> np.ndarray:
+    if linkno_to_order is None or len(linkno_to_order) == 0:
+        return np.zeros_like(owner, dtype=np.int32)
+
+    max_owner = int(np.max(owner))
+    order_lookup = np.zeros(max_owner + 1, dtype=np.int32)
+    for key, val in linkno_to_order.items():
+        if key <= max_owner:
+            order_lookup[int(key)] = int(val)
+
+    return order_lookup[owner]
+
+@njit(cache=True)
+def compute_owner_mix_zone(owner: np.ndarray, mix_radius_cells: int) -> np.ndarray:
+    nrows, ncols = owner.shape
+    boundary = np.zeros_like(owner, dtype=np.uint8)
+
+    for r in range(1, nrows - 1):
+        for c in range(1, ncols - 1):
+            oid = owner[r, c]
+            if oid <= 0:
+                continue
+            if (
+                owner[r - 1, c] != oid or
+                owner[r + 1, c] != oid or
+                owner[r, c - 1] != oid or
+                owner[r, c + 1] != oid
+            ):
+                boundary[r, c] = 1
+
+    if mix_radius_cells <= 0:
+        return boundary
+
+    mix_zone = np.zeros_like(owner, dtype=np.uint8)
+    for r in range(nrows):
+        for c in range(ncols):
+            if boundary[r, c] == 0:
+                continue
+            r_min = r - mix_radius_cells
+            if r_min < 0:
+                r_min = 0
+            r_max = r + mix_radius_cells + 1
+            if r_max > nrows:
+                r_max = nrows
+            c_min = c - mix_radius_cells
+            if c_min < 0:
+                c_min = 0
+            c_max = c + mix_radius_cells + 1
+            if c_max > ncols:
+                c_max = ncols
+
+            for rr in range(r_min, r_max):
+                for cc in range(c_min, c_max):
+                    if owner[rr, cc] > 0:
+                        mix_zone[rr, cc] = 1
+
+    return mix_zone
+
 def Curve2Flood_MainFunction(input_file: str = None,
                              args: dict = None, 
                              quiet: bool = False,
@@ -1886,6 +2492,9 @@ def Curve2Flood_MainFunction(input_file: str = None,
     STRM_File = ReadInputFile(lines,'Stream_File')
     LAND_File = ReadInputFile(lines,'LU_Raster_SameRes')
     StrmShp_File = ReadInputFile(lines,'StrmShp_File')
+    Flow_Direction_File = ReadInputFile(lines,'Flow_Direction_File')
+    StrmOrder_Field = ReadInputFile(lines,'StrmOrder_Field')
+    Downstream_Link_Field = ReadInputFile(lines,'Downstream_Link_Field')
     Flood_File = ReadInputFile(lines,'OutFLD')
     OutDEP = ReadInputFile(lines,'OutDEP')
     OutWSE = ReadInputFile(lines,'OutWSE')
@@ -1895,6 +2504,12 @@ def Curve2Flood_MainFunction(input_file: str = None,
     FlowFileName: str = ReadInputFile(lines,'COMID_Flow_File') or ReadInputFile(lines,'Comid_Flow_File')
     VDTDatabaseFileName = ReadInputFile(lines,'Print_VDT_Database')
     CurveParamFileName = ReadInputFile(lines,'Print_Curve_File')
+    Use_FLDPLN_Model = ReadInputFile(lines,'Use_FLDPLN_Model')
+    FLDPLN_fldmn = ReadInputFile(lines,'FLDPLN_fldmn')
+    FLDPLN_fldmx = ReadInputFile(lines,'FLDPLN_fldmx')
+    FLDPLN_dh = ReadInputFile(lines,'FLDPLN_dh')
+    FLDPLN_mxht0 = ReadInputFile(lines,'FLDPLN_mxht0')
+    FLDPLN_ssflg = ReadInputFile(lines,'FLDPLN_ssflg')
     Q_Fraction = ReadInputFile(lines,'Q_Fraction')
     TopWidthPlausibleLimit = ReadInputFile(lines,'TopWidthPlausibleLimit')
     TW_MultFact = ReadInputFile(lines,'TW_MultFact')
@@ -1931,7 +2546,37 @@ def Curve2Flood_MainFunction(input_file: str = None,
     Q_Fraction = float(Q_Fraction)
     TopWidthPlausibleLimit = float(TopWidthPlausibleLimit)
     TW_MultFact = float(TW_MultFact)
-    
+
+    use_fldpln_model = False
+    if Use_FLDPLN_Model is not None:
+        use_fldpln_model = str(Use_FLDPLN_Model).strip().lower() in ("true", "1", "yes", "y")
+
+    # Set default values if the variables are not None or an empty string
+    if FLDPLN_fldmn is not None and FLDPLN_fldmn != '':
+        fldmn = float(FLDPLN_fldmn)
+    else:
+        fldmn = 0.01
+
+    if FLDPLN_fldmx is not None and FLDPLN_fldmx != '':
+        fldmx = float(FLDPLN_fldmx)
+    else:
+        fldmx = 3.0
+
+    if FLDPLN_dh is not None and FLDPLN_dh != '':
+        dh = float(FLDPLN_dh)
+    else:
+        dh = 0.5
+
+    if FLDPLN_mxht0 is not None and FLDPLN_mxht0 != '':
+        mxht0 = float(FLDPLN_mxht0)
+    else:
+        mxht0 = 0.0
+
+    if FLDPLN_ssflg is not None and FLDPLN_ssflg != '':
+        ssflg = int(FLDPLN_ssflg)
+    else:
+        ssflg = 0
+    # set model start time for logging
     Model_Start_Time = datetime.now()
 
     LOG.info('Opening ' + DEM_File)
@@ -1947,6 +2592,17 @@ def Curve2Flood_MainFunction(input_file: str = None,
     E = np.full((nrows+2, ncols+2), -9999.0, dtype=np.float32)  #Create an array that is slightly larger than the STRM Raster Array and fill it with -9999.0
     E[1:-1, 1:-1] = ds.ReadAsArray()
     ds = None  
+
+    if Flow_Direction_File:
+        (FDR, fdr_ncols, fdr_nrows, _, _, _, _, _, _, _, _) = Read_Raster_GDAL(Flow_Direction_File)
+        if fdr_ncols != ncols or fdr_nrows != nrows:
+            LOG.warning("Flow direction raster size does not match DEM; flow-direction gating will be disabled.")
+            FlowDir = np.zeros((nrows+2, ncols+2), dtype=np.int32)
+        else:
+            FlowDir = np.zeros((nrows+2, ncols+2), dtype=np.int32)
+            FlowDir[1:-1, 1:-1] = FDR.astype(np.int32)
+    else:
+        FlowDir = np.zeros((nrows+2, ncols+2), dtype=np.int32)
 
     LOG.info("Executing flood mapping logic...")
 
@@ -1983,8 +2639,10 @@ def Curve2Flood_MainFunction(input_file: str = None,
         Strm_gdf = Strm_gdf[Strm_gdf['LINKNO'].isin(COMID_Unique)]
 
         # change the TopWidthPlausibleLimit to be weighted by the stream order column in Strm_gdf
-        if 'StrmOrder' in Strm_gdf.columns:
-            Strm_gdf['TopWidthPlausibleLimit'] = (Strm_gdf['StrmOrder']/max(Strm_gdf['StrmOrder'].values)) * TopWidthPlausibleLimit
+        order_field = StrmOrder_Field if StrmOrder_Field in Strm_gdf.columns else 'StrmOrder'
+        if order_field in Strm_gdf.columns:
+            Strm_gdf['TopWidthPlausibleLimit'] = (Strm_gdf[order_field]/max(Strm_gdf[order_field].values)) * TopWidthPlausibleLimit
+            linkno_to_order = dict(zip(Strm_gdf['LINKNO'], Strm_gdf[order_field]))
             # drop all columns in the GDF except for the LINKNO/COMID column and the TopWidthPlausibleLimit column
             Strm_gdf = Strm_gdf[['LINKNO', 'TopWidthPlausibleLimit']]
             # Build a lookup dictionary from the GDF
@@ -1992,10 +2650,25 @@ def Curve2Flood_MainFunction(input_file: str = None,
             del Strm_gdf
         else:
             linkno_to_twlimit = None
+            linkno_to_order = None
             del Strm_gdf
+    if StrmShp_File and Downstream_Link_Field:
+        try:
+            Strm_gdf_down = gpd.read_file(StrmShp_File)
+            if Downstream_Link_Field in Strm_gdf_down.columns:
+                linkno_to_downstream = dict(zip(Strm_gdf_down['LINKNO'], Strm_gdf_down[Downstream_Link_Field]))
+            else:
+                linkno_to_downstream = None
+            del Strm_gdf_down
+        except Exception:
+            linkno_to_downstream = None
     else:
+        linkno_to_downstream = None
+
+    if not StrmShp_File:
         # If no shapefile is provided, set the linkno_to_twlimit to None
         linkno_to_twlimit = None
+        linkno_to_order = None
     
     # COMID Flow File Read-in
     LOG.info('Opening and Reading ' + FlowFileName)
@@ -2030,7 +2703,6 @@ def Curve2Flood_MainFunction(input_file: str = None,
     else:
         S_Rast = None  # will be read later if needed      
 
-    
     #Go through all the Flow Events
     Flood_array_list = []
     Depth_array_list = []
@@ -2043,11 +2715,23 @@ def Curve2Flood_MainFunction(input_file: str = None,
         #Get an Average Flow rate associated with each stream reach.
         if Set_Depth<=0.000000001:
             COMID_Unique_Flow = FindFlowRateForEachCOMID_Ensemble(FlowFileName, flow_event_num)
-        Flood_array, Depth_array, Slope_array = Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, COMID_Unique_Flow, CurveParamFileName, VDTDatabaseFileName, Q_Fraction, TopWidthPlausibleLimit, TW_MultFact, WeightBox, TW_for_WeightBox_ElipseMask, LocalFloodOption, Set_Depth, quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast, OutDEP, OutWSE, OutVEL, linkno_to_twlimit=linkno_to_twlimit)        
+        Flood_array, Depth_array, Slope_array = Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, 
+                                                            COMID_Unique_Flow, CurveParamFileName, VDTDatabaseFileName,
+                                                            Q_Fraction, TopWidthPlausibleLimit, TW_MultFact, WeightBox, 
+                                                            TW_for_WeightBox_ElipseMask, LocalFloodOption, Set_Depth, 
+                                                            quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast, OutDEP, 
+                                                            OutWSE, OutVEL, FlowDir, use_fldpln_model, fldmn, fldmx,
+                                                            dh, mxht0, ssflg, linkno_to_twlimit=linkno_to_twlimit, 
+                                                            linkno_to_order=linkno_to_order, linkno_to_downstream=linkno_to_downstream)        
         Flood_array = remove_cells_not_connected(Flood_array, S)
         Flood_array_list.append(Flood_array)
         Depth_array_list.append(Depth_array)
         Slope_array_list.append(Slope_array)
+
+    # clear some memory by deleting large arrays that are no longer needed
+    del T_Rast
+    del W_Rast
+    del S_Rast    
 
     # Combine all flow events into a single ensemble
     #Turn into a percentage
