@@ -2617,6 +2617,24 @@ def Curve2Flood_MainFunction(input_file: str = None,
     use_fldpln_model = False
     if Use_FLDPLN_Model is not None:
         use_fldpln_model = str(Use_FLDPLN_Model).strip().lower() in ("true", "1", "yes", "y")
+
+    if use_fldpln_model:
+        required = {
+            "Flow_Direction_File": Flow_Direction_File,
+            "StrmOrder_Field": StrmOrder_Field,
+            "Downstream_Link_Field": Downstream_Link_Field,
+            "FLDPLN_fldmn": FLDPLN_fldmn,
+            "FLDPLN_fldmx": FLDPLN_fldmx,
+            "FLDPLN_dh": FLDPLN_dh,
+            "FLDPLN_mxht0": FLDPLN_mxht0,
+            "FLDPLN_ssflg": FLDPLN_ssflg,
+        }
+        missing = [name for name, val in required.items() if val is None or val == ""]
+        if missing:
+            raise ValueError(
+                "Use_FLDPLN_Model is True but required parameters are missing: "
+                + ", ".join(missing)
+            )
     
 
     # Set default values if the variables are not None or an empty string
