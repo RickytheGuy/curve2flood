@@ -2523,7 +2523,7 @@ def ReadInputFile(lines,P):
                 return True
             if P=='Set_Depth' or P=='FloodSpreader_SpecifyDepth':
                 return float(ls[1])
-            if P in ['Bathy_Use_Banks', 'Flood_WaterLC_and_STRM_Cells']:
+            if P in ['Bathy_Use_Banks', 'Flood_WaterLC_and_STRM_Cells', 'Make_Output_GPKG']:
                 if "True" in ls[1]:
                     return True
                 elif "False" in ls[1] or ls[1] == '':
@@ -2539,6 +2539,8 @@ def ReadInputFile(lines,P):
         return float(-1.1)
     if P in ['LocalFloodOption', 'FloodLocalOnly', 'Bathy_Use_Banks', 'Flood_WaterLC_and_STRM_Cells']:
         return False
+    if P == 'Make_Output_GPKG':
+        return True
     if P=='LAND_WaterValue':
         return 80
     if P=='OutDEP' or P=='OutWSE':
@@ -2811,6 +2813,50 @@ def compute_owner_mix_zone(owner: np.ndarray, mix_radius_cells: int) -> np.ndarr
 
     return mix_zone
 
+def read_geometry_and_get_linkno_mappings(StrmShp_File: str, 
+                                 COMID_Unique, 
+                                 StrmOrder_Field, 
+                                 TopWidthPlausibleLimit,
+                                 Downstream_Link_Field) -> tuple[dict | None, dict | None, dict | None]:
+    linkno_to_downstream = None
+    linkno_to_twlimit = None
+    linkno_to_order = None
+    if not StrmShp_File:
+        return linkno_to_twlimit, linkno_to_order, linkno_to_downstream
+    
+    # Read the shapefile
+    LOG.info('Opening ' + StrmShp_File)
+    Strm_gdf = gpd.read_file(StrmShp_File, use_arrow=True)
+    # filter the Strm_gdf to only include the COMIDs in the COMID_Unique array
+    Strm_gdf = Strm_gdf[Strm_gdf['LINKNO'].isin(COMID_Unique)]
+
+    # change the TopWidthPlausibleLimit to be weighted by the stream order column in Strm_gdf
+    order_field = StrmOrder_Field if StrmOrder_Field in Strm_gdf.columns else 'StrmOrder'
+    if order_field in Strm_gdf.columns:
+        Strm_gdf['TopWidthPlausibleLimit'] = (Strm_gdf[order_field]/max(Strm_gdf[order_field].values)) * TopWidthPlausibleLimit
+        linkno_to_order = dict(zip(Strm_gdf['LINKNO'], Strm_gdf[order_field]))
+        # drop all columns in the GDF except for the LINKNO/COMID column and the TopWidthPlausibleLimit column
+        Strm_gdf = Strm_gdf[['LINKNO', 'TopWidthPlausibleLimit']]
+        # Build a lookup dictionary from the GDF
+        linkno_to_twlimit = dict(zip(Strm_gdf['LINKNO'], Strm_gdf['TopWidthPlausibleLimit']))
+    else:
+        linkno_to_twlimit = None
+        linkno_to_order = None
+
+    if Downstream_Link_Field:
+        try:
+            Strm_gdf_down = gpd.read_file(StrmShp_File, use_arrow=True)
+            if Downstream_Link_Field in Strm_gdf_down.columns:
+                linkno_to_downstream = dict(zip(Strm_gdf_down['LINKNO'], Strm_gdf_down[Downstream_Link_Field]))
+            else:
+                linkno_to_downstream = None
+            del Strm_gdf_down
+        except Exception:
+            linkno_to_downstream = None
+    
+    return linkno_to_twlimit, linkno_to_order, linkno_to_downstream
+        
+
 def Curve2Flood_MainFunction(input_file: str = None,
                              args: dict = None, 
                              quiet: bool = False,
@@ -2859,6 +2905,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
     STRM_File = ReadInputFile(lines,'Stream_File')
     LAND_File = ReadInputFile(lines,'LU_Raster_SameRes')
     StrmShp_File = ReadInputFile(lines,'StrmShp_File')
+    Make_Output_GPKG = ReadInputFile(lines,'Make_Output_GPKG')
     Flow_Direction_File = ReadInputFile(lines,'Flow_Direction_File')
     StrmOrder_Field = ReadInputFile(lines,'StrmOrder_Field')
     Downstream_Link_Field = ReadInputFile(lines,'Downstream_Link_Field')
@@ -3017,46 +3064,10 @@ def Curve2Flood_MainFunction(input_file: str = None,
     COMID_Unique = np.unique(B[RR, CC]) # Always sorted
     COMID_Unique = COMID_Unique.astype(int) # Ensure it's treated as integers
     # COMID_Unique = np.delete(COMID_Unique, 0)  #We don't need the first entry of zero
-
+    
     # Open the StrmShp_File if provided
-    if StrmShp_File:
-        # Read the shapefile
-        LOG.info('Opening ' + StrmShp_File)
-        Strm_gdf = gpd.read_file(StrmShp_File)
-        # filter the Strm_gdf to only include the COMIDs in the COMID_Unique array
-        Strm_gdf = Strm_gdf[Strm_gdf['LINKNO'].isin(COMID_Unique)]
-
-        # change the TopWidthPlausibleLimit to be weighted by the stream order column in Strm_gdf
-        order_field = StrmOrder_Field if StrmOrder_Field in Strm_gdf.columns else 'StrmOrder'
-        if order_field in Strm_gdf.columns:
-            Strm_gdf['TopWidthPlausibleLimit'] = (Strm_gdf[order_field]/max(Strm_gdf[order_field].values)) * TopWidthPlausibleLimit
-            linkno_to_order = dict(zip(Strm_gdf['LINKNO'], Strm_gdf[order_field]))
-            # drop all columns in the GDF except for the LINKNO/COMID column and the TopWidthPlausibleLimit column
-            Strm_gdf = Strm_gdf[['LINKNO', 'TopWidthPlausibleLimit']]
-            # Build a lookup dictionary from the GDF
-            linkno_to_twlimit = dict(zip(Strm_gdf['LINKNO'], Strm_gdf['TopWidthPlausibleLimit']))
-            del Strm_gdf
-        else:
-            linkno_to_twlimit = None
-            linkno_to_order = None
-            del Strm_gdf
-    if StrmShp_File and Downstream_Link_Field:
-        try:
-            Strm_gdf_down = gpd.read_file(StrmShp_File)
-            if Downstream_Link_Field in Strm_gdf_down.columns:
-                linkno_to_downstream = dict(zip(Strm_gdf_down['LINKNO'], Strm_gdf_down[Downstream_Link_Field]))
-            else:
-                linkno_to_downstream = None
-            del Strm_gdf_down
-        except Exception:
-            linkno_to_downstream = None
-    else:
-        linkno_to_downstream = None
-
-    if not StrmShp_File:
-        # If no shapefile is provided, set the linkno_to_twlimit to None
-        linkno_to_twlimit = None
-        linkno_to_order = None
+    _tuple = read_geometry_and_get_linkno_mappings(StrmShp_File, COMID_Unique, StrmOrder_Field, TopWidthPlausibleLimit, Downstream_Link_Field)
+    linkno_to_twlimit, linkno_to_order, linkno_to_downstream = _tuple
     
     # COMID Flow File Read-in
     LOG.info('Opening and Reading ' + FlowFileName)
@@ -3198,7 +3209,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
         create_velocity(OutVEL, Depth_Array, LU_Manning_n, LC_array, Slope_array_list, dem_geotransform, dem_projection, ncols, nrows, Flood_Ensemble, S)
 
 
-    if StrmShp_File:
+    if StrmShp_File and Make_Output_GPKG:
         # convert the raster to a geodataframe
         flood_gdf = Write_Output_Raster_As_GeoDataFrame(Flood_Ensemble, ncols, nrows, dem_geotransform, dem_projection, gdal.GDT_Byte)
         
