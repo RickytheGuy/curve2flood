@@ -2166,9 +2166,9 @@ def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, E, B,
             Total_Weight[r_min:r_max,c_min:c_max] += weight_slice
 
 
-        # # divide the values in WSE_Times_Weight by the 
-        # # values in Total_Weight   
-        # WSE_array = WSE_Times_Weight / np.where(Total_Weight == 0, np.float32(1e-12), Total_Weight)
+        # divide the values in WSE_Times_Weight by the 
+        # values in Total_Weight   
+        WSE_array = WSE_Times_Weight / np.where(Total_Weight == 0, np.float32(1e-12), Total_Weight)
 
         # # Iterative spillover: boundary spill points -> upsteam and downstream spread using flowdir until steady-state.
         # max_q = nrows * ncols
