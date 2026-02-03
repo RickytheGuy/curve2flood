@@ -1283,7 +1283,7 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, order_lookup, downstream_lookup, 
     https://kuscholarworks.ku.edu/server/api/core/bitstreams/df102f13-5968-4e45-ad04-91b4d8086de0/content
 
     Propagate each seeded WSE upstream along reverse flow direction, then iteratively
-    perform boundary spillover by routing downstream and backfilling to steady-state.
+    perform boundary spillover and upstream backfill to steady-state.
     A cell is inundated if its elevation is lower than the seed WSE and it drains to
     that seed cell. If multiple seeds reach a cell, keep the maximum WSE.
 
@@ -1299,17 +1299,18 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, order_lookup, downstream_lookup, 
     - ssflg: steady-state toggle (currently not used in this implementation)
 
     Notes:
-    - Spillover candidates are adjacent dry cells with E < WSE; spillover depth is based
-      on max adjacent depth and is recalculated as the floodplain expands.
-    - Spillover routing follows flowdir downstream and each route is backfilled upstream
-      to the spillover depth until steady-state.
+    - Spillover candidates are dry boundary cells adjacent to wet cells where WSE_Out > E.
+    - Candidate depth is selected from wet neighbors using a minimum required depth
+      (tie-breaker: highest boundary elevation).
+    - Spillover floods the candidate point and then backfills upstream (reverse flowdir)
+      to the spill depth until steady-state.
 
     Returns WSE_Out (final WSE), fsp (flood source pixel id), and dtf (depth-to-flood).
     """
     # Initialize outputs: WSE_Out holds max WSE per cell, fsp holds source stream id, dtf holds first inundation stage.
     WSE_Out = np.full((nrows, ncols), np.nan, dtype=np.float32)
-    fsp = np.zeros((nrows, ncols), dtype=np.int32)
-    dtf = np.full((nrows, ncols), np.float32(1.0e20))
+    # fsp = np.zeros((nrows, ncols), dtype=np.int32)
+    # dtf = np.full((nrows, ncols), np.float32(1.0e20))
 
     # Preallocate BFS queue and per-seed visitation map for reverse-flow traversal.
     max_q = nrows * ncols
@@ -1320,7 +1321,12 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, order_lookup, downstream_lookup, 
     # Track adjacent dry neighbors that could be spilled into later.
     end_flag = np.zeros((nrows, ncols), dtype=np.uint8)
 
-    # Iterate over all seed cells with valid WSE_Initial and propagate their WSE upstream.
+    # Collect valid seed cells for ordered traversal by WSE.
+    seed_r = np.empty(max_q, dtype=np.int32)
+    seed_c = np.empty(max_q, dtype=np.int32)
+    seed_wse = np.empty(max_q, dtype=np.float32)
+    seed_src = np.empty(max_q, dtype=np.int32)
+    seed_count = 0
     for sr in range(nrows):
         for sc in range(ncols):
             wse = WSE_Initial[sr, sc]
@@ -1334,167 +1340,185 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, order_lookup, downstream_lookup, 
             if mxht0 > 0.0 and depth_seed > mxht0:
                 continue
             wse = E[sr, sc] + depth_seed
-            # Start a new seed traversal for this stream cell.
-            seed_id += 1
-            q_read = 0
-            q_write = 0
-            q_r[q_write] = sr
-            q_c[q_write] = sc
-            q_write += 1
-            visit_id[sr, sc] = seed_id
+            seed_r[seed_count] = sr
+            seed_c[seed_count] = sc
+            seed_wse[seed_count] = wse
+            seed_src[seed_count] = stream_id[sr, sc] if stream_id[sr, sc] > 0 else 0
+            seed_count += 1
 
-            # Use stream_id as fsp label when available.
-            src_id = stream_id[sr, sc] if stream_id[sr, sc] > 0 else 0
-            if np.isnan(WSE_Out[sr, sc]) or wse > WSE_Out[sr, sc]:
-                WSE_Out[sr, sc] = wse
-                fsp[sr, sc] = src_id
-                dtf[sr, sc] = fldmn
+    # Process seeds from lowest WSE to highest WSE.
+    for _ in range(seed_count):
+        min_idx = -1
+        min_wse = np.float32(1.0e30)
+        for i in range(seed_count):
+            wse = seed_wse[i]
+            if wse < -9998.0:
+                continue
+            if wse < min_wse:
+                min_wse = wse
+                min_idx = i
+        if min_idx < 0:
+            break
+        sr = seed_r[min_idx]
+        sc = seed_c[min_idx]
+        wse = seed_wse[min_idx]
+        src_id = seed_src[min_idx]
+        # Mark processed.
+        seed_wse[min_idx] = np.float32(-9999.0)
 
-            # Breadth-first search (BFS) over reverse-flow neighbors to propagate the fsp WSE upstream.
-            while q_read < q_write:
-                r = q_r[q_read]
-                c = q_c[q_read]
-                q_read += 1
-                added_upstream = False
+        # Start a new seed traversal for this stream cell.
+        seed_id += 1
+        q_read = 0
+        q_write = 0
+        q_r[q_write] = sr
+        q_c[q_write] = sc
+        q_write += 1
+        visit_id[sr, sc] = seed_id
 
-                # Check upstream neighbors whose flowdir points into (r, c).
-                if r > 0 and flowdir[r - 1, c] == 4:
-                    nr = r - 1
-                    nc = c
-                    if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc] and (mxht0 <= 0.0 or (wse - E[nr, nc]) <= mxht0):
-                        # Neighbor drains into (r,c); enqueue and assign WSE if higher.
-                        visit_id[nr, nc] = seed_id
-                        q_r[q_write] = nr
-                        q_c[q_write] = nc
-                        q_write += 1
-                        added_upstream = True
-                        if np.isnan(WSE_Out[nr, nc]) or wse > WSE_Out[nr, nc]:
-                            WSE_Out[nr, nc] = wse
-                            fsp[nr, nc] = src_id
-                            dtf[nr, nc] = fldmn
-                            # Clear spill candidate flag if this cell is now wet.
-                            end_flag[nr, nc] = 0
-                if r < nrows - 1 and flowdir[r + 1, c] == 64:
-                    nr = r + 1
-                    nc = c
-                    if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc] and (mxht0 <= 0.0 or (wse - E[nr, nc]) <= mxht0):
-                        # Neighbor drains into (r,c); enqueue and assign WSE if higher.
-                        visit_id[nr, nc] = seed_id
-                        q_r[q_write] = nr
-                        q_c[q_write] = nc
-                        q_write += 1
-                        added_upstream = True
-                        if np.isnan(WSE_Out[nr, nc]) or wse > WSE_Out[nr, nc]:
-                            WSE_Out[nr, nc] = wse
-                            fsp[nr, nc] = src_id
-                            dtf[nr, nc] = fldmn
-                            # Clear spill candidate flag if this cell is now wet.
-                            end_flag[nr, nc] = 0
-                if c > 0 and flowdir[r, c - 1] == 1:
-                    nr = r
-                    nc = c - 1
-                    if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc] and (mxht0 <= 0.0 or (wse - E[nr, nc]) <= mxht0):
-                        # Neighbor drains into (r,c); enqueue and assign WSE if higher.
-                        visit_id[nr, nc] = seed_id
-                        q_r[q_write] = nr
-                        q_c[q_write] = nc
-                        q_write += 1
-                        added_upstream = True
-                        if np.isnan(WSE_Out[nr, nc]) or wse > WSE_Out[nr, nc]:
-                            WSE_Out[nr, nc] = wse
-                            fsp[nr, nc] = src_id
-                            dtf[nr, nc] = fldmn
-                            # Clear spill candidate flag if this cell is now wet.
-                            end_flag[nr, nc] = 0
-                if c < ncols - 1 and flowdir[r, c + 1] == 16:
-                    nr = r
-                    nc = c + 1
-                    if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc] and (mxht0 <= 0.0 or (wse - E[nr, nc]) <= mxht0):
-                        # Neighbor drains into (r,c); enqueue and assign WSE if higher.
-                        visit_id[nr, nc] = seed_id
-                        q_r[q_write] = nr
-                        q_c[q_write] = nc
-                        q_write += 1
-                        added_upstream = True
-                        if np.isnan(WSE_Out[nr, nc]) or wse > WSE_Out[nr, nc]:
-                            WSE_Out[nr, nc] = wse
-                            fsp[nr, nc] = src_id
-                            dtf[nr, nc] = fldmn
-                            # Clear spill candidate flag if this cell is now wet.
-                            end_flag[nr, nc] = 0
-                if r > 0 and c > 0 and flowdir[r - 1, c - 1] == 2:
-                    nr = r - 1
-                    nc = c - 1
-                    if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc] and (mxht0 <= 0.0 or (wse - E[nr, nc]) <= mxht0):
-                        # Neighbor drains into (r,c); enqueue and assign WSE if higher.
-                        visit_id[nr, nc] = seed_id
-                        q_r[q_write] = nr
-                        q_c[q_write] = nc
-                        q_write += 1
-                        added_upstream = True
-                        if np.isnan(WSE_Out[nr, nc]) or wse > WSE_Out[nr, nc]:
-                            WSE_Out[nr, nc] = wse
-                            fsp[nr, nc] = src_id
-                            dtf[nr, nc] = fldmn
-                            # Clear spill candidate flag if this cell is now wet.
-                            end_flag[nr, nc] = 0
-                if r > 0 and c < ncols - 1 and flowdir[r - 1, c + 1] == 8:
-                    nr = r - 1
-                    nc = c + 1
-                    if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc] and (mxht0 <= 0.0 or (wse - E[nr, nc]) <= mxht0):
-                        # Neighbor drains into (r,c); enqueue and assign WSE if higher.
-                        visit_id[nr, nc] = seed_id
-                        q_r[q_write] = nr
-                        q_c[q_write] = nc
-                        q_write += 1
-                        added_upstream = True
-                        if np.isnan(WSE_Out[nr, nc]) or wse > WSE_Out[nr, nc]:
-                            WSE_Out[nr, nc] = wse
-                            fsp[nr, nc] = src_id
-                            dtf[nr, nc] = fldmn
-                            # Clear spill candidate flag if this cell is now wet.
-                            end_flag[nr, nc] = 0
-                if r < nrows - 1 and c > 0 and flowdir[r + 1, c - 1] == 128:
-                    nr = r + 1
-                    nc = c - 1
-                    if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc] and (mxht0 <= 0.0 or (wse - E[nr, nc]) <= mxht0):
-                        # Neighbor drains into (r,c); enqueue and assign WSE if higher.
-                        visit_id[nr, nc] = seed_id
-                        q_r[q_write] = nr
-                        q_c[q_write] = nc
-                        q_write += 1
-                        added_upstream = True
-                        if np.isnan(WSE_Out[nr, nc]) or wse > WSE_Out[nr, nc]:
-                            WSE_Out[nr, nc] = wse
-                            fsp[nr, nc] = src_id
-                            dtf[nr, nc] = fldmn
-                            # Clear spill candidate flag if this cell is now wet.
-                            end_flag[nr, nc] = 0
-                if r < nrows - 1 and c < ncols - 1 and flowdir[r + 1, c + 1] == 32:
-                    nr = r + 1
-                    nc = c + 1
-                    if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc] and (mxht0 <= 0.0 or (wse - E[nr, nc]) <= mxht0):
-                        # Neighbor drains into (r,c); enqueue and assign WSE if higher.
-                        visit_id[nr, nc] = seed_id
-                        q_r[q_write] = nr
-                        q_c[q_write] = nc
-                        q_write += 1
-                        added_upstream = True
-                        if np.isnan(WSE_Out[nr, nc]) or wse > WSE_Out[nr, nc]:
-                            WSE_Out[nr, nc] = wse
-                            fsp[nr, nc] = src_id
-                            dtf[nr, nc] = fldmn
-                            # Clear spill candidate flag if this cell is now wet.
-                            end_flag[nr, nc] = 0
+        # Use stream_id as fsp label when available.
+        if np.isnan(WSE_Out[sr, sc]) or wse > WSE_Out[sr, sc]:
+            WSE_Out[sr, sc] = wse
+            # fsp[sr, sc] = src_id
+            # dtf[sr, sc] = fldmn
 
+        # Breadth-first search (BFS) over reverse-flow neighbors to propagate the fsp WSE upstream.
+        while q_read < q_write:
+            r = q_r[q_read]
+            c = q_c[q_read]
+            q_read += 1
+            added_upstream = False
 
-    # Iterative spillover: boundary spill points -> downstream routing -> backfill until steady-state.
-    wet = np.zeros((nrows, ncols), dtype=np.uint8)
-    for r in range(nrows):
-        for c in range(ncols):
-            if E[r, c] > -9998.0 and (not np.isnan(WSE_Out[r, c])) and WSE_Out[r, c] > E[r, c]:
-                wet[r, c] = 1
+            # Check upstream neighbors whose flowdir points into (r, c).
+            if r > 0 and flowdir[r - 1, c] == 4:
+                nr = r - 1
+                nc = c
+                if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc] and (mxht0 <= 0.0 or (wse - E[nr, nc]) <= mxht0):
+                    # Neighbor drains into (r,c); enqueue and assign WSE if higher.
+                    visit_id[nr, nc] = seed_id
+                    q_r[q_write] = nr
+                    q_c[q_write] = nc
+                    q_write += 1
+                    added_upstream = True
+                    if np.isnan(WSE_Out[nr, nc]) or wse > WSE_Out[nr, nc]:
+                        WSE_Out[nr, nc] = wse
+                        # fsp[nr, nc] = src_id
+                        # dtf[nr, nc] = fldmn
+                        # Clear spill candidate flag if this cell is now wet.
+                        end_flag[nr, nc] = 0
+            if r < nrows - 1 and flowdir[r + 1, c] == 64:
+                nr = r + 1
+                nc = c
+                if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc] and (mxht0 <= 0.0 or (wse - E[nr, nc]) <= mxht0):
+                    # Neighbor drains into (r,c); enqueue and assign WSE if higher.
+                    visit_id[nr, nc] = seed_id
+                    q_r[q_write] = nr
+                    q_c[q_write] = nc
+                    q_write += 1
+                    added_upstream = True
+                    if np.isnan(WSE_Out[nr, nc]) or wse > WSE_Out[nr, nc]:
+                        WSE_Out[nr, nc] = wse
+                        # fsp[nr, nc] = src_id
+                        # dtf[nr, nc] = fldmn
+                        # Clear spill candidate flag if this cell is now wet.
+                        end_flag[nr, nc] = 0
+            if c > 0 and flowdir[r, c - 1] == 1:
+                nr = r
+                nc = c - 1
+                if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc] and (mxht0 <= 0.0 or (wse - E[nr, nc]) <= mxht0):
+                    # Neighbor drains into (r,c); enqueue and assign WSE if higher.
+                    visit_id[nr, nc] = seed_id
+                    q_r[q_write] = nr
+                    q_c[q_write] = nc
+                    q_write += 1
+                    added_upstream = True
+                    if np.isnan(WSE_Out[nr, nc]) or wse > WSE_Out[nr, nc]:
+                        WSE_Out[nr, nc] = wse
+                        # fsp[nr, nc] = src_id
+                        # dtf[nr, nc] = fldmn
+                        # Clear spill candidate flag if this cell is now wet.
+                        end_flag[nr, nc] = 0
+            if c < ncols - 1 and flowdir[r, c + 1] == 16:
+                nr = r
+                nc = c + 1
+                if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc] and (mxht0 <= 0.0 or (wse - E[nr, nc]) <= mxht0):
+                    # Neighbor drains into (r,c); enqueue and assign WSE if higher.
+                    visit_id[nr, nc] = seed_id
+                    q_r[q_write] = nr
+                    q_c[q_write] = nc
+                    q_write += 1
+                    added_upstream = True
+                    if np.isnan(WSE_Out[nr, nc]) or wse > WSE_Out[nr, nc]:
+                        WSE_Out[nr, nc] = wse
+                        # fsp[nr, nc] = src_id
+                        # dtf[nr, nc] = fldmn
+                        # Clear spill candidate flag if this cell is now wet.
+                        end_flag[nr, nc] = 0
+            if r > 0 and c > 0 and flowdir[r - 1, c - 1] == 2:
+                nr = r - 1
+                nc = c - 1
+                if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc] and (mxht0 <= 0.0 or (wse - E[nr, nc]) <= mxht0):
+                    # Neighbor drains into (r,c); enqueue and assign WSE if higher.
+                    visit_id[nr, nc] = seed_id
+                    q_r[q_write] = nr
+                    q_c[q_write] = nc
+                    q_write += 1
+                    added_upstream = True
+                    if np.isnan(WSE_Out[nr, nc]) or wse > WSE_Out[nr, nc]:
+                        WSE_Out[nr, nc] = wse
+                        # fsp[nr, nc] = src_id
+                        # dtf[nr, nc] = fldmn
+                        # Clear spill candidate flag if this cell is now wet.
+                        end_flag[nr, nc] = 0
+            if r > 0 and c < ncols - 1 and flowdir[r - 1, c + 1] == 8:
+                nr = r - 1
+                nc = c + 1
+                if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc] and (mxht0 <= 0.0 or (wse - E[nr, nc]) <= mxht0):
+                    # Neighbor drains into (r,c); enqueue and assign WSE if higher.
+                    visit_id[nr, nc] = seed_id
+                    q_r[q_write] = nr
+                    q_c[q_write] = nc
+                    q_write += 1
+                    added_upstream = True
+                    if np.isnan(WSE_Out[nr, nc]) or wse > WSE_Out[nr, nc]:
+                        WSE_Out[nr, nc] = wse
+                        # fsp[nr, nc] = src_id
+                        # dtf[nr, nc] = fldmn
+                        # Clear spill candidate flag if this cell is now wet.
+                        end_flag[nr, nc] = 0
+            if r < nrows - 1 and c > 0 and flowdir[r + 1, c - 1] == 128:
+                nr = r + 1
+                nc = c - 1
+                if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc] and (mxht0 <= 0.0 or (wse - E[nr, nc]) <= mxht0):
+                    # Neighbor drains into (r,c); enqueue and assign WSE if higher.
+                    visit_id[nr, nc] = seed_id
+                    q_r[q_write] = nr
+                    q_c[q_write] = nc
+                    q_write += 1
+                    added_upstream = True
+                    if np.isnan(WSE_Out[nr, nc]) or wse > WSE_Out[nr, nc]:
+                        WSE_Out[nr, nc] = wse
+                        # fsp[nr, nc] = src_id
+                        # dtf[nr, nc] = fldmn
+                        # Clear spill candidate flag if this cell is now wet.
+                        end_flag[nr, nc] = 0
+            if r < nrows - 1 and c < ncols - 1 and flowdir[r + 1, c + 1] == 32:
+                nr = r + 1
+                nc = c + 1
+                if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc] and (mxht0 <= 0.0 or (wse - E[nr, nc]) <= mxht0):
+                    # Neighbor drains into (r,c); enqueue and assign WSE if higher.
+                    visit_id[nr, nc] = seed_id
+                    q_r[q_write] = nr
+                    q_c[q_write] = nc
+                    q_write += 1
+                    added_upstream = True
+                    if np.isnan(WSE_Out[nr, nc]) or wse > WSE_Out[nr, nc]:
+                        WSE_Out[nr, nc] = wse
+                        # fsp[nr, nc] = src_id
+                        # dtf[nr, nc] = fldmn
+                        # Clear spill candidate flag if this cell is now wet.
+                        end_flag[nr, nc] = 0
 
+    # Iterative spillover: boundary spill points -> upsteam and downstream spread using flowdir until steady-state.
     candidate_depth = np.full((nrows, ncols), np.float32(-1.0), dtype=np.float32)
     candidate_src = np.zeros((nrows, ncols), dtype=np.int32)
     candidate_wse = np.full((nrows, ncols), np.nan, dtype=np.float32)
@@ -1511,22 +1535,22 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, order_lookup, downstream_lookup, 
     touched_count = 0
     new_r = np.empty(max_q, dtype=np.int32)
     new_c = np.empty(max_q, dtype=np.int32)
-    # Build initial boundary queue of dry cells adjacent to wet cells.
+    # Build initial boundary queue of dry cells adjacent to wet cells (WSE_Out > E).
     bq_read = 0
     bq_write = 0
     for r in range(1, nrows - 1):
         for c in range(1, ncols - 1):
-            if wet[r, c] == 1:
+            if (not np.isnan(WSE_Out[r, c])) and WSE_Out[r, c] > -9998.0 and WSE_Out[r, c] > E[r, c]:
                 continue
             if (
-                (wet[r - 1, c] == 1 and WSE_Out[r - 1, c] > E[r, c]) or
-                (wet[r + 1, c] == 1 and WSE_Out[r + 1, c] > E[r, c]) or
-                (wet[r, c - 1] == 1 and WSE_Out[r, c - 1] > E[r, c]) or
-                (wet[r, c + 1] == 1 and WSE_Out[r, c + 1] > E[r, c]) or
-                (wet[r - 1, c - 1] == 1 and WSE_Out[r - 1, c - 1] > E[r, c]) or
-                (wet[r - 1, c + 1] == 1 and WSE_Out[r - 1, c + 1] > E[r, c]) or
-                (wet[r + 1, c - 1] == 1 and WSE_Out[r + 1, c - 1] > E[r, c]) or
-                (wet[r + 1, c + 1] == 1 and WSE_Out[r + 1, c + 1] > E[r, c])
+                ((not np.isnan(WSE_Out[r - 1, c])) and WSE_Out[r - 1, c] > E[r, c]) or
+                ((not np.isnan(WSE_Out[r + 1, c])) and WSE_Out[r + 1, c] > E[r, c]) or
+                ((not np.isnan(WSE_Out[r, c - 1])) and WSE_Out[r, c - 1] > E[r, c]) or
+                ((not np.isnan(WSE_Out[r, c + 1])) and WSE_Out[r, c + 1] > E[r, c]) or
+                ((not np.isnan(WSE_Out[r - 1, c - 1])) and WSE_Out[r - 1, c - 1] > E[r, c]) or
+                ((not np.isnan(WSE_Out[r - 1, c + 1])) and WSE_Out[r - 1, c + 1] > E[r, c]) or
+                ((not np.isnan(WSE_Out[r + 1, c - 1])) and WSE_Out[r + 1, c - 1] > E[r, c]) or
+                ((not np.isnan(WSE_Out[r + 1, c + 1])) and WSE_Out[r + 1, c + 1] > E[r, c])
             ):
                 if bq_inq[r, c] == 0:
                     bq_r[bq_write] = r
@@ -1535,6 +1559,7 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, order_lookup, downstream_lookup, 
                     bq_write += 1
 
     spill_changed = True
+    debug_spill_count = 0
     while spill_changed:
         spill_changed = False
         new_count = 0
@@ -1548,14 +1573,14 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, order_lookup, downstream_lookup, 
             candidate_bdy_elev[rr, cc] = np.float32(-1.0)
         touched_count = 0
 
-        # Build boundary list from the queue.
+        # Build boundary list from the queue of dry cells adjacent to wet cells.
         boundary_count = 0
         while bq_read < bq_write:
             r = bq_r[bq_read]
             c = bq_c[bq_read]
             bq_read += 1
             bq_inq[r, c] = 0
-            if wet[r, c] == 1:
+            if (not np.isnan(WSE_Out[r, c])) and WSE_Out[r, c] > -9998.0 and WSE_Out[r, c] > E[r, c]:
                 continue
             boundary_r[boundary_count] = r
             boundary_c[boundary_count] = c
@@ -1563,7 +1588,7 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, order_lookup, downstream_lookup, 
         
         # if boundary_count == 0, end the loop because we don't have spillover candidates.
         if boundary_count == 0:
-            spill_changed = True
+            break
             
         # Identify spillover candidates by minimum depth from wet neighbors.
         for i in range(boundary_count):
@@ -1572,27 +1597,35 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, order_lookup, downstream_lookup, 
             obdy_fill = E[r, c]
             if obdy_fill <= -9998.0:
                 continue
-            min_depth = np.float32(1.0e30)
+            min_depth = np.float32(1e30)
             best_src = 0
             best_wse = np.nan
             best_bdy_elev = np.float32(-1.0)
-            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1),
-                            (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+            for dr, dc, fd_in in [(-1, 0, 4), (1, 0, 64), (0, -1, 1), (0, 1, 16),
+                                  (-1, -1, 2), (-1, 1, 8), (1, -1, 128), (1, 1, 32)]:
                 nr = r + dr
                 nc = c + dc
                 if nr < 0 or nr >= nrows or nc < 0 or nc >= ncols:
                     continue
-                if wet[nr, nc] == 0:
+                if np.isnan(WSE_Out[nr, nc]) or WSE_Out[nr, nc] <= -9998.0 or WSE_Out[nr, nc] <= E[nr, nc]:
+                    continue
+                # Only consider wet neighbors that do not flow into the candidate cell.
+                if flowdir[nr, nc] == fd_in:
                     continue
                 bdy_fill = E[nr, nc]
                 if bdy_fill <= -9998.0:
                     continue
-                bdy_dtf = dtf[nr, nc]
-                if bdy_dtf <= 0.0:
-                    continue
+                # bdy_dtf = dtf[nr, nc]
+                # if bdy_dtf <= 0.0:
+                #     continue
                 if WSE_Out[nr, nc] <= obdy_fill:
                     continue
-                depth = WSE_Out[nr, nc] - E[nr, nc]
+                if E[nr, nc] < obdy_fill:
+                    continue
+                depth = WSE_Out[nr, nc] - obdy_fill
+                wse = WSE_Out[nr, nc]
+                # depth = WSE_Out[nr, nc] - obdy_fill
+                # wse = depth + obdy_fill
                 if depth <= 0.0:
                     continue
                 if depth < fldmn:
@@ -1601,17 +1634,11 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, order_lookup, downstream_lookup, 
                     continue
                 if mxht0 > 0.0 and depth > mxht0:
                     continue
-                better = False
                 if depth < min_depth:
-                    better = True
-                elif depth == min_depth and bdy_fill > best_bdy_elev:
-                    better = True
-                if better and depth + obdy_fill <= WSE_Out[nr, nc]:
                     min_depth = depth
-                    best_src = fsp[nr, nc]
-                    best_wse = WSE_Out[nr, nc]
+                    best_wse = wse
                     best_bdy_elev = bdy_fill
-            if min_depth < np.float32(1.0e30):
+            if min_depth < np.float32(1e30):
                 candidate_depth[r, c] = min_depth
                 candidate_src[r, c] = best_src
                 candidate_wse[r, c] = best_wse
@@ -1620,93 +1647,180 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, order_lookup, downstream_lookup, 
                 touched_c[touched_count] = c
                 touched_count += 1
 
-        # Process spillover candidates and backfill from candidate to spill depth.
-        back_read = 0
-        back_write = 0
-        for r in range(1, nrows - 1):
-            for c in range(1, ncols - 1):
-                depth = candidate_depth[r, c]
-                if depth <= 0.0:
-                    continue
-                if depth < fldmn:
-                    continue
-                if depth > fldmx:
-                    continue
-                if wet[r, c] == 1:
-                    continue
-                if mxht0 > 0.0 and depth > mxht0:
-                    continue
 
-                # Flood the spillover point.
-                src_id = candidate_src[r, c]
-                source_wse = candidate_wse[r, c]
-                source_depth = candidate_depth[r, c]
-                if np.isnan(source_wse) or source_wse <= 0.0:
-                    continue
-                if wet[r, c] == 0:
-                    WSE_Out[r, c] = min(E[r, c] + depth, source_wse)
-                    wet[r, c] = 1
-                    new_r[new_count] = r
-                    new_c[new_count] = c
-                    new_count += 1
-                fsp[r, c] = src_id
-                dtf[r, c] = min(dtf[r, c], fldmn)
-                spill_source_wse[r, c] = source_wse
-                spill_source_depth[r, c] = source_depth
-                spill_changed = True
-                q_r[back_write] = r
-                q_c[back_write] = c
-                back_write += 1
 
-        # Backfill upstream from routed spillover paths to the spill depth.
-        while back_read < back_write:
-            r = q_r[back_read]
-            c = q_c[back_read]
-            back_read += 1
-            src_id = fsp[r, c]
-            source_wse = spill_source_wse[r, c]
-            source_depth = spill_source_depth[r, c]
-            if np.isnan(source_wse):
-                continue
-            if source_wse <= E[r, c]:
-                continue
+        # Sort spillover candidates by increasing WSE (NaNs last) using argsort.
+        cand_count = touched_count
+        cand_wse = np.empty(cand_count, dtype=np.float32)
+        for i in range(cand_count):
+            rr = touched_r[i]
+            cc = touched_c[i]
+            wse = candidate_wse[rr, cc]
+            if np.isnan(wse):
+                wse = np.float32(1.0e30)
+            cand_wse[i] = wse
+        cand_idx = np.argsort(cand_wse).astype(np.int32)
+
+        # Process spillover candidates and backfill immediately for each new wet cell.
+        for i in range(cand_count):
+            r = touched_r[cand_idx[i]]
+            c = touched_c[cand_idx[i]]
+            src_id = candidate_src[r, c]
+            source_wse = candidate_wse[r, c]
+            source_depth = candidate_depth[r, c]
             if source_depth <= 0.0:
                 continue
             if source_depth < fldmn:
                 continue
             if source_depth > fldmx:
                 continue
+            if (not np.isnan(WSE_Out[r, c])) and WSE_Out[r, c] > -9998.0 and WSE_Out[r, c] > E[r, c]:
+                continue
             if mxht0 > 0.0 and source_depth > mxht0:
                 continue
-            for dr, dc, fd_in in [(-1, 0, 4), (1, 0, 64), (0, -1, 1), (0, 1, 16),
-                                  (-1, -1, 2), (-1, 1, 8), (1, -1, 128), (1, 1, 32)]:
-                nr = r + dr
-                nc = c + dc
-                if nr < 0 or nr >= nrows or nc < 0 or nc >= ncols:
-                    continue
-                if E[nr, nc] <= -9998.0:
-                    continue
-                if flowdir[nr, nc] != fd_in:
-                    continue
-                if wet[nr, nc] == 1:
-                    continue
-                depth_use = source_depth
-                if source_wse <= E[nr, nc] or E[nr, nc] + depth_use <= E[nr, nc]:
-                    continue
-                if wet[nr, nc] == 0:
-                    WSE_Out[nr, nc] = min(E[nr, nc] + depth_use, source_wse)
-                    wet[nr, nc] = 1
-                    new_r[new_count] = nr
-                    new_c[new_count] = nc
+
+            # Flood the spillover point using the candidate depth.
+            if np.isnan(source_wse) or source_wse <= 0.0:
+                continue
+            if np.isnan(WSE_Out[r, c]) or WSE_Out[r, c] <= -9998.0 or WSE_Out[r, c] <= E[r, c]:
+                if (E[r, c] + source_depth) > E[r, c]:
+                    WSE_Out[r, c] = E[r, c] + source_depth
+                    new_r[new_count] = r
+                    new_c[new_count] = c
+                    spill_source_wse[r, c] = E[r, c] + source_depth
+                    spill_source_depth[r, c] = source_depth
+                    spill_changed = True
                     new_count += 1
-                fsp[nr, nc] = src_id
-                dtf[nr, nc] = min(dtf[nr, nc], fldmn)
-                spill_source_wse[nr, nc] = source_wse
-                spill_source_depth[nr, nc] = source_depth
-                spill_changed = True
-                q_r[back_write] = nr
-                q_c[back_write] = nc
-                back_write += 1
+                else:
+                    continue
+                    # # # Use the new spillover WSE as the source for upstream backfill.
+                    # source_wse = new_wse
+                    # source_depth = new_depth
+            # fsp[r, c] = src_id
+            # dtf[r, c] = min(dtf[r, c], fldmn)
+            # spill_source_wse[r, c] = source_wse
+            # spill_source_depth[r, c] = source_depth
+            # spill_changed = True
+
+            # # Backfill upstream (reverse flowdir) immediately using a stack.
+            # back_write = 0
+            # q_r[back_write] = r
+            # q_c[back_write] = c
+            # back_write += 1
+            # start_r = r
+            # start_c = c
+
+            # while back_write > 0:
+            #     back_write -= 1
+            #     r = q_r[back_write]
+            #     c = q_c[back_write]
+            #     if not (r == start_r and c == start_c):
+            #         if (not np.isnan(WSE_Out[r, c])) and WSE_Out[r, c] > -9998.0 and WSE_Out[r, c] > E[r, c]:
+            #             # Stop upstream routing when we re-enter an already wet pixel.
+            #             continue
+            #     # src_id = fsp[r, c]
+            #     source_wse = spill_source_wse[r, c]
+            #     source_depth = spill_source_depth[r, c]
+            #     if np.isnan(source_wse):
+            #         continue
+            #     if source_wse <= E[r, c]:
+            #         continue
+            #     if source_depth <= 0.0:
+            #         continue
+            #     if source_depth < fldmn:
+            #         continue
+            #     if source_depth > fldmx:
+            #         continue
+            #     if mxht0 > 0.0 and source_depth > mxht0:
+            #         continue
+            #     for dr, dc, fd_in in [(-1, 0, 4), (1, 0, 64), (0, -1, 1), (0, 1, 16),
+            #                         (-1, -1, 2), (-1, 1, 8), (1, -1, 128), (1, 1, 32)]:
+            #         nr = r + dr
+            #         nc = c + dc
+            #         if nr < 0 or nr >= nrows or nc < 0 or nc >= ncols:
+            #             continue
+            #         if E[nr, nc] <= -9998.0:
+            #             continue
+            #         if flowdir[nr, nc] != fd_in:
+            #             continue
+            #         if (not np.isnan(WSE_Out[nr, nc])) and WSE_Out[nr, nc] > -9998.0 and WSE_Out[nr, nc] > E[nr, nc]:
+            #             continue
+            #         depth_use = source_wse - E[nr, nc]
+            #         if depth_use <= 0.0:
+            #             if ssflg == 1:
+            #                 debug_spill_count += 1
+            #             continue
+            #         if depth_use < fldmn:
+            #             continue
+            #         if depth_use > fldmx:
+            #             continue
+            #         if mxht0 > 0.0 and depth_use > mxht0:
+            #             continue
+            #         if np.isnan(WSE_Out[nr, nc]) or WSE_Out[nr, nc] <= -9998.0 or WSE_Out[nr, nc] <= E[nr, nc]:
+            #             WSE_Out[nr, nc] = source_wse
+            #             new_r[new_count] = nr
+            #             new_c[new_count] = nc
+            #             new_count += 1
+            #         # fsp[nr, nc] = src_id
+            #         # dtf[nr, nc] = min(dtf[nr, nc], fldmn)
+            #         spill_source_wse[nr, nc] = source_wse
+            #         spill_source_depth[nr, nc] = depth_use
+            #         spill_changed = True
+            #         q_r[back_write] = nr
+            #         q_c[back_write] = nc
+            #         back_write += 1
+                
+                # # Flow downstream (using flowdir) until encountering a wet cell or dead end.
+                # rr = r
+                # cc = c
+                # steps = 0
+                # while steps < max_q:
+                #     fd = flowdir[rr, cc]
+                #     if fd <= 0:
+                #         break
+                #     if fd == 1:
+                #         dr, dc = 0, 1
+                #     elif fd == 2:
+                #         dr, dc = 1, 1
+                #     elif fd == 4:
+                #         dr, dc = 1, 0
+                #     elif fd == 8:
+                #         dr, dc = 1, -1
+                #     elif fd == 16:
+                #         dr, dc = 0, -1
+                #     elif fd == 32:
+                #         dr, dc = -1, -1
+                #     elif fd == 64:
+                #         dr, dc = -1, 0
+                #     else:
+                #         dr, dc = -1, 1
+                #     rr = rr + dr
+                #     cc = cc + dc
+                #     if rr < 0 or rr >= nrows or cc < 0 or cc >= ncols:
+                #         break
+                #     if E[rr, cc] <= -9998.0:
+                #         break
+                #     if (not np.isnan(WSE_Out[rr, cc])) and WSE_Out[rr, cc] > -9998.0 and WSE_Out[rr, cc] > E[rr, cc]:
+                #         break
+                #     depth_use = source_wse - E[rr, cc]
+                #     if depth_use <= 0.0:
+                #         break
+                #     if depth_use < fldmn:
+                #         break
+                #     if depth_use > fldmx:
+                #         break
+                #     if mxht0 > 0.0 and depth_use > mxht0:
+                #         break
+                #     WSE_Out[rr, cc] = source_wse
+                #     new_r[new_count] = rr
+                #     new_c[new_count] = cc
+                #     new_count += 1
+                #     # fsp[rr, cc] = src_id
+                #     spill_source_wse[rr, cc] = source_wse
+                #     spill_source_depth[rr, cc] = depth_use
+                #     spill_changed = True
+                #     steps += 1
+
 
         # Update boundary queue from newly wet cells.
         for i in range(new_count):
@@ -1718,7 +1832,7 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, order_lookup, downstream_lookup, 
                 nc = c + dc
                 if nr < 1 or nr >= nrows - 1 or nc < 1 or nc >= ncols - 1:
                     continue
-                if wet[nr, nc] == 1:
+                if (not np.isnan(WSE_Out[nr, nc])) and WSE_Out[nr, nc] > -9998.0 and WSE_Out[nr, nc] > E[nr, nc]:
                     continue
                 if WSE_Out[r, c] <= E[nr, nc]:
                     continue
@@ -1731,8 +1845,10 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, order_lookup, downstream_lookup, 
         if new_count == 0:
             spill_changed = False
 
+    if ssflg == 1:
+        print("fldpln spillover debug: source_wse <= candidate E count =", debug_spill_count)
 
-    return WSE_Out, fsp, dtf
+    return WSE_Out
 
 @njit(cache=True, parallel=True)
 def CreateSimpleFloodMapParallel(RR, CC, T_Rast, W_Rast, S_Rast, E, B, 
@@ -1764,29 +1880,29 @@ def CreateSimpleFloodMapParallel(RR, CC, T_Rast, W_Rast, S_Rast, E, B,
         # if using Set_Depth, we want to seed all stream cells with WSE = E + Set_Depth, and then let the FLDPLN model expand from there.
         if Set_Depth > 0.0:
             W_Rast_Padded = np.full((nrows + 2, ncols + 2), np.nan, dtype=np.float32)
-            for r in range(nrows):
-                for c in range(ncols):
+            for r in range(1, nrows + 1):
+                for c in range(1, ncols + 1):
                     if B[r, c] > 0:
-                        W_Rast_Padded[r + 1, c + 1] = E[r, c] + Set_Depth
+                        W_Rast_Padded[r, c] = E[r, c] + Set_Depth
                     else:
-                        W_Rast_Padded[r + 1, c + 1] = np.nan
+                        W_Rast_Padded[r, c] = np.nan
 
         else:
             # pad the W_Rast to make it match E and the other arrays that are all nrows+2 by ncols+2
             W_Rast_Padded = np.full((nrows + 2, ncols + 2), np.nan, dtype=np.float32)
-            for r in range(nrows):
-                for c in range(ncols):
-                    if W_Rast[r, c] > -9998.0:
-                        W_Rast_Padded[r + 1, c + 1] = W_Rast[r, c]
+            for r in range(1, nrows + 1):
+                for c in range(1, ncols + 1):
+                    if W_Rast[r - 1, c - 1] > -9998.0:
+                        W_Rast_Padded[r, c] = W_Rast[r - 1, c - 1]
                     else:
-                        W_Rast_Padded[r + 1, c + 1] = np.nan
+                        W_Rast_Padded[r, c] = np.nan
 
         # This spreads WSE outward from currently-flooded cells to dry cells as long as
         # neighboring ground elevation E can be overtopped.
-        WSE_array, fsp_map, dtf_map = fldpln(
-                                                          W_Rast_Padded, E, flowdir, B, order_lookup, 
-                                                          downstream_lookup, nrows + 2, ncols + 2, 
-                                                          fldmn, fldmx, dh, mxht0, ssflg
+        WSE_array = fldpln(
+                            W_Rast_Padded, E, flowdir, B, order_lookup, 
+                            downstream_lookup, nrows + 2, ncols + 2, 
+                            fldmn, fldmx, dh, mxht0, ssflg
         )
     else:
         
@@ -1954,10 +2070,10 @@ def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, E, B,
 
         # This spreads WSE outward from currently-flooded cells to dry cells as long as
         # neighboring ground elevation E can be overtopped.
-        WSE_array, fsp_map, dtf_map = fldpln(
-                                                          W_Rast_Padded, E, flowdir, B, order_lookup, 
-                                                          downstream_lookup, nrows + 2, ncols + 2, 
-                                                          fldmn, fldmx, dh, mxht0, ssflg
+        WSE_array = fldpln(
+                            W_Rast_Padded, E, flowdir, B, order_lookup, 
+                            downstream_lookup, nrows + 2, ncols + 2, 
+                            fldmn, fldmx, dh, mxht0, ssflg
         )
     else:
         
@@ -2050,9 +2166,186 @@ def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, E, B,
             Total_Weight[r_min:r_max,c_min:c_max] += weight_slice
 
 
-        # divide the values in WSE_Times_Weight by the 
-        # values in Total_Weight   
-        WSE_array = WSE_Times_Weight / np.where(Total_Weight == 0, np.float32(1e-12), Total_Weight)
+        # # divide the values in WSE_Times_Weight by the 
+        # # values in Total_Weight   
+        # WSE_array = WSE_Times_Weight / np.where(Total_Weight == 0, np.float32(1e-12), Total_Weight)
+
+        # # Iterative spillover: boundary spill points -> upsteam and downstream spread using flowdir until steady-state.
+        # max_q = nrows * ncols
+        # candidate_depth = np.full((nrows, ncols), np.float32(-1.0), dtype=np.float32)
+        # candidate_src = np.zeros((nrows, ncols), dtype=np.int32)
+        # candidate_wse = np.full((nrows, ncols), np.nan, dtype=np.float32)
+        # candidate_bdy_elev = np.full((nrows, ncols), np.float32(-1.0), dtype=np.float32)
+        # spill_source_wse = np.full((nrows, ncols), np.nan, dtype=np.float32)
+        # spill_source_depth = np.full((nrows, ncols), np.float32(-1.0), dtype=np.float32)
+        # boundary_r = np.empty(max_q, dtype=np.int32)
+        # boundary_c = np.empty(max_q, dtype=np.int32)
+        # bq_r = np.empty(max_q, dtype=np.int32)
+        # bq_c = np.empty(max_q, dtype=np.int32)
+        # bq_inq = np.zeros((nrows, ncols), dtype=np.uint8)
+        # touched_r = np.empty(max_q, dtype=np.int32)
+        # touched_c = np.empty(max_q, dtype=np.int32)
+        # touched_count = 0
+        # new_r = np.empty(max_q, dtype=np.int32)
+        # new_c = np.empty(max_q, dtype=np.int32)
+        # # Build initial boundary queue of dry cells adjacent to wet cells (WSE_Out > E).
+        # bq_read = 0
+        # bq_write = 0
+        # for r in range(1, nrows - 1):
+        #     for c in range(1, ncols - 1):
+        #         if (not np.isnan(WSE_array[r, c])) and WSE_array[r, c] > -9998.0 and WSE_array[r, c] > E[r, c]:
+        #             continue
+        #         if (
+        #             ((not np.isnan(WSE_array[r - 1, c])) and WSE_array[r - 1, c] > E[r, c]) or
+        #             ((not np.isnan(WSE_array[r + 1, c])) and WSE_array[r + 1, c] > E[r, c]) or
+        #             ((not np.isnan(WSE_array[r, c - 1])) and WSE_array[r, c - 1] > E[r, c]) or
+        #             ((not np.isnan(WSE_array[r, c + 1])) and WSE_array[r, c + 1] > E[r, c]) or
+        #             ((not np.isnan(WSE_array[r - 1, c - 1])) and WSE_array[r - 1, c - 1] > E[r, c]) or
+        #             ((not np.isnan(WSE_array[r - 1, c + 1])) and WSE_array[r - 1, c + 1] > E[r, c]) or
+        #             ((not np.isnan(WSE_array[r + 1, c - 1])) and WSE_array[r + 1, c - 1] > E[r, c]) or
+        #             ((not np.isnan(WSE_array[r + 1, c + 1])) and WSE_array[r + 1, c + 1] > E[r, c])
+        #         ):
+        #             if bq_inq[r, c] == 0:
+        #                 bq_r[bq_write] = r
+        #                 bq_c[bq_write] = c
+        #                 bq_inq[r, c] = 1
+        #                 bq_write += 1
+
+        # spill_changed = True
+        # debug_spill_count = 0
+        # while spill_changed:
+        #     spill_changed = False
+        #     new_count = 0
+
+        #     # Reset candidate values only for touched cells.
+        #     for i in range(touched_count):
+        #         rr = touched_r[i]
+        #         cc = touched_c[i]
+        #         candidate_depth[rr, cc] = np.float32(-1.0)
+        #         candidate_wse[rr, cc] = np.nan
+        #         candidate_bdy_elev[rr, cc] = np.float32(-1.0)
+        #     touched_count = 0
+
+        #     # Build boundary list from the queue of dry cells adjacent to wet cells.
+        #     boundary_count = 0
+        #     while bq_read < bq_write:
+        #         r = bq_r[bq_read]
+        #         c = bq_c[bq_read]
+        #         bq_read += 1
+        #         bq_inq[r, c] = 0
+        #         if (not np.isnan(WSE_array[r, c])) and WSE_array[r, c] > -9998.0 and WSE_array[r, c] > E[r, c]:
+        #             continue
+        #         boundary_r[boundary_count] = r
+        #         boundary_c[boundary_count] = c
+        #         boundary_count += 1
+            
+        #     # if boundary_count == 0, end the loop because we don't have spillover candidates.
+        #     if boundary_count == 0:
+        #         break
+                
+        #     # Identify spillover candidates by minimum depth from wet neighbors.
+        #     for i in range(boundary_count):
+        #         r = boundary_r[i]
+        #         c = boundary_c[i]
+        #         obdy_fill = E[r, c]
+        #         if obdy_fill <= -9998.0:
+        #             continue
+        #         min_depth = np.float32(1e30)
+        #         best_wse = np.nan
+        #         best_bdy_elev = np.float32(-1.0)
+        #         for dr, dc, fd_in in [(-1, 0, 4), (1, 0, 64), (0, -1, 1), (0, 1, 16),
+        #                             (-1, -1, 2), (-1, 1, 8), (1, -1, 128), (1, 1, 32)]:
+        #             nr = r + dr
+        #             nc = c + dc
+        #             if nr < 0 or nr >= nrows or nc < 0 or nc >= ncols:
+        #                 continue
+        #             if np.isnan(WSE_array[nr, nc]) or WSE_array[nr, nc] <= -9998.0 or WSE_array[nr, nc] <= E[nr, nc]:
+        #                 continue
+        #             # Only consider wet neighbors that do not flow into the candidate cell.
+        #             bdy_fill = E[nr, nc]
+        #             if bdy_fill <= -9998.0:
+        #                 continue
+
+        #             if WSE_array[nr, nc] <= obdy_fill:
+        #                 continue
+        #             depth = WSE_array[nr, nc] - obdy_fill
+        #             wse = WSE_array[nr, nc]
+        #             if depth <= 0.0:
+        #                 continue
+        #             if depth < min_depth:
+        #                 min_wse = wse
+        #                 min_depth = depth
+        #                 best_wse = wse
+        #                 best_bdy_elev = bdy_fill
+        #         if min_depth < np.float32(1e30):
+        #             candidate_depth[r, c] = min_depth
+        #             candidate_wse[r, c] = best_wse
+        #             candidate_bdy_elev[r, c] = best_bdy_elev
+        #             touched_r[touched_count] = r
+        #             touched_c[touched_count] = c
+        #             touched_count += 1
+
+        #     # Sort spillover candidates by increasing WSE (NaNs last) using argsort.
+        #     cand_count = touched_count
+        #     cand_wse = np.empty(cand_count, dtype=np.float32)
+        #     for i in range(cand_count):
+        #         rr = touched_r[i]
+        #         cc = touched_c[i]
+        #         wse = candidate_wse[rr, cc]
+        #         if np.isnan(wse):
+        #             wse = np.float32(1.0e30)
+        #         cand_wse[i] = wse
+        #     cand_idx = np.argsort(cand_wse).astype(np.int32)
+
+        #     # Process spillover candidates and backfill immediately for each new wet cell.
+        #     for i in range(cand_count):
+        #         r = touched_r[cand_idx[i]]
+        #         c = touched_c[cand_idx[i]]
+        #         src_id = candidate_src[r, c]
+        #         source_wse = candidate_wse[r, c]
+        #         source_depth = candidate_depth[r, c]
+        #         if (not np.isnan(WSE_array[r, c])) and WSE_array[r, c] > -9998.0 and WSE_array[r, c] > E[r, c]:
+        #             continue
+        #         if mxht0 > 0.0 and source_depth > mxht0:
+        #             continue
+
+        #         # Flood the spillover point using the candidate depth.
+        #         if np.isnan(source_wse) or source_wse <= 0.0:
+        #             continue
+        #         if np.isnan(WSE_array[r, c]) or WSE_array[r, c] <= -9998.0 or WSE_array[r, c] <= E[r, c]:
+        #             if source_wse > E[r, c]:
+        #                 WSE_array[r, c] = E[r, c] + source_depth
+        #                 new_r[new_count] = r
+        #                 new_c[new_count] = c
+        #                 spill_source_wse[r, c] = E[r, c] + source_depth
+        #                 spill_source_depth[r, c] = source_depth
+        #                 spill_changed = True
+        #                 new_count += 1
+        #             else:
+        #                 continue
+
+        #     # Update boundary queue from newly wet cells.
+        #     for i in range(new_count):
+        #         r = new_r[i]
+        #         c = new_c[i]
+        #         for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1),
+        #                     (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+        #             nr = r + dr
+        #             nc = c + dc
+        #             if nr < 1 or nr >= nrows - 1 or nc < 1 or nc >= ncols - 1:
+        #                 continue
+        #             if (not np.isnan(WSE_array[nr, nc])) and WSE_array[nr, nc] > -9998.0 and WSE_array[nr, nc] > E[nr, nc]:
+        #                 continue
+        #             if WSE_array[r, c] <= E[nr, nc]:
+        #                 continue
+        #             if bq_inq[nr, nc] == 0:
+        #                 bq_r[bq_write] = nr
+        #                 bq_c[bq_write] = nc
+        #                 bq_inq[nr, nc] = 1
+        #                 bq_write += 1
+
+        #     if new_count == 0:
+        #         spill_changed = False
 
     Flooded_array = np.where((WSE_array > E) & (E > -9998.0), 1, 0).astype(np.uint8)
 
