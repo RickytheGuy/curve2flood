@@ -232,6 +232,11 @@ def FindFlowRateForEachCOMID_Ensemble(FlowFileName: str, flow_event_num: int) ->
     else:
         flow_df = pd.read_csv(FlowFileName, usecols=[0, flow_event_num + 1])
 
+    # If any of the flow values are nan, send a little warning
+    if flow_df.iloc[:, 1].isna().any():
+        LOG.warning(f"Warning: NaN values found in flow data for event {flow_event_num}. These will be treated as zero flow.")
+        flow_df.iloc[:, 1] = flow_df.iloc[:, 1].fillna(0)
+
     comid_q_dict = flow_df.set_index(flow_df.columns[0])[flow_df.columns[1]].to_dict()
     
     return comid_q_dict
