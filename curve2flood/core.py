@@ -498,7 +498,7 @@ def Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E_DEM, VDTDatabaseFileName: str, C
     
     # Add COMID flow information
     comid_flow_df = pd.DataFrame(COMID_Unique_Flow.items(), columns=['COMID', 'Flow'])
-    vdt_df = vdt_df.merge(comid_flow_df, on='COMID', how='left')    
+    vdt_df = vdt_df.merge(comid_flow_df, on='COMID', how='inner')    
 
     # Ensure row and col are integers
     vdt_df['Row'] = vdt_df['Row'].astype(int)
