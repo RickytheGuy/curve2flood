@@ -2563,7 +2563,7 @@ def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, E, B,
 
     return Flooded_array[1:-1, 1:-1], Depth_array[1:-1, 1:-1], None
 
-@njit("float32[:](float32)", cache=True)
+@njit("float32[:](float32)", cache=True, parallel=True)
 def create_gaussian_kernel_1d(sigma):
     kernel_size = int(6 * sigma + 1)
     if kernel_size % 2 == 0:
@@ -2572,7 +2572,7 @@ def create_gaussian_kernel_1d(sigma):
 
     kernel = np.empty(kernel_size, dtype=np.float32)
 
-    for i in range(kernel_size):
+    for i in prange(kernel_size):
         x = i - center
         kernel[i] = np.exp(- (x**2) / (2.0 * sigma**2))
 
@@ -2581,14 +2581,14 @@ def create_gaussian_kernel_1d(sigma):
 
     return kernel
 
-@njit("float32[:, :](float32[:, :], float32[:])", cache=True)
+@njit("float32[:, :](float32[:, :], float32[:])", cache=True, parallel=True)
 def convolve_rows(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
     nrows, ncols = image.shape
     klen = len(kernel)
     pad = klen // 2
     output = np.empty_like(image)
 
-    for r in range(nrows):
+    for r in prange(nrows):
         for c in range(ncols):
             acc = 0.0
             weight_sum = 0.0
@@ -2606,14 +2606,14 @@ def convolve_rows(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
             output[r, c] = acc / weight_sum if weight_sum > 0 else image[r, c]
     return output
 
-@njit("float32[:, :](float32[:, :], float32[:])", cache=True)
+@njit("float32[:, :](float32[:, :], float32[:])", cache=True, parallel=True)
 def convolve_cols(image, kernel):
     nrows, ncols = image.shape
     klen = len(kernel)
     pad = klen // 2
     output = np.zeros_like(image)
 
-    for c in range(ncols):
+    for c in prange(ncols):
         for r in range(nrows):
             acc = 0.0
             weight_sum = 0.0
@@ -2637,8 +2637,58 @@ def gaussian_blur_separable(image, sigma):
     blurred = convolve_cols(blurred, kernel)
     return blurred
 
-
 @njit(cache=True, parallel=True)
+def spread_Bathy(
+    nrows: int,
+    ncols: int,
+    WeightBox: np.ndarray,
+    TW_for_WeightBox_ElipseMask: int,
+    Bathy: np.ndarray,
+    ARBathyMask: np.ndarray
+):
+    # Arrays to accumulate weighted sums
+    bathy_times_weight = np.zeros_like(Bathy, dtype=np.float32)
+    total_weight       = np.zeros_like(Bathy, dtype=np.float32)
+
+    # 3) For each valid bathy cell, spread its value using WeightBox
+    tw = TW_for_WeightBox_ElipseMask
+    valid_donor = (Bathy > -98.99) & (ARBathyMask == 1)
+
+    for r in prange(1, nrows + 1):
+        for c in range(1, ncols + 1):
+            if ARBathyMask[r, c] != 1:
+                continue
+
+            # window in Bathy space (same pattern as CreateSimpleFloodMap)
+            r_min = max(r - tw, 1)
+            r_max = min(r + tw + 1, nrows + 1)
+            c_min = max(c - tw, 1)
+            c_max = min(c + tw + 1, ncols + 1)
+
+            # corresponding window in WeightBox (centered on [tw, tw])
+            w_r_min = tw - (r - r_min)
+            w_c_min = tw - (c - c_min)
+
+            acc_val = 0.0
+            acc_w = 0.0
+
+            for rr in range(r_min, r_max):
+                wr = w_r_min + (rr - r_min)
+                for cc in range(c_min, c_max):
+                    if not valid_donor[rr, cc]:
+                        continue
+
+                    wc = w_c_min + (cc - c_min)
+                    w = WeightBox[wr, wc]
+
+                    acc_val += Bathy[rr, cc] * w
+                    acc_w += w
+
+            bathy_times_weight[r, c] = acc_val
+            total_weight[r, c] = acc_w
+
+    return bathy_times_weight, total_weight
+
 def Create_Topobathy_Dataset(
     E: np.ndarray,
     nrows: int,
@@ -2658,84 +2708,39 @@ def Create_Topobathy_Dataset(
     # ------------------------------------------------------------
     # 1) PRE-CLEANUP: Outside ARBathyMask, Bathy = DEM BEFORE weighting
     # ------------------------------------------------------------
-    Bathy = Bathy.astype(np.float32).copy()
-    for r in prange(nrows + 2):
-        for c in range(ncols + 2):
-            if ARBathyMask[r, c] == 1 and Bathy[r, c] < -98.99:
-                Bathy[r, c] = E[r, c]
+    mask = (Bathy < -98.99) & (ARBathyMask == 1)
+    Bathy[mask] = E[mask]
 
     # 2) Identify valid bathy donors inside the water mask
     #    (same nodata threshold as before: > -98.99)
-    # Arrays to accumulate weighted sums
-    bathy_times_weight = np.zeros_like(Bathy, dtype=np.float32)
-    total_weight       = np.zeros_like(Bathy, dtype=np.float32)
-
-    # 3) For each valid bathy cell, spread its value using WeightBox
-    tw = TW_for_WeightBox_ElipseMask
-
-    for r_use in range(1, nrows + 1):
-        for c_use in range(1, ncols + 1):
-            if not (Bathy[r_use, c_use] > -98.99 and ARBathyMask[r_use, c_use] == 1):
-                continue
-
-            # window in Bathy space (same pattern as CreateSimpleFloodMap)
-            r_min = max(r_use - tw, 1)
-            r_max = min(r_use + tw + 1, nrows + 1)
-            c_min = max(c_use - tw, 1)
-            c_max = min(c_use + tw + 1, ncols + 1)
-
-            # corresponding window in WeightBox (centered on [tw, tw])
-            w_r_min = tw - (r_use - r_min)
-            w_c_min = tw - (c_use - c_min)
-
-            val = Bathy[r_use, c_use]
-
-            for rr in range(r_min, r_max):
-                wr = w_r_min + (rr - r_min)
-                for cc in range(c_min, c_max):
-                    if ARBathyMask[rr, cc] != 1:
-                        continue
-                    wc = w_c_min + (cc - c_min)
-                    w = WeightBox[wr, wc]
-                    bathy_times_weight[rr, cc] += val * w
-                    total_weight[rr, cc] += w
+    bathy_times_weight, total_weight = spread_Bathy(nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, Bathy, ARBathyMask)
 
     # 5) Start from original Bathy, and fill only where Bathy was invalid
-    filled = Bathy.copy().astype(np.float32)
-    for r in prange(nrows + 2):
-        for c in range(ncols + 2):
-            b = Bathy[r, c]
-            invalid = (b <= -98.99) or (b < -9998.0) or np.isnan(b)
-            if not invalid:
-                continue
-            if total_weight[r, c] > 1e-10:
-                filled[r, c] = bathy_times_weight[r, c] / total_weight[r, c]
-            else:
-                filled[r, c] = E[r, c]
+    filled = Bathy.copy()
+
+    invalid = (Bathy <= -98.99) | np.isnan(Bathy)
+
+    use_weight = invalid & (total_weight > 1e-10)
+    use_dem    = invalid & ~use_weight
+
+    filled[use_weight] = bathy_times_weight[use_weight] / total_weight[use_weight]
+    filled[use_dem] = E[use_dem]
 
     # 6) Optional extra smoothing (you can keep or weaken this)
     sigma_value = 1.0
-    filled = gaussian_blur_separable(filled.astype(np.float32), sigma=sigma_value)
+    filled = gaussian_blur_separable(filled, sigma=sigma_value)
 
     # 7) Outside the AR bathy mask, always use DEM
-    for r in prange(nrows + 2):
-        for c in range(ncols + 2):
-            if ARBathyMask[r, c] != 1:
-                filled[r, c] = E[r, c]
+    mask = ARBathyMask != 1
+    filled[mask] = E[mask]
 
     # 8) Final safety net: any remaining bad values from DEM
-    for r in prange(nrows + 2):
-        for c in range(ncols + 2):
-            val = filled[r, c]
-            if (val <= -98.99) or (val < -9998.0) or np.isnan(val):
-                filled[r, c] = E[r, c]
+    mask = (filled <= -98.99) | (filled < -9998.0) | np.isnan(filled)
+    filled[mask] = E[mask]
 
     # 9) Honor Bathy_Use_Banks: keep bathy from being above DEM if requested
     if Bathy_Use_Banks == False:
-        for r in prange(nrows + 2):
-            for c in range(ncols + 2):
-                if filled[r, c] > E[r, c]:
-                    filled[r, c] = E[r, c]
+        np.minimum(filled, E, out=filled)
 
     # 10) Return interior (arrays are padded by 1)
     return filled[1:nrows+1, 1:ncols+1]
