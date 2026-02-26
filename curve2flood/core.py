@@ -793,7 +793,7 @@ def Write_Output_Raster_As_GeoDataFrame(raster_data, ncols, nrows, dem_geotransf
     mask_band = raster_ds.GetRasterBand(1).GetMaskBand()
 
     # Create an in-memory vector layer for the polygonized data
-    memory_driver = ogr.GetDriverByName('Memory')
+    memory_driver = (ogr.GetDriverByName('MEM') or ogr.GetDriverByName('Memory'))
     vector_ds = memory_driver.CreateDataSource('')
     srs = osr.SpatialReference()
     srs.ImportFromWkt(dem_projection)
