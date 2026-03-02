@@ -238,42 +238,42 @@ def FindFlowRateForEachCOMID_Ensemble(FlowFileName: str, flow_event_num: int) ->
         flow_df.iloc[:, 1] = flow_df.iloc[:, 1].fillna(0)
 
     comid_q_dict = flow_df.set_index(flow_df.columns[0])[flow_df.columns[1]].to_dict()
-    
+
     return comid_q_dict
 
 
-# def filter_outliers(group):
-#     """
-#     A function to filter outliers based on mean and standard deviation for each COMID group
-#     """
-#     # Calculate mean and standard deviation for TopWidth
-#     topwidth_mean = group['TopWidth'].mean()
-#     topwidth_std = group['TopWidth'].std()
-#     lower_bound_tw = topwidth_mean - 1 * topwidth_std
-#     upper_bound_tw = topwidth_mean + 1 * topwidth_std
+def filter_outliers(group):
+    """
+    A function to filter outliers based on mean and standard deviation for each COMID group
+    """
+    # Calculate mean and standard deviation for TopWidth
+    topwidth_mean = group['TopWidth'].mean()
+    topwidth_std = group['TopWidth'].std()
+    lower_bound_tw = topwidth_mean - 2 * topwidth_std
+    upper_bound_tw = topwidth_mean + 2 * topwidth_std
 
-#     # Filter TopWidth outliers
-#     group = group[(group['TopWidth'] >= lower_bound_tw) & (group['TopWidth'] <= upper_bound_tw)]
+    # Filter TopWidth outliers
+    group = group[(group['TopWidth'] >= lower_bound_tw) & (group['TopWidth'] <= upper_bound_tw)]
 
-#     # Calculate mean and standard deviation for WSE
-#     wse_mean = group['WSE'].mean()
-#     wse_std = group['WSE'].std()
-#     lower_bound_wse = wse_mean - 1 * wse_std
-#     upper_bound_wse = wse_mean + 1 * wse_std
+    # Calculate mean and standard deviation for WSE
+    wse_mean = group['WSE'].mean()
+    wse_std = group['WSE'].std()
+    lower_bound_wse = wse_mean - 2 * wse_std
+    upper_bound_wse = wse_mean + 2 * wse_std
 
-#     # Filter WSE outliers
-#     group = group[(group['WSE'] >= lower_bound_wse) & (group['WSE'] <= upper_bound_wse)]
+    # Filter WSE outliers
+    group = group[(group['WSE'] >= lower_bound_wse) & (group['WSE'] <= upper_bound_wse)]
 
-#     # Calculate mean and standard deviation for Velocity
-#     wse_mean = group['Velocity'].mean()
-#     wse_std = group['Velocity'].std()
-#     lower_bound_wse = wse_mean - 1 * wse_std
-#     upper_bound_wse = wse_mean + 1 * wse_std
+    # Calculate mean and standard deviation for Velocity
+    wse_mean = group['Velocity'].mean()
+    wse_std = group['Velocity'].std()
+    lower_bound_wse = wse_mean - 2 * wse_std
+    upper_bound_wse = wse_mean + 2 * wse_std
 
-#     # Filter WSE outliers
-#     group = group[(group['Velocity'] >= lower_bound_wse) & (group['Velocity'] <= upper_bound_wse)]
+    # Filter WSE outliers
+    group = group[(group['Velocity'] >= lower_bound_wse) & (group['Velocity'] <= upper_bound_wse)]
 
-#     return group
+    return group
 
 def compute_tw_multfact_scale(flow: np.ndarray,
                               qbase: np.ndarray,
@@ -515,7 +515,7 @@ def Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E_DEM, VDTDatabaseFileName: str, C
     if VDTDatabaseFileName.endswith('.parquet'):
         vdt_df = pd.read_parquet(VDTDatabaseFileName)
     else:
-        vdt_df = pd.read_csv(VDTDatabaseFileName, engine='pyarrow')
+        vdt_df = pd.read_csv(VDTDatabaseFileName)
         
     if vdt_df.empty:
         raise ValueError("The VDT Database file is empty or could not be read properly.")
@@ -2512,7 +2512,7 @@ def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, E, B,
                     Slope_Times_Weight[r_min:r_max, c_min:c_max] += (SLOPE * weight_slice * FloodLocalMask)
             else:
 
-
+                # This puts the weights from each cell into the composite arrays.
                 cell_wse_weight = WSE * weight_slice                
                 WSE_Times_Weight[r_min:r_max, c_min:c_max] += cell_wse_weight
                 Total_Weight[r_min:r_max,c_min:c_max] += weight_slice
@@ -2521,7 +2521,7 @@ def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, E, B,
                 if S_Rast is not None:
                     Slope_Times_Weight[r_min:r_max, c_min:c_max] += (SLOPE * weight_slice)
 
-
+        # These are the cells that we want to flood based on the weighted WSE being greater than the elevation, and also making sure the elevation is valid and that we have some weight there.
         valid_candidate = (
             (E > -9998.0) &
             (Total_Weight > 0.0) &
@@ -2855,7 +2855,7 @@ def Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
             mannings_n_padded = np.full_like(E, np.nan, dtype=np.float32)
             mannings_n_padded[1:nrows + 1, 1:ncols + 1] = mannings_n.astype(np.float32)
     else:
-        mannings_n_padded = np.zeros_like(E, dtype=np.float32)
+        mannings_n_padded = np.empty((3, 3), dtype=np.float32)  # Dummy array if not used
 
     # we need to compute stream ownership if we are using FLDPLN
     if use_fldpln_model is True:
@@ -2917,9 +2917,10 @@ def Set_Stream_Locations(nrows: int, ncols: int, infilename: str):
     if infilename.endswith('.parquet'):
         df = pd.read_parquet(infilename, columns=['Row', 'Col', 'COMID'])
     else:
-        df = pd.read_csv(infilename, usecols=['Row', 'Col', 'COMID'], engine='pyarrow')
+        df = pd.read_csv(infilename, usecols=['Row', 'Col', 'COMID'])
         
     S[df['Row'].values, df['Col'].values] = df['COMID'].values
+
     return S
 
 def Flood_WaterLC_and_STRM_Cells_in_Flood_Map(Flood_Ensemble, S, LC_array, watervalue):
@@ -3532,7 +3533,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
     E[1:-1, 1:-1] = ds.ReadAsArray()
     ds = None  
 
-    if Flow_Direction_File:
+    if Flow_Direction_File and use_fldpln_model:
         (FDR, fdr_ncols, fdr_nrows, _, _, _, _, _, _, _, _) = Read_Raster_GDAL(Flow_Direction_File)
         if fdr_ncols != ncols or fdr_nrows != nrows:
             LOG.warning("Flow direction raster size does not match DEM; flow-direction gating will be disabled.")
@@ -3541,9 +3542,9 @@ def Curve2Flood_MainFunction(input_file: str = None,
             FlowDir = np.zeros((nrows+2, ncols+2), dtype=np.int32)
             FlowDir[1:-1, 1:-1] = FDR.astype(np.int32)
     else:
-        FlowDir = np.zeros((nrows+2, ncols+2), dtype=np.int32)
+        FlowDir = np.empty((3, 3), dtype=np.int32)  # dummy array to avoid errors downstream; won't be used if flow direction file is missing
 
-    if Flow_Accumulation_File:
+    if Flow_Accumulation_File and use_fldpln_model:
         (FAC, fac_ncols, fac_nrows, _, _, _, _, _, _, _, _) = Read_Raster_GDAL(Flow_Accumulation_File)
         if fac_ncols != ncols or fac_nrows != nrows:
             LOG.warning("Flow accumulation raster size does not match DEM; flow-accumulation input will be ignored.")
@@ -3552,7 +3553,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
             FlowAcc = np.zeros((nrows+2, ncols+2), dtype=np.float32)
             FlowAcc[1:-1, 1:-1] = FAC.astype(np.float32)
     else:
-        FlowAcc = np.zeros((nrows+2, ncols+2), dtype=np.float32)
+        FlowAcc = np.empty((3, 3), dtype=np.float32)  # dummy array to avoid errors downstream; won't be used if flow direction file is missing
 
     # Precompute Manning's n grid for FLDPLN spillover resistance.
     LC_array = None
@@ -3669,7 +3670,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
         S_Rast = None  # will be read later if needed      
 
     #Go through all the Flow Events
-    Flood_array_list = []
+    Flood_Ensemble = np.zeros((nrows, ncols), dtype=np.float16 if num_flows > 1 else np.uint8)  # use uint8 if only one flow, otherwise float16 for percentage calculation
     Depth_array_list = []
     Slope_array_list = []
     for flow_event_num in range(num_flows):
@@ -3680,7 +3681,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
         #Get an Average Flow rate associated with each stream reach.
         if Set_Depth<=0.000000001:
             COMID_Unique_Flow = FindFlowRateForEachCOMID_Ensemble(FlowFileName, flow_event_num)
-        Flood_array, Depth_array, Slope_array = Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, 
+        Flood_array_this_flow, Depth_array, Slope_array = Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, 
                                                             COMID_Unique_Flow, CurveParamFileName, VDTDatabaseFileName,
                                                             Q_Fraction, TopWidthPlausibleLimit, TW_MultFact, WeightBox, 
                                                             TW_for_WeightBox_ElipseMask, LocalFloodOption, Set_Depth, 
@@ -3690,8 +3691,8 @@ def Curve2Flood_MainFunction(input_file: str = None,
                                                             linkno_to_twlimit=linkno_to_twlimit, 
                                                             linkno_to_order=linkno_to_order,
                                                             linkno_to_downstream=linkno_to_downstream)        
-        Flood_array = remove_cells_not_connected(Flood_array, S)
-        Flood_array_list.append(Flood_array)
+        Flood_array_this_flow = remove_cells_not_connected(Flood_array_this_flow, S)
+        Flood_Ensemble += Flood_array_this_flow
         Depth_array_list.append(Depth_array)
         Slope_array_list.append(Slope_array)
 
@@ -3701,10 +3702,10 @@ def Curve2Flood_MainFunction(input_file: str = None,
 
     # Combine all flow events into a single ensemble
     #Turn into a percentage
+    Flood_Ensemble *= 100
     if num_flows > 1:
-        Flood_Ensemble = (100 * np.sum(Flood_array_list, axis=0) / num_flows).astype(np.uint8)
-    else:
-        Flood_Ensemble = Flood_array_list[0] * 100  # Much quicker than nansum
+        Flood_Ensemble /= num_flows
+        Flood_Ensemble = Flood_Ensemble.astype(np.uint8)
 
     # If Flood_WaterLC_and_STRM_Cells or OutVEL is selected, we need to read in the Land Cover Raster
     if Flood_WaterLC_and_STRM_Cells or OutVEL:
@@ -3763,7 +3764,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
     # If the FLDPLN model was used, we need to calculate the Slope_array here
     # We will just use the S_Rast and Flood_array to find the closest slope from S_Rast for each flooded cell
     if use_fldpln_model and S_Rast is not None:
-        Slope_array = Flood_Flooded_Cells_in_Map(S_Rast.astype(np.float32), Flood_array.astype(np.uint8), eps=0.0002)
+        Slope_array = Flood_Flooded_Cells_in_Map(S_Rast.astype(np.float32), Flood_Ensemble.astype(np.uint8), eps=0.0002)
         Slope_array = np.where((Slope_array <= 0), np.nan, Slope_array).astype(np.float32)
         # smooth with Gaussian filter
         sigma_value = 1.00
