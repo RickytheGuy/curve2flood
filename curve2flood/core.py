@@ -1,9 +1,7 @@
 ﻿
 #This code looks at a DEM raster to find the dimensions, then writes a script to create a STRM raster.
 # built-in imports
-import gc
 import json
-import math
 import sys
 import os
 from datetime import datetime
@@ -228,7 +226,7 @@ def convert_cell_size(dem_cell_size, dem_lower_left, dem_upper_right):
 
 def FindFlowRateForEachCOMID_Ensemble(FlowFileName: str, flow_event_num: int) -> dict:  
     if FlowFileName.endswith('.parquet'):
-        flow_df = pd.read_parquet(FlowFileName)
+        flow_df = pd.read_parquet(FlowFileName, engine='fastparquet')
     else:
         flow_df = pd.read_csv(FlowFileName, usecols=[0, flow_event_num + 1])
 
@@ -295,7 +293,7 @@ def Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName: str, COMID_Uniqu
 
     # read the curve data in as a Pandas dataframe
     if CurveParamFileName.endswith('.parquet'):
-        curve_df = pd.read_parquet(CurveParamFileName)
+        curve_df = pd.read_parquet(CurveParamFileName, engine='fastparquet')
     else:
         curve_df = pd.read_csv(CurveParamFileName)
 
@@ -513,9 +511,9 @@ def Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E_DEM, VDTDatabaseFileName: str, C
     
     # Read the VDT Database into a DataFrame
     if VDTDatabaseFileName.endswith('.parquet'):
-        vdt_df = pd.read_parquet(VDTDatabaseFileName)
+        vdt_df = pd.read_parquet(VDTDatabaseFileName, engine='fastparquet')
     else:
-        vdt_df = pd.read_csv(VDTDatabaseFileName, engine='pyarrow')
+        vdt_df = pd.read_csv(VDTDatabaseFileName)
         
     if vdt_df.empty:
         raise ValueError("The VDT Database file is empty or could not be read properly.")
@@ -2915,9 +2913,9 @@ def Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
 def Set_Stream_Locations(nrows: int, ncols: int, infilename: str):
     S = np.full((nrows, ncols), -9999, dtype=np.int32)  #Create an array
     if infilename.endswith('.parquet'):
-        df = pd.read_parquet(infilename, columns=['Row', 'Col', 'COMID'])
+        df = pd.read_parquet(infilename, columns=['Row', 'Col', 'COMID'], engine='fastparquet')
     else:
-        df = pd.read_csv(infilename, usecols=['Row', 'Col', 'COMID'], engine='pyarrow')
+        df = pd.read_csv(infilename, usecols=['Row', 'Col', 'COMID'])
         
     S[df['Row'].values, df['Col'].values] = df['COMID'].values
     return S
