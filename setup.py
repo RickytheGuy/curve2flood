@@ -16,6 +16,7 @@ setup(
         "numpy",
         "pandas",
         "gdal",
+        "fastparquet",
         "rasterio",
         "geopandas",
         "shapely",
