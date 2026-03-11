@@ -22,7 +22,8 @@ setup(
         "shapely",
         "scipy",
         "numba",
-        "tqdm"
+        "tqdm",
+        "pyproj",
     ],
     entry_points={
         "console_scripts": [

@@ -8,3 +8,4 @@ geopandas
 shapely
 scipy
 tqdm
+pyproj
