@@ -1483,19 +1483,19 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
             if fd_ex == 1:
                 dr_ex, dc_ex = 0, 1
             elif fd_ex == 2:
-                dr_ex, dc_ex = 1, 1
+                dr_ex, dc_ex = -1, 1
             elif fd_ex == 4:
-                dr_ex, dc_ex = 1, 0
+                dr_ex, dc_ex = -1, 0
             elif fd_ex == 8:
-                dr_ex, dc_ex = 1, -1
+                dr_ex, dc_ex = -1, -1
             elif fd_ex == 16:
                 dr_ex, dc_ex = 0, -1
             elif fd_ex == 32:
-                dr_ex, dc_ex = -1, -1
+                dr_ex, dc_ex = 1, -1
             elif fd_ex == 64:
-                dr_ex, dc_ex = -1, 0
+                dr_ex, dc_ex = 1, 0
             elif fd_ex == 128:
-                dr_ex, dc_ex = -1, 1
+                dr_ex, dc_ex = 1, 1
             else:
                 break
             nr_ex = rr_ex + dr_ex
@@ -1539,7 +1539,9 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                 c = q_c[q_read]
                 q_read += 1
 
-                if r > 0 and flowdir[r - 1, c] == 4:
+                # Whitebox D8 pointer encoding:
+                # 1=E, 2=NE, 4=N, 8=NW, 16=W, 32=SW, 64=S, 128=SE
+                if r > 0 and flowdir[r - 1, c] == 64:
                     nr = r - 1
                     nc = c
                     if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc]:
@@ -1550,7 +1552,7 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                         if np.isnan(stream_wse[nr, nc]) or wse > stream_wse[nr, nc]:
                             stream_wse[nr, nc] = wse
                             end_flag[nr, nc] = 0
-                if r < nrows - 1 and flowdir[r + 1, c] == 64:
+                if r < nrows - 1 and flowdir[r + 1, c] == 4:
                     nr = r + 1
                     nc = c
                     if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc]:
@@ -1583,7 +1585,7 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                         if np.isnan(stream_wse[nr, nc]) or wse > stream_wse[nr, nc]:
                             stream_wse[nr, nc] = wse
                             end_flag[nr, nc] = 0
-                if r > 0 and c > 0 and flowdir[r - 1, c - 1] == 2:
+                if r > 0 and c > 0 and flowdir[r - 1, c - 1] == 128:
                     nr = r - 1
                     nc = c - 1
                     if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc]:
@@ -1594,7 +1596,7 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                         if np.isnan(stream_wse[nr, nc]) or wse > stream_wse[nr, nc]:
                             stream_wse[nr, nc] = wse
                             end_flag[nr, nc] = 0
-                if r > 0 and c < ncols - 1 and flowdir[r - 1, c + 1] == 8:
+                if r > 0 and c < ncols - 1 and flowdir[r - 1, c + 1] == 32:
                     nr = r - 1
                     nc = c + 1
                     if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc]:
@@ -1605,7 +1607,7 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                         if np.isnan(stream_wse[nr, nc]) or wse > stream_wse[nr, nc]:
                             stream_wse[nr, nc] = wse
                             end_flag[nr, nc] = 0
-                if r < nrows - 1 and c > 0 and flowdir[r + 1, c - 1] == 128:
+                if r < nrows - 1 and c > 0 and flowdir[r + 1, c - 1] == 2:
                     nr = r + 1
                     nc = c - 1
                     if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc]:
@@ -1616,7 +1618,7 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                         if np.isnan(stream_wse[nr, nc]) or wse > stream_wse[nr, nc]:
                             stream_wse[nr, nc] = wse
                             end_flag[nr, nc] = 0
-                if r < nrows - 1 and c < ncols - 1 and flowdir[r + 1, c + 1] == 32:
+                if r < nrows - 1 and c < ncols - 1 and flowdir[r + 1, c + 1] == 8:
                     nr = r + 1
                     nc = c + 1
                     if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and wse > E[nr, nc]:
@@ -1731,8 +1733,7 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                 if obdy_fill <= -9998.0:
                     continue
                 wet_wse = WSE_Out_stream[r, c]
-
-                # Find the candidate dry cell to that the wet cell should spill into.
+                # Find the candidate dry cell that the wet cell should spill into.
                 for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1),
                                     (-1, -1), (-1, 1), (1, -1), (1, 1)]:
                     nr = r + dr
@@ -1741,6 +1742,8 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                         continue
                     # if the cell is excluded for this stream move on
                     if excl[nr, nc] == 1:
+                        continue
+                    if stream_id[nr, nc] > 0:
                         continue
                     # candidate cell's elevation
                     bdy_fill = E[nr, nc]
@@ -1825,8 +1828,7 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                 # Flow downstream (using flowdir) until encountering a wet cell, stream location, or dead end.
                 rr = r
                 cc = c
-                source_wse = WSE_Out_stream[r, c]
-                source_depth = WSE_Out_stream[r, c] - E[r, c]
+                source_wse = spill_source_wse[r, c]
                 steps = 0
                 while steps < max_q:
                     fd = flowdir[rr, cc]
@@ -1835,19 +1837,19 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                     if fd == 1:
                         dr, dc = 0, 1
                     elif fd == 2:
-                        dr, dc = 1, 1
+                        dr, dc = -1, 1
                     elif fd == 4:
-                        dr, dc = 1, 0
+                        dr, dc = -1, 0
                     elif fd == 8:
-                        dr, dc = 1, -1
+                        dr, dc = -1, -1
                     elif fd == 16:
                         dr, dc = 0, -1
                     elif fd == 32:
-                        dr, dc = -1, -1
+                        dr, dc = 1, -1
                     elif fd == 64:
-                        dr, dc = -1, 0
+                        dr, dc = 1, 0
                     else:
-                        dr, dc = -1, 1
+                        dr, dc = 1, 1
                     rr = rr + dr
                     cc = cc + dc
                     if rr < 0 or rr >= nrows or cc < 0 or cc >= ncols:
@@ -1855,21 +1857,20 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                     # if the cell is in the excluded flow path, stop routing it
                     if excl[rr, cc] == 1:
                         break
-                    # if the cell is already a stream cell, stop routing
+                    # if the cell is a stream cell, stop routing
                     if stream_id[rr, cc] > 0:
                         break
                     # if we are at the edge of the DEM stop routing
                     if E[rr, cc] <= -9998.0:
                         break
-                    # if the wse is lower than the elevation, stop routing
+                    # Recompute spill depth at each downstream step from the
+                    # upstream cell's current WSE and the destination elevation.
                     if source_wse <= E[rr, cc]:
                         break
-                    # make sure the water depth is above the land surface
                     depth_use = source_wse - E[rr, cc]
                     if depth_use <= 0.0:
                         break
-                    # this will be the WSE we will use
-                    new_wse = depth_use + E[rr, cc]
+                    new_wse = E[rr, cc] + depth_use
                     wrote = False
                     # if the cell is dry go ahead and flood it
                     if np.isnan(WSE_Out_stream[rr, cc]):
@@ -1898,22 +1899,27 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                         back_write -= 1
                         ur = q_r[back_write]
                         uc = q_c[back_write]
-                        source_wse = spill_source_wse[ur, uc]
-                        source_depth = source_wse - E[ur, uc]
+                        source_depth = spill_source_depth[ur, uc]
+                        if source_depth <= 0.0:
+                            continue
+                        source_wse = E[ur, uc] + source_depth
                         # Stop upstream routing when we re-enter an already wet pixel. Replace the WSE if the backfill WSE is lower than the existing WSE.
                         if (not np.isnan(WSE_Out_stream[ur, uc])):
                             if source_wse < WSE_Out_stream[ur, uc] and source_wse > E[ur, uc]:
                                 WSE_Out_stream[ur, uc] = source_wse
                             else:
                                 continue
-                        if source_depth <= 0.0:
-                            continue
-                        for dr, dc, fd_in in [(-1, 0, 4), (1, 0, 64), (0, -1, 1), (0, 1, 16),
-                                            (-1, -1, 2), (-1, 1, 8), (1, -1, 128), (1, 1, 32)]:
+                        for dr, dc, fd_in in [(-1, 0, 64), (1, 0, 4), (0, -1, 1), (0, 1, 16),
+                                            (-1, -1, 128), (-1, 1, 32), (1, -1, 2), (1, 1, 8)]:
                             nr = ur + dr
                             nc = uc + dc
                             # if we we are out of bounds in the domain stop routing upstream
                             if nr < 0 or nr >= nrows or nc < 0 or nc >= ncols:
+                                continue
+                            if excl[nr, nc] == 1:
+                                continue
+                            # if backfill encounters a stream cell that isn't the current stream, pass it
+                            if stream_id[nr, nc] > 0:
                                 continue
                             # if we we are out of bounds in the domain stop routing upstream
                             if E[nr, nc] <= -9998.0:
@@ -1925,12 +1931,10 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                             wrote_up = False
                             if (not np.isnan(WSE_Out_stream[nr, nc])):
                                 continue
-                            depth_use = source_wse - E[nr, nc]
-                            if depth_use <= 0.0:
-                                continue
+                            new_wse = E[nr, nc] + source_depth
                             # if the cell is dry and the depth is above ground, lets make it wet now 
-                            if np.isnan(WSE_Out_stream[nr, nc]) and source_wse > E[nr, nc]:
-                                WSE_Out_stream[nr, nc] = source_wse
+                            if np.isnan(WSE_Out_stream[nr, nc]) and new_wse > E[nr, nc]:
+                                WSE_Out_stream[nr, nc] = new_wse
                                 wrote_up = True
                                 if new_inq[nr, nc] == 0:
                                     new_r[new_count] = nr
@@ -1939,8 +1943,8 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                                     new_count += 1
                             if not wrote_up:
                                 continue
-                            spill_source_wse[nr, nc] = source_wse
-                            spill_source_depth[nr, nc] = depth_use
+                            spill_source_wse[nr, nc] = new_wse
+                            spill_source_depth[nr, nc] = source_depth
                             spill_changed = True
                             q_r[back_write] = nr
                             q_c[back_write] = nc
@@ -2099,7 +2103,7 @@ def CreateSimpleFloodMapParallel(RR, CC, T_Rast, W_Rast, S_Rast, E, B,
             if WSE < 0.001 or COMID_TW_m < 0.00001 or (WSE - E[r,c]) < 0.001:
                 continue
 
-            
+            # give the TW for the weightbox the median if its smaller than the median.
             if COMID_TW_m > TW_m:
                 COMID_TW_m = TW_m
 
@@ -2130,7 +2134,7 @@ def CreateSimpleFloodMapParallel(RR, CC, T_Rast, W_Rast, S_Rast, E, B,
             w_c_max = TW_for_WeightBox_ElipseMask + (c_max - c_use)
 
             weight_slice = WeightBox[w_r_min:w_r_max, w_c_min:w_c_max]
-            boundary_has_valid = False
+            boundary_has_flooded_too_much = False
             if LocalFloodOption:
                 #Find what would flood local
                 E_Box = E[r_min:r_max,c_min:c_max]
@@ -2141,31 +2145,20 @@ def CreateSimpleFloodMapParallel(RR, CC, T_Rast, W_Rast, S_Rast, E, B,
                     Slope_Times_Weight[r_min:r_max, c_min:c_max] += (SLOPE * weight_slice * FloodLocalMask)
             else:
 
-
+                # This puts the weights from each cell into the composite arrays.
                 cell_wse_weight = WSE * weight_slice                
                 WSE_Times_Weight[r_min:r_max, c_min:c_max] += cell_wse_weight
                 Total_Weight[r_min:r_max,c_min:c_max] += weight_slice
 
-                # determine which sides of weight_slice have stream cells (in the B array)
-                stream_slice = B[r_min:r_max, c_min:c_max]
-                top_has_stream = np.any(stream_slice[0, :] > 0)
-                bottom_has_stream = np.any(stream_slice[-1, :] > 0)
-                left_has_stream = np.any(stream_slice[:, 0] > 0)
-                right_has_stream = np.any(stream_slice[:, -1] > 0)
-                boundary_has_valid = top_has_stream or bottom_has_stream or left_has_stream or right_has_stream
-
+                # This makes a weighted slope raster that can be used for velocity estimates
                 if S_Rast is not None:
                     Slope_Times_Weight[r_min:r_max, c_min:c_max] += (SLOPE * weight_slice)
 
-
-
+        # These are the cells that we want to flood based on the weighted WSE being greater than the elevation, and also making sure the elevation is valid and that we have some weight there.
         valid_candidate = (
             (E > -9998.0) &
-            (Total_Weight > 0.0) &
             (WSE_Times_Weight > E * Total_Weight)  # Keeps the values where WSE is greater than E, which means it would be flooded
         )
-
-
 
         # existing_wse = np.where(valid_existing, num / den, -1.0e30)
         WSE_array = np.where(valid_candidate, WSE_Times_Weight / Total_Weight, np.nan).astype(np.float32)
@@ -2710,56 +2703,15 @@ def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, E, B,
                 if S_Rast is not None:
                     Slope_Times_Weight[r_min:r_max, c_min:c_max] += (SLOPE * weight_slice * FloodLocalMask)
             else:
-                # Let's save these before we go on our adventure to improve the flood map
-                prev_wse_slice = WSE_Times_Weight[r_min:r_max, c_min:c_max].copy()
-                prev_total_slice = Total_Weight[r_min:r_max, c_min:c_max].copy()
 
                 # This puts the weights from each cell into the composite arrays.
                 cell_wse_weight = WSE * weight_slice                
                 WSE_Times_Weight[r_min:r_max, c_min:c_max] += cell_wse_weight
                 Total_Weight[r_min:r_max,c_min:c_max] += weight_slice
 
-                # (compactness, min_edge_frac, max_edge_frac,
-                #   new_cells, max_run, is_blocky) = detect_blocky_contribution(
-                #                                                         WSE_Times_Weight, Total_Weight, E,
-                #                                                         prev_wse_slice, prev_total_slice,
-                #                                                         r_min, r_max, c_min, c_max,
-                #                                                         max_run_threshold = np.int32(COMID_TW//2)
-                #                                                     )
-
-                # # If still above threshold after iteration, remove this cell's contribution entirely.
-                # if is_blocky:
-                #     WSE_Times_Weight[r_min:r_max, c_min:c_max] = prev_wse_slice
-                #     Total_Weight[r_min:r_max, c_min:c_max] = prev_total_slice
-
-                # source_depth is the hydraulic model's predicted depth at this stream cell.
-                # It is the physically meaningful reference — what the model says the water
-                # surface should be above the ground at the source point.
-                # source_depth = np.float32(WSE - E[r_use, c_use])
-
-                # # Only filter when the source itself has a meaningful positive depth.
-                # # A near-zero source depth means the stream cell is barely above ground
-                # # and the spread estimate will be unstable.
-                # if source_depth > np.float32(0.01):
-                #     remove_depth_outliers_from_slice(
-                #         WSE_Times_Weight, Total_Weight, E,
-                #         r_min, r_max, c_min, c_max,
-                #         source_depth,
-                #         n_sigma=np.float32(2.0)
-                #     )
-                # if S_Rast is not None:
-                #     Slope_Times_Weight[r_min:r_max, c_min:c_max] += (SLOPE * weight_slice)
-
-                source_depth = np.float32(WSE - E[r_use, c_use])
-
-                if source_depth > np.float32(0.01):
-                    remove_downhill_drift_contributions(
-                        WSE_Times_Weight, Total_Weight, E,
-                        r_min, r_max, c_min, c_max,
-                        r_use, c_use,
-                        np.float32(WSE),
-                        max_depth_multiplier=np.float32(10.0)
-                    )
+                # This makes a weighted slope raster that can be used for velocity estimates
+                if S_Rast is not None:
+                    Slope_Times_Weight[r_min:r_max, c_min:c_max] += (SLOPE * weight_slice)
 
         # These are the cells that we want to flood based on the weighted WSE being greater than the elevation, and also making sure the elevation is valid and that we have some weight there.
         valid_candidate = (
