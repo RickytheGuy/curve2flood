@@ -1121,192 +1121,6 @@ def _heap_pop(r_heap, c_heap, p_heap, size):
     return r, c, p, size
 
 @njit(cache=True)
-def propagate_wse_fast_convergent(WSE_Initial, E, owner, owner_order, flowdir, nrows, ncols, cellsize, decay_per_meter=0.0001, prefer_low_wse=True, depth_cap=10.0):
-    """
-    Priority-driven propagation with stream-ownership gating.
-
-    1. Captures all IDW seeds (even shallow ones).
-    2. Finalizes cells in priority order (low WSE first by default).
-    3. Prevents cross-basin overwrites by enforcing nearest-stream ownership.
-    4. Uses gentle decay to allow spreading on flat terrain.
-    """
-    WSE_Out = WSE_Initial.copy()
-
-    # Clamp dry-cell WSE to the max of its 4-connected neighbors
-    for r in range(nrows):
-        for c in range(ncols):
-            if E[r, c] <= -9998.0:
-                continue
-            val = WSE_Out[r, c]
-            if np.isnan(val):
-                continue
-            if val >= E[r, c] - 0.1:
-                continue
-
-            max_n = -1.0e20
-            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                nr = r + dr
-                nc = c + dc
-                if 0 <= nr < nrows and 0 <= nc < ncols:
-                    nval = WSE_Out[nr, nc]
-                    if not np.isnan(nval) and nval > max_n:
-                        max_n = nval
-
-            if max_n > -1.0e19 and val > max_n:
-                WSE_Out[r, c] = max_n
-    # owner_median, owner_std = get_owner_stats_all(WSE_Out, owner, nrows, ncols)
-
-    # owner_median, owner_std = get_owner_stats_all(WSE_Work, owner, nrows, ncols)
-
-    # for r in range(nrows):
-    #     for c in range(ncols):
-    #         oid = owner[r, c]
-    #         if oid <= 0:
-    #             continue
-    #         val = WSE_Work[r, c]
-    #         if np.isnan(val):
-    #             continue
-
-    #         med = owner_median[oid]
-    #         std = owner_std[oid]
-
-    #         if not np.isnan(std) and std > 0.0:
-    #             if abs(val - med) > 2.0 * std:
-    #                 WSE_Work[r, c] = med
-    #         if not np.isnan(med) and WSE_Work[r, c] > med:
-    #             WSE_Work[r, c] = med
-
-    # WSE_Out = WSE_Work.copy()
-
-    # 1. DEFINE SOURCE (Relaxed Definition)
-    # Check if WSE is effectively at or above ground (allow -0.1m tolerance for float errors)
-    wet_seed = (WSE_Out >= E - 0.1) & (E > -9998.0) & (~np.isnan(WSE_Out))
-
-    max_q = nrows * ncols
-    heap_r = np.empty(max_q, dtype=np.int32)
-    heap_c = np.empty(max_q, dtype=np.int32)
-    heap_p = np.empty(max_q, dtype=np.float32)
-    heap_size = 0
-
-    finalized = np.zeros((nrows, ncols), dtype=np.uint8)
-    if prefer_low_wse:
-        best = np.full((nrows, ncols), 1e20, dtype=np.float32)
-    else:
-        best = np.full((nrows, ncols), -1e20, dtype=np.float32)
-
-    # 2. SEEDING
-    for r in range(nrows):
-        for c in range(ncols):
-            if wet_seed[r, c]:
-            # if wet_seed[r, c] and owner[r, c] > 0:
-                wse = WSE_Out[r, c]
-                if prefer_low_wse:
-                    if wse < best[r, c]:
-                        best[r, c] = wse
-                        heap_size = _heap_push(heap_r, heap_c, heap_p, heap_size, r, c, wse)
-                else:
-                    if wse > best[r, c]:
-                        best[r, c] = wse
-                        heap_size = _heap_push(heap_r, heap_c, heap_p, heap_size, r, c, -wse)
-
-    # 3. PROPAGATION
-    while heap_size > 0:
-        r, c, p, heap_size = _heap_pop(heap_r, heap_c, heap_p, heap_size)
-        if prefer_low_wse:
-            current_wse = p
-        else:
-            current_wse = -p
-
-        if finalized[r, c]:
-            continue
-        if abs(current_wse - best[r, c]) > 1e-6:
-            continue
-
-        # oid = owner[r, c]
-        # if oid > 0:
-        #     med = owner_median[oid]
-        #     std = owner_std[oid]
-        #     if not np.isnan(std) and std > 0.0:
-        #         if current_wse < (med - 2.0 * std) or current_wse > (med + 2.0 * std):
-        #             continue
-
-        finalized[r, c] = 1
-        WSE_Out[r, c] = current_wse
-
-        local_median, local_std = get_local_stats(r, c, WSE_Out, nrows, ncols)
-
-        # # Gentle Decay (default 10cm/km)
-        # drop = cellsize * decay_per_meter
-
-        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            nr, nc = r + dr, c + dc
-
-            if 0 <= nr < nrows and 0 <= nc < ncols:
-                if E[nr, nc] <= -9998.0:
-                    continue
-                if finalized[nr, nc]:
-                    continue
-                # if owner[nr, nc] != owner[r, c]:
-                #     continue
-                fd = flowdir[r, c]
-                if fd > 0:
-                    if not (
-                        (fd == 1 and dr == 0 and dc == 1) or
-                        (fd == 2 and dr == 1 and dc == 1) or
-                        (fd == 4 and dr == 1 and dc == 0) or
-                        (fd == 8 and dr == 1 and dc == -1) or
-                        (fd == 16 and dr == 0 and dc == -1) or
-                        (fd == 32 and dr == -1 and dc == -1) or
-                        (fd == 64 and dr == -1 and dc == 0) or
-                        (fd == 128 and dr == -1 and dc == 1)
-                    ):
-                        continue
-
-                # --- HYDRAULIC CHECK ---
-                # check if current WSE is above local median plus or minus 2 std-devs (if we have that info)
-                if not np.isnan(local_std) and local_std > 0.0:
-                    if current_wse < (local_median - local_std) or current_wse > (local_median + local_std):
-                        max_allowed_wse = local_median  # <-- This is a hard cap to prevent outliers from spreading too much
-                    else:
-                        max_allowed_wse = current_wse
-                # max_allowed_wse = current_wse - drop
-
-                # Check if water fits
-                if max_allowed_wse > E[nr, nc]:
-                    # Ensure we don't accidentally set WSE below ground
-                    final_wse = max(max_allowed_wse, E[nr, nc])
-                    if depth_cap > 0.0:
-                        if (final_wse - E[nr, nc]) > depth_cap:
-                            continue
-                    # cap = owner_median[owner[r, c]]
-                    # if not np.isnan(cap) and final_wse > cap:
-                    #     final_wse = cap
-
-                    # if owner[nr, nc] != owner[r, c]:
-                    #     continue
-                        # # Allow higher-order owner to overwrite near confluences
-                        # if owner_order[r, c] <= owner_order[nr, nc]:
-                        #     continue
-                        # if mix_zone[nr, nc] == 0:
-                        #     continue
-
-                        # seed_val = WSE_Out[nr, nc]
-                        # seed_val = WSE_Work[nr, nc]
-                        # if not np.isnan(seed_val) and final_wse > seed_val:
-                        #     continue
-
-                    if prefer_low_wse:
-                        if final_wse < best[nr, nc]:
-                            best[nr, nc] = final_wse
-                            heap_size = _heap_push(heap_r, heap_c, heap_p, heap_size, nr, nc, final_wse)
-                    else:
-                        if final_wse > best[nr, nc]:
-                            best[nr, nc] = final_wse
-                            heap_size = _heap_push(heap_r, heap_c, heap_p, heap_size, nr, nc, -final_wse)
-
-    return WSE_Out
-
-@njit(cache=True)
 def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshold, stream_id, owner, order_lookup, downstream_lookup, nrows, ncols, fldmn, fldmx, dh, mxht0, ssflg, mannings_n, dx, dy):
     """
     This function is meant to mimic the FLDPLN model developed at the University of Kansas, translated iteratively
@@ -1456,63 +1270,6 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
             seed_c[seed_count] = sc0
             seed_wse[seed_count] = wse0
             seed_count += 1
-
-        # Per-stream downstream exclusion mask (fldpln-main style 'excl')
-        excl = np.zeros((nrows, ncols), dtype=np.uint8)
-
-        # Find the maximum-FAC cell
-        best_fac = np.float32(1e-5)
-        # to define the exclusion path starting location.
-        for p in range(p0, p1):
-            rr = catalog_r[p]
-            cc = catalog_c[p]
-            fac_v = flowacc[rr, cc]
-            if fac_v > best_fac:
-                best_fac = fac_v
-                end_r = rr
-                end_c = cc
-
-        # Build downstream exclusion path from segment end, excluding end pixel itself.
-        rr_ex = end_r
-        cc_ex = end_c
-        steps_ex = 0
-        while steps_ex < max_q:
-            fd_ex = flowdir[rr_ex, cc_ex]
-            if fd_ex <= 0:
-                break
-            if fd_ex == 1:
-                dr_ex, dc_ex = 0, 1
-            elif fd_ex == 2:
-                dr_ex, dc_ex = -1, 1
-            elif fd_ex == 4:
-                dr_ex, dc_ex = -1, 0
-            elif fd_ex == 8:
-                dr_ex, dc_ex = -1, -1
-            elif fd_ex == 16:
-                dr_ex, dc_ex = 0, -1
-            elif fd_ex == 32:
-                dr_ex, dc_ex = 1, -1
-            elif fd_ex == 64:
-                dr_ex, dc_ex = 1, 0
-            elif fd_ex == 128:
-                dr_ex, dc_ex = 1, 1
-            else:
-                break
-            nr_ex = rr_ex + dr_ex
-            nc_ex = cc_ex + dc_ex
-            if nr_ex < 0 or nr_ex >= nrows or nc_ex < 0 or nc_ex >= ncols:
-                break
-            if E[nr_ex, nc_ex] <= -9998.0:
-                break
-            # Follow exclusion only along FAC-defined stream cells.
-            if flowacc[nr_ex, nc_ex] < flowacc_stream_threshold:
-                break
-            if excl[nr_ex, nc_ex] == 1:
-                break
-            excl[nr_ex, nc_ex] = 1
-            rr_ex = nr_ex
-            cc_ex = nc_ex
-            steps_ex += 1
 
         # Process the seed catalog for this stream.
         for i in range(seed_count):
@@ -1733,15 +1490,15 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                 if obdy_fill <= -9998.0:
                     continue
                 wet_wse = WSE_Out_stream[r, c]
+                wet_depth = wet_wse - obdy_fill
+                if wet_depth <= 0.0:
+                    continue
                 # Find the candidate dry cell that the wet cell should spill into.
                 for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1),
                                     (-1, -1), (-1, 1), (1, -1), (1, 1)]:
                     nr = r + dr
                     nc = c + dc
                     if nr < 0 or nr >= nrows or nc < 0 or nc >= ncols:
-                        continue
-                    # if the cell is excluded for this stream move on
-                    if excl[nr, nc] == 1:
                         continue
                     if stream_id[nr, nc] > 0:
                         continue
@@ -1753,8 +1510,12 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                     # if the cell is wet, ignore it
                     if WSE_Out_stream[nr, nc] > bdy_fill:
                         continue
-                    # water depth passing from the wet cell to the dry cell via spillover
-                    candidate_depth = wet_wse - bdy_fill
+                    # Preserve the wet-cell depth and reduce it only when the
+                    # spill candidate is at a higher elevation.
+                    candidate_depth = wet_depth
+                    delta_elevation = obdy_fill - bdy_fill
+                    if delta_elevation < 0.0:
+                        candidate_depth = candidate_depth + delta_elevation
                     if candidate_depth <= 0.0:
                         continue
                     # Keep a sparse list of newly touched dry cells and retain
@@ -1828,7 +1589,12 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                 # Flow downstream (using flowdir) until encountering a wet cell, stream location, or dead end.
                 rr = r
                 cc = c
+                # initial WSE for spillover
                 source_wse = spill_source_wse[r, c]
+                # intial depth for spilloever
+                depth_use = spill_source_wse[r, c] - E[r, c]
+                # initial elevation
+                previous_elev = E[r, c]
                 steps = 0
                 while steps < max_q:
                     fd = flowdir[rr, cc]
@@ -1854,9 +1620,6 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                     cc = cc + dc
                     if rr < 0 or rr >= nrows or cc < 0 or cc >= ncols:
                         break
-                    # if the cell is in the excluded flow path, stop routing it
-                    if excl[rr, cc] == 1:
-                        break
                     # if the cell is a stream cell, stop routing
                     if stream_id[rr, cc] > 0:
                         break
@@ -1867,7 +1630,10 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                     # upstream cell's current WSE and the destination elevation.
                     if source_wse <= E[rr, cc]:
                         break
-                    depth_use = source_wse - E[rr, cc]
+                    # delta_elevation is almost like a rough head loss term
+                    delta_elevation = previous_elev - E[rr, cc]
+                    if delta_elevation < 0.0:
+                        depth_use = depth_use + delta_elevation
                     if depth_use <= 0.0:
                         break
                     new_wse = E[rr, cc] + depth_use
@@ -1880,6 +1646,8 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                             new_r[new_count] = rr
                             new_c[new_count] = cc
                             new_inq[rr, cc] = 1
+                            source_wse = new_wse
+                            previous_elev = E[rr, cc]
                             new_count += 1
                         spill_source_wse[rr, cc] = new_wse
                     # if the cell is wet stop routing
@@ -1916,8 +1684,6 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                             # if we we are out of bounds in the domain stop routing upstream
                             if nr < 0 or nr >= nrows or nc < 0 or nc >= ncols:
                                 continue
-                            if excl[nr, nc] == 1:
-                                continue
                             # if backfill encounters a stream cell that isn't the current stream, pass it
                             if stream_id[nr, nc] > 0:
                                 continue
@@ -1928,7 +1694,6 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                             if flowdir[nr, nc] != fd_in:
                                 continue
                             # if the cell is already wet, continue to the next location
-                            wrote_up = False
                             if (not np.isnan(WSE_Out_stream[nr, nc])):
                                 continue
                             new_wse = E[nr, nc] + source_depth
@@ -1941,8 +1706,6 @@ def fldpln(WSE_Initial, COMID_TW_m, E, flowdir, flowacc, flowacc_stream_threshol
                                     new_c[new_count] = nc
                                     new_inq[nr, nc] = 1
                                     new_count += 1
-                            if not wrote_up:
-                                continue
                             spill_source_wse[nr, nc] = new_wse
                             spill_source_depth[nr, nc] = source_depth
                             spill_changed = True
