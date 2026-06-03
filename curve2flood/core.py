@@ -1363,8 +1363,8 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, nrows, ncols, dx, dy):
                 q_read += 1
 
                 # Whitebox D8 pointer encoding:
-                # 1=E, 2=NE, 4=N, 8=NW, 16=W, 32=SW, 64=S, 128=SE
-                if r > 0 and flowdir[r - 1, c] == 64:
+                # 1=NE, 2=E, 4=SE, 8=S, 16=SW, 32=W, 64=NW, 128=N
+                if r > 0 and flowdir[r - 1, c] == 8:
                     nr = r - 1
                     nc = c
                     if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and (wse - E[nr, nc]) > 0.1:
@@ -1375,7 +1375,7 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, nrows, ncols, dx, dy):
                         if np.isnan(stream_wse[nr, nc]) or wse > stream_wse[nr, nc]:
                             stream_wse[nr, nc] = wse
                             end_flag[nr, nc] = 0
-                if r < nrows - 1 and flowdir[r + 1, c] == 4:
+                if r < nrows - 1 and flowdir[r + 1, c] == 128:
                     nr = r + 1
                     nc = c
                     if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and (wse - E[nr, nc]) > 0.1:
@@ -1386,7 +1386,7 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, nrows, ncols, dx, dy):
                         if np.isnan(stream_wse[nr, nc]) or wse > stream_wse[nr, nc]:
                             stream_wse[nr, nc] = wse
                             end_flag[nr, nc] = 0
-                if c > 0 and flowdir[r, c - 1] == 1:
+                if c > 0 and flowdir[r, c - 1] == 2:
                     nr = r
                     nc = c - 1
                     if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and (wse - E[nr, nc]) > 0.1:
@@ -1397,7 +1397,7 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, nrows, ncols, dx, dy):
                         if np.isnan(stream_wse[nr, nc]) or wse > stream_wse[nr, nc]:
                             stream_wse[nr, nc] = wse
                             end_flag[nr, nc] = 0
-                if c < ncols - 1 and flowdir[r, c + 1] == 16:
+                if c < ncols - 1 and flowdir[r, c + 1] == 32:
                     nr = r
                     nc = c + 1
                     if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and (wse - E[nr, nc]) > 0.1:
@@ -1408,7 +1408,7 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, nrows, ncols, dx, dy):
                         if np.isnan(stream_wse[nr, nc]) or wse > stream_wse[nr, nc]:
                             stream_wse[nr, nc] = wse
                             end_flag[nr, nc] = 0
-                if r > 0 and c > 0 and flowdir[r - 1, c - 1] == 128:
+                if r > 0 and c > 0 and flowdir[r - 1, c - 1] == 4:
                     nr = r - 1
                     nc = c - 1
                     if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and (wse - E[nr, nc]) > 0.1:
@@ -1419,7 +1419,7 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, nrows, ncols, dx, dy):
                         if np.isnan(stream_wse[nr, nc]) or wse > stream_wse[nr, nc]:
                             stream_wse[nr, nc] = wse
                             end_flag[nr, nc] = 0
-                if r > 0 and c < ncols - 1 and flowdir[r - 1, c + 1] == 32:
+                if r > 0 and c < ncols - 1 and flowdir[r - 1, c + 1] == 16:
                     nr = r - 1
                     nc = c + 1
                     if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and (wse - E[nr, nc]) > 0.1:
@@ -1430,7 +1430,7 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, nrows, ncols, dx, dy):
                         if np.isnan(stream_wse[nr, nc]) or wse > stream_wse[nr, nc]:
                             stream_wse[nr, nc] = wse
                             end_flag[nr, nc] = 0
-                if r < nrows - 1 and c > 0 and flowdir[r + 1, c - 1] == 2:
+                if r < nrows - 1 and c > 0 and flowdir[r + 1, c - 1] == 1:
                     nr = r + 1
                     nc = c - 1
                     if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and (wse - E[nr, nc]) > 0.1:
@@ -1441,7 +1441,7 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, nrows, ncols, dx, dy):
                         if np.isnan(stream_wse[nr, nc]) or wse > stream_wse[nr, nc]:
                             stream_wse[nr, nc] = wse
                             end_flag[nr, nc] = 0
-                if r < nrows - 1 and c < ncols - 1 and flowdir[r + 1, c + 1] == 8:
+                if r < nrows - 1 and c < ncols - 1 and flowdir[r + 1, c + 1] == 64:
                     nr = r + 1
                     nc = c + 1
                     if visit_id[nr, nc] != seed_id and E[nr, nc] > -9998.0 and (wse - E[nr, nc]) > 0.1:
@@ -1667,21 +1667,21 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, nrows, ncols, dx, dy):
                     if fd <= 0:
                         break
                     if fd == 1:
-                        dr, dc = 0, 1
-                    elif fd == 2:
                         dr, dc = -1, 1
+                    elif fd == 2:
+                        dr, dc = 0, 1
                     elif fd == 4:
-                        dr, dc = -1, 0
-                    elif fd == 8:
-                        dr, dc = -1, -1
-                    elif fd == 16:
-                        dr, dc = 0, -1
-                    elif fd == 32:
-                        dr, dc = 1, -1
-                    elif fd == 64:
-                        dr, dc = 1, 0
-                    else:
                         dr, dc = 1, 1
+                    elif fd == 8:
+                        dr, dc = 1, 0
+                    elif fd == 16:
+                        dr, dc = 1, -1
+                    elif fd == 32:
+                        dr, dc = 0, -1
+                    elif fd == 64:
+                        dr, dc = -1, -1
+                    else:
+                        dr, dc = -1, 0
                     rr = rr + dr
                     cc = cc + dc
                     if rr < 0 or rr >= nrows or cc < 0 or cc >= ncols:
@@ -1743,8 +1743,10 @@ def fldpln(WSE_Initial, E, flowdir, stream_id, nrows, ncols, dx, dy):
                                 WSE_Out_stream[ur, uc] = source_wse
                             else:
                                 continue
-                        for dr, dc, fd_in in [(-1, 0, 64), (1, 0, 4), (0, -1, 1), (0, 1, 16),
-                                            (-1, -1, 128), (-1, 1, 32), (1, -1, 2), (1, 1, 8)]:
+
+                        # 1=NE, 2=E, 4=SE, 8=S, 16=SW, 32=W, 64=NW, 128=N
+                        for dr, dc, fd_in in [(-1, 0, 8), (1, 0, 128), (0, -1, 2), (0, 1, 32),
+                                            (-1, -1, 4), (-1, 1, 16), (1, -1, 1), (1, 1, 64)]:
                             nr = ur + dr
                             nc = uc + dc
                             # if we we are out of bounds in the domain stop routing upstream
