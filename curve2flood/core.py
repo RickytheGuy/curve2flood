@@ -620,42 +620,13 @@ def Calculate_TW_D_V_ForEachCOMID_VDTDatabase(E_DEM, VDTDatabaseFileName: str, C
     # Apply the outlier filtering function to each COMID group
     cols = ['TopWidth', 'WSE', 'Velocity']
     for col in cols:
-        # if not fast_vdt:
-        # This is faster, but may have slight differences due to floating point operations (effects 0.025% of flood inundation cells)
-        grp_median = vdt_df.groupby('COMID')[col].transform('median')
-        grp_std = vdt_df.groupby('COMID')[col].transform('std')
+        q01 = vdt_df.groupby('COMID')[col].transform(lambda x: x.quantile(0.01))
+        q99 = vdt_df.groupby('COMID')[col].transform(lambda x: x.quantile(0.99))
 
-        lower = grp_median - 2 * grp_std
-        upper = grp_median + 2 * grp_std
-
-        vdt_df = vdt_df[vdt_df[col].where((vdt_df[col] >= lower) & (vdt_df[col] <= upper)).notna()]
-        # else:
-        #     g = vdt_df.groupby('COMID', group_keys=False)[col]
-        #     mask = g.transform(filter_outliers_helper)
-
-        #     vdt_df = vdt_df[mask > 0]
-
-    # # Apply the outlier filtering function to each COMID group
-    # cols = ['TopWidth', 'WSE', 'Velocity']
-    # for col in cols:
-    #     if not fast_vdt:
-    #         # This is faster, but may have slight differences due to floating point operations (effects 0.025% of flood inundation cells)
-    #         grp_mean = vdt_df.groupby('COMID')[col].transform('mean')
-    #         grp_std = vdt_df.groupby('COMID')[col].transform('std')
-
-    #         lower = grp_mean - 1 * grp_std
-    #         upper = grp_mean + 1 * grp_std
-
-    #         vdt_df = vdt_df[vdt_df[col].where((vdt_df[col] >= lower) & (vdt_df[col] <= upper)).notna()]
-    #     else:
-    #         g = vdt_df.groupby('COMID', group_keys=False)[col]
-    #         mask = g.transform(filter_outliers_helper)
-
-    #         vdt_df = vdt_df[mask > 0]
-
-    # if not fast_vdt:
-    #     vdt_df = vdt_df.sort_values(by=['COMID'], kind='mergesort')
-
+        vdt_df = vdt_df[
+            (vdt_df[col] >= q01) &
+            (vdt_df[col] <= q99)
+        ]
     
     # Fill T_Rast, W_Rast, and S_Rast
     T_Rast[vdt_df['Row'], vdt_df['Col']] = vdt_df['TopWidth']
@@ -2398,7 +2369,7 @@ def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, E, B,
                          COMID_Unique_Depth: COMID_FLOW_DICT_TYPE,
                          WeightBox, TW_for_WeightBox_ElipseMask, 
                          TopWidthPlausibleLimit, Set_Depth, flood_vdt_cells, OutDEP,
-                         mapper):
+                         mapper, OutWSE):
        
     COMID_Averaging_Method = 0
 
@@ -2474,7 +2445,7 @@ def CreateSimpleFloodMap(RR, CC, T_Rast, W_Rast, S_Rast, E, B,
             Flooded_array[RR[i],CC[i]] = 1
 
     # Create the Depth array
-    if OutDEP:
+    if OutDEP or S_Rast is not None or OutWSE:
         Depth_array = np.where((WSE_array > E) & (E > -9998.0), WSE_array - E, np.nan).astype(np.float32)
     else:
         Depth_array = np.empty((3, 3), dtype=np.float32) # Dummy array if not used
@@ -2558,7 +2529,7 @@ def create_kernel_weighted_spread_map(
             if S_Rast is not None:
                 SLOPE = S_Rast[r-1,c-1]
 
-        if WSE < 0.001 or COMID_TW_m < 0.00001 or (WSE - E[r,c]) < 0.001:
+        if COMID_TW_m < 0.00001 or (WSE - E[r,c]) < 0.001:
             continue
 
         # give the TW for the weightbox the median if its smaller than the median.
@@ -4425,7 +4396,7 @@ def Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
                 Q_Fraction, TopWidthPlausibleLimit, TW_MultFact, WeightBox, 
                 TW_for_WeightBox_ElipseMask, LocalFloodOption, Set_Depth, 
                 quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast, OutDEP, 
-                flowdir,
+                flowdir, OutWSE,
                 parallel, fast_vdt, mapper: str = "Curve2Flood-Kernel Weighted",
                 mapper_options: dict | None = None,
                 linkno_to_twlimit=None, linkno_to_order=None, linkno_to_downstream=None):
@@ -4494,7 +4465,7 @@ def Curve2Flood(E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
                                                                     WeightBox, 
                                                                     TW_for_WeightBox_ElipseMask, TopWidthPlausibleLimit, 
                                                                     Set_Depth, flood_vdt_cells, OutDEP,
-                                                                    mapper)
+                                                                    mapper, OutWSE)
     elif mapper == "Curve2Flood-Multi-Point Interpolation":
         # this is the entry point for the functionality from FHS_FloodMapper_AllInOne.py that creates a flood map via multi-point inverse distance interpolation and buffering instead of the low-level raster spreading logic in CreateSimpleFloodMap.
         if parallel:
@@ -4741,49 +4712,14 @@ def create_positive_max_array(array_list: list[np.ndarray]) -> np.ndarray:
     return max_vals.astype(np.float32)
 
 def create_depth(
-                num_flows: int,
                 array_list: list[np.ndarray],
                 Flood_Ensemble: np.ndarray,
-                streams: np.ndarray,
-                E: np.ndarray,
-                geotransform: tuple,
-                projection: str,
-                ncols: int,
-                nrows: int,
-                fname: str,
-                nodata_value: float = -9999.0,
     ):
     min_depth_m = np.float32(0.01)
     max_vals = create_positive_max_array(array_list)
 
     # match the flood extent of Flood_Ensemble
     max_vals = Flood_Flooded_Cells_in_Map(max_vals, Flood_Ensemble, eps=0.01)
-
-    # Convert NaN ? NoData sentinel
-    out_band_data = np.where(np.isnan(max_vals), nodata_value, max_vals).astype(np.float32)
-
-    # --- Write GeoTIFF ---
-    driver = gdal.GetDriverByName("GTiff")
-    ds: gdal.Dataset = driver.Create(
-        fname, ncols, nrows, 1, gdal.GDT_Float32,
-        options=["COMPRESS=DEFLATE", "PREDICTOR=2", "TILED=YES"]
-    )
-    if ds is None:
-        raise RuntimeError(f"Failed to create output raster: {fname}")
-
-    ds.SetGeoTransform(geotransform)
-    ds.SetProjection(projection)
-
-    band = ds.GetRasterBand(1)
-    band.WriteArray(out_band_data)
-    band.SetNoDataValue(nodata_value)
-    band.FlushCache()
-    ds.FlushCache()
-
-    # Cleanup
-    band = None
-    ds = None
-
 
     # # ------------------------------------------------------------------
     # # Find nearest non-zero stream value for every cell (by index)
@@ -5283,7 +5219,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
                                                             Q_Fraction, TopWidthPlausibleLimit, TW_MultFact, WeightBox, 
                                                             TW_for_WeightBox_ElipseMask, LocalFloodOption, Set_Depth, 
                                                             quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast, OutDEP, 
-                                                            FlowDir,
+                                                            FlowDir, OutWSE,
                                                             parallel, fast_vdt, mapper, mapper_options,
                                                             linkno_to_twlimit=linkno_to_twlimit, 
                                                             linkno_to_order=linkno_to_order,
@@ -5328,10 +5264,35 @@ def Curve2Flood_MainFunction(input_file: str = None,
     out_ds = None  # Close the dataset to ensure it's written to disk
 
 
-    if OutDEP:
-        Depth_Array = create_depth(num_flows, Depth_array_list, Flood_Ensemble, S, E, dem_geotransform, dem_projection, ncols, nrows, OutDEP)
+    if OutDEP or OutWSE or OutVEL:
+        Depth_Array = create_depth(Depth_array_list, Flood_Ensemble)
 
-    if OutDEP and OutWSE:
+        if OutDEP:
+            # Convert NaN ? NoData sentinel
+            out_band_data = np.where(np.isnan(Depth_Array), -9999.0, Depth_Array).astype(np.float32)
+
+            # --- Write GeoTIFF ---
+            ds: gdal.Dataset = gdal.GetDriverByName("GTiff").Create(
+                OutDEP, ncols, nrows, 1, gdal.GDT_Float32,
+                options=["COMPRESS=DEFLATE", "PREDICTOR=2", "TILED=YES"]
+            )
+            if ds is None:
+                raise RuntimeError(f"Failed to create output raster: {OutDEP}")
+
+            ds.SetGeoTransform(dem_geotransform)
+            ds.SetProjection(dem_projection)
+
+            band: gdal.Band = ds.GetRasterBand(1)
+            band.WriteArray(out_band_data)
+            band.SetNoDataValue(-9999.0)
+            band.FlushCache()
+            ds.FlushCache()
+
+            # Cleanup
+            band = None
+            ds = None
+
+    if OutWSE:
         WSE_Array = np.where((Depth_Array > 0) & (E[1:-1, 1:-1] > -9998.0), Depth_Array+E[1:-1, 1:-1], np.nan).astype(np.float32)
 
         
@@ -5342,7 +5303,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
             options=["COMPRESS=DEFLATE", "PREDICTOR=2", "TILED=YES"]
         )
         if ds is None:
-            raise RuntimeError(f"Failed to create output raster: {OutDEP}")
+            raise RuntimeError(f"Failed to create output raster: {OutWSE}")
 
         ds.SetGeoTransform(dem_geotransform)
         ds.SetProjection(dem_projection)
@@ -5367,7 +5328,7 @@ def Curve2Flood_MainFunction(input_file: str = None,
         Slope_array = gaussian_blur_separable(Slope_array.astype(np.float32), sigma=sigma_value)
         Slope_array_list = [Slope_array]
 
-    if OutVEL and OutDEP:
+    if OutVEL:
         # Create the velocity output raster
         create_velocity(OutVEL, Depth_Array, LU_Manning_n, LC_array, Slope_array_list, dem_geotransform, dem_projection, ncols, nrows, Flood_Ensemble, S)
 
