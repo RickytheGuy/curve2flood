@@ -1304,7 +1304,9 @@ def get_params(input_file: str = None, args: dict = None):
 
 def validate_params(params: dict):
     required_params = []
-    if params['Flood_File'] or params['OutDEP'] or params['OutWSE'] or params['OutVEL'] or (params['BathyOutputFileName'] and params['BathyFromARFileName'] and not path_exists(params['BathyWaterMaskFileName'])):
+    if (params['Flood_File'] or params['OutDEP'] or params['OutWSE'] or params['OutVEL'] or \
+        (params['BathyOutputFileName'] and params['BathyFromARFileName'] and not path_exists(params['BathyWaterMaskFileName']))) and \
+        not params['Set_Depth'] <= 0.0:
         required_params.append('FlowFileName')
 
     if params['mapper'] == "Curve2Flood-FLDPLNpy":
@@ -1354,6 +1356,10 @@ def main_flood_ouputs(
 
         if Path(params['FLDPLN_Library']).suffix == '.parquet':
             fldpln_library = pl.scan_parquet(params['FLDPLN_Library'])
+            fldpln_library = fldpln_library.with_columns(
+                [pl.col(c).cast(pl.Float32)
+                for c, d in fldpln_library.collect_schema().items() if d == pl.Decimal]
+            )
         else:
             fldpln_library = pl.scan_csv(params['FLDPLN_Library'])
     else:
