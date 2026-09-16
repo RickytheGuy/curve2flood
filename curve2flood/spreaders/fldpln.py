@@ -821,8 +821,7 @@ def _solve_iterative(fil: np.ndarray, fdr: np.ndarray, ncols: int,
 # Segment driver
 # ---------------------------------------------------------------------------
 
-def fldpln_library_for_segment(dem: np.ndarray,
-                               filled_dem: np.ndarray,
+def fldpln_library_for_segment(filled_dem: np.ndarray,
                                flow_direction: np.ndarray,
                                stream_id: int,
                                stream_info: np.ndarray,
@@ -838,10 +837,8 @@ def fldpln_library_for_segment(dem: np.ndarray,
 
     Parameters
     ----------
-    dem : np.ndarray
-        Original elevation raster.
     filled_dem : np.ndarray
-        Filled elevation raster.
+        Filled elevation raster.  The only surface the solvers see.
     flow_direction : np.ndarray
         D8 flow-direction raster, assumes whitebox conventions.
     stream_id : int
@@ -870,20 +867,17 @@ def fldpln_library_for_segment(dem: np.ndarray,
     Returns
     -------
     pandas.DataFrame
-        Table with FSP, FPP, DTF, and fill depth columns.
+        Table with FSP, FPP and DTF columns.
     """
     if solver not in SOLVERS:
         raise ValueError(f"solver must be one of {SOLVERS}, got {solver!r}.")
     if solver == "iterative" and dh <= 0:
         raise ValueError("dh must be positive.")
 
-    nrows, ncols = dem.shape
+    nrows, ncols = filled_dem.shape
     if flow_direction.shape != (nrows, ncols):
         raise ValueError("flow_direction shape must match filled_dem shape.")
-    if filled_dem.shape != (nrows, ncols):
-        raise ValueError("filled_dem shape must match dem shape.")
 
-    dem = np.ascontiguousarray(dem, dtype=np.float32)
     filled_dem = np.ascontiguousarray(filled_dem, dtype=np.float32)
     flow_direction = np.ascontiguousarray(flow_direction, dtype=np.uint8)
 
@@ -897,11 +891,11 @@ def fldpln_library_for_segment(dem: np.ndarray,
     downstream = _downstream_exclusion(stream_id, stream_info, flat_fdr, nrows, ncols)
     downstream = np.fromiter(downstream, dtype=np.int64, count=len(downstream))
 
-    header = ["FSP", "FPP", "DTF", "fill depth"]
+    header = ["FSP", "FPP", "DTF"]
     if stream_pixels.size == 0:
         return pd.DataFrame(
             {"FSP": np.empty(0, np.int32), "FPP": np.empty(0, np.int32),
-             "DTF": np.empty(0, np.float32), "fill depth": np.empty(0, np.float32)},
+             "DTF": np.empty(0, np.float32)},
             columns=header)
 
     margins = _WINDOW_MARGINS + (max(nrows, ncols),)
@@ -940,12 +934,7 @@ def fldpln_library_for_segment(dem: np.ndarray,
 
     fpp = _to_global(cells, ncols, r0, c0, wc)
     fsp = _to_global(source_of, ncols, r0, c0, wc)
-    flat_dem = dem.ravel()
-    flat_filled = filled_dem.ravel()
-    return pd.DataFrame(
-        {"FSP": fsp, "FPP": fpp, "DTF": values,
-         "fill depth": (flat_filled[fpp] - flat_dem[fpp]).astype(np.float32)},
-        columns=header)
+    return pd.DataFrame({"FSP": fsp, "FPP": fpp, "DTF": values}, columns=header)
 
 
 def _set_shared(name: str, shm: shared_memory.SharedMemory):
@@ -980,7 +969,6 @@ def read_array_and_set_shared(file: str, dtype: np.dtype, set_shared: bool,
 
 def run_parallel(args):
     return fldpln_library_for_segment(
-            globals()['dem_array'],
             globals()['filled_dem_array'],
             globals()['flow_direction_array'],
             *args
@@ -1027,7 +1015,6 @@ def init_parallel(
         globals()[name] = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
 
 def build_fldpln_library(
-    dem: str,
     filled_dem: str,
     stream_info_file: str,
     flow_direction_file: str,
@@ -1052,10 +1039,9 @@ def build_fldpln_library(
 
     Parameters
     ----------
-    dem: str
-        Path to the DEM raster.
     filled_dem: str
-        Path to the filled DEM raster.
+        Path to the filled DEM raster.  The only surface the solvers see, and the
+        one the mapper measures its stage against.
     stream_info_file: str
         Path to the stream info CSV file.
     flow_direction_file: str
@@ -1094,16 +1080,15 @@ def build_fldpln_library(
     """
     try:
         _build_fldpln_library(
-            dem, filled_dem, stream_info_file, flow_direction_file, library_file,
+            filled_dem, stream_info_file, flow_direction_file, library_file,
             dh, fldmn, fldmx, iterative_spill, vdt_file, stream_ids,
             global_max_wse, bg, parallel, pbar, processes, bg_mask,
             spill_decay, solver
         )
     finally:
-        close_shared_memory(['dem_array', 'filled_dem_array', 'flow_direction_array'])
+        close_shared_memory(['filled_dem_array', 'flow_direction_array'])
 
 def _build_fldpln_library(
-    dem: str,
     filled_dem: str,
     stream_info_file: str,
     flow_direction_file: str,
@@ -1128,10 +1113,9 @@ def _build_fldpln_library(
 
     Parameters
     ----------
-    dem: str
-        Path to the DEM raster.
     filled_dem: str
-        Path to the filled DEM raster.
+        Path to the filled DEM raster.  The only surface the solvers see, and the
+        one the mapper measures its stage against.
     stream_info_file: str
         Path to the stream info CSV file.
     flow_direction_file: str
@@ -1179,7 +1163,6 @@ def _build_fldpln_library(
     if stream_ids is not None:
         stream_info = stream_info[stream_info.iloc[:, 3].isin(stream_ids)]
 
-    dem_array = read_array_and_set_shared(dem, np.float32, set_shared=parallel, name='dem_array')
     filled_dem_array = read_array_and_set_shared(filled_dem, np.float32, set_shared=parallel, name='filled_dem_array')
     flow_direction_array = read_array_and_set_shared(flow_direction_file, np.uint8, set_shared=parallel, name='flow_direction_array')
 
@@ -1244,22 +1227,21 @@ def _build_fldpln_library(
 
     dfs: list[pd.DataFrame] = []
     if parallel:
-        names = ['dem_array', 'filled_dem_array', 'flow_direction_array']
-        shapes = [dem_array.shape, filled_dem_array.shape, flow_direction_array.shape]
-        dtypes = [dem_array.dtype, filled_dem_array.dtype, flow_direction_array.dtype]
+        names = ['filled_dem_array', 'flow_direction_array']
+        shapes = [filled_dem_array.shape, flow_direction_array.shape]
+        dtypes = [filled_dem_array.dtype, flow_direction_array.dtype]
         with mp.Pool(processes, init_parallel, (names, shapes, dtypes)) as pool:
             for df in pbar(pool.imap_unordered(run_parallel, args), total=len(args), desc="Processing streams in parallel"):
                 dfs.append(df)
     else:
         for i, _ in enumerate(pbar(stream_ids, desc="Processing streams")):
             dfs.append(fldpln_library_for_segment(
-                dem_array,
                 filled_dem_array,
                 flow_direction_array,
                 *args[i]
             ))
 
-    close_shared_memory(['dem_array', 'filled_dem_array', 'flow_direction_array'])
+    close_shared_memory(['filled_dem_array', 'flow_direction_array'])
 
     df = pd.concat(dfs, ignore_index=True)
     dfs = None
@@ -1533,7 +1515,7 @@ def _make_fldpln_flood_map(
         row_chunks.extend([
             (fsp, dof)
             for (fsp, _), dof in zip(path_rows, dof_profile)
-            if np.isfinite(dof) and dof > 0.0
+            if np.isfinite(dof)
         ])
 
     if not row_chunks:
@@ -1546,20 +1528,21 @@ def _make_fldpln_flood_map(
     fldpln_library = fldpln_library.with_columns(
         DTF=(pl.col('DoF') - pl.col('DTF'))
     )
-    # Do NOT filter DTF < 0, because DTF is refering to the filled DEM, not the og DEM. So negative depths are allowed.
-    fldpln_library = fldpln_library.group_by('FPP').agg([
-        pl.max('DTF'),
-        pl.first('fill depth')
-    ])
-    fldpln_library = fldpln_library.with_columns(
-        DTF=(pl.col('DTF') + pl.col('fill depth'))
-    )
+    # ``DoF - DTF`` is the head left over at the floodplain pixel, measured from
+    # the filled DEM, so it is allowed to be negative there -- the pixel is still
+    # wet whenever the filled surface sits above the mapping DEM by more.  Take
+    # the deepest of the sources that reach the pixel.
+    fldpln_library = fldpln_library.group_by('FPP').agg(pl.max('DTF'))
 
     fldpln_library: pl.DataFrame = fldpln_library.collect()
 
     rows = fldpln_library.with_columns(Row=(pl.col('FPP') // ncols).cast(pl.Int32))['Row']
     cols = fldpln_library.with_columns(Col=(pl.col('FPP') % ncols).cast(pl.Int32))['Col']
-    wse_array[rows, cols] = fldpln_library['DTF'] + dem[rows, cols]
+    # The water surface needs no DEM: a library built with a ``fill depth``
+    # column added ``dem + (DoF - DTF) + (filled_dem - dem)``, and ``dem``
+    # cancels.  Libraries that still carry that column simply go unused, so the
+    # two forms give identical maps.
+    wse_array[rows, cols] = fldpln_library['DTF'] + filled_dem[rows, cols]
     mask = (dem > -9998) & (wse_array > dem)
     wse_array[~mask] = np.nan
 
