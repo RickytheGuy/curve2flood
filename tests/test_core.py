@@ -11,7 +11,6 @@ class TestCurve2Flood(unittest.TestCase):
         StrmShp_File path/to/streams.shp
         OutFLD path/to/output_flood.tif
         LU_Water_Value  80
-        Q_Fraction 0.5
         TopWidthPlausibleLimit 200
         TW_MultFact 1.0
         Set_Depth 0.1
@@ -24,7 +23,7 @@ class TestCurve2Flood(unittest.TestCase):
         # Test the input file reading
         params = get_params("test_input.txt")
         self.assertEqual(params["DEM_File"], "path/to/dem.tif")
-        self.assertEqual(params["Q_Fraction"], 0.5)
+        self.assertEqual(params["TW_MultFact"], 1.0)
         self.assertTrue(params["LocalFloodOption"])
     
     def test_curve2flood_main_function(self):
@@ -36,7 +35,6 @@ class TestCurve2Flood(unittest.TestCase):
         StrmShp_File path/to/streams.shp
         OutFLD path/to/output_flood.tif
         LU_Water_Value  80
-        Q_Fraction 0.5
         TopWidthPlausibleLimit 200
         TW_MultFact 1.0
         Set_Depth 0.1

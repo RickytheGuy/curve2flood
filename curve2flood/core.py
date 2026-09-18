@@ -852,7 +852,7 @@ def Calculate_Depth_TopWidth_TWMax_Velocity(params: dict, E, COMID_Unique_Flow, 
     if not quiet:
         for idx, comid in enumerate(COMID_Unique):
             if COMID_Unique_TW[comid]>TopWidthPlausibleLimit:
-                LOG.warning(f"Ignoring {comid}  {COMID_Unique_Flow[comid]}  {COMID_Unique_Flow[comid]*params['Q_Fraction']}  {COMID_Unique_Depth[comid]}  {COMID_Unique_TW[comid]}")  
+                LOG.warning(f"Ignoring {comid}  {COMID_Unique_Flow[comid]}  {COMID_Unique_Depth[comid]}  {COMID_Unique_TW[comid]}")
 
     if TopWidthPlausibleLimit < TopWidthMax:
         TopWidthMax = TopWidthPlausibleLimit
@@ -900,10 +900,7 @@ def make_fldpln_flood_map(
         streams_gdf,
         params['reach_id_field'],
         params['downstream_reach_id_field'],
-        max_wse_rise=params['max_wse_rise'],
         median_filter_size=params['FLDPLN_Median_Filter_Size'],
-        missing_fsp_interpolation=params['FLDPLN_Missing_FSP_Interpolation'],
-        dof_signal=params['FLDPLN_DoF_Signal'],
     )
 
     Flood_array = (wse_array > E[1:-1, 1:-1]).astype(np.uint8)
@@ -1246,7 +1243,6 @@ def get_params(input_file: str = None, args: dict = None):
         'VDTDatabaseFileName': data.get('Print_VDT_Database', ''),
         'CurveParamFileName': data.get('Print_Curve_File', ''),
         'mapper': data.get('mapper', "Curve2Flood-Kernel Weighted"),
-        'Q_Fraction': float(data.get('Q_Fraction', 1.0)),
         'TopWidthPlausibleLimit': float(data.get('TopWidthPlausibleLimit', 1000.0)),
         'TW_MultFact': float(data.get('TW_MultFact', 3.0)),
         'Set_Depth': min(float(data.get('Set_Depth', -1.1)), float(data.get('FloodSpreader_SpecifyDepth', -1.1))),
@@ -1265,8 +1261,6 @@ def get_params(input_file: str = None, args: dict = None):
         'FLDPLN_Library': data.get('FLDPLN_Library', ''),
         'max_wse_rise': float(data.get('max_wse_rise', 0.01)),
         'FLDPLN_Median_Filter_Size': int(data.get('FLDPLN_Median_Filter_Size', data.get('median_filter_size', 53))),
-        'FLDPLN_Missing_FSP_Interpolation': data.get('FLDPLN_Missing_FSP_Interpolation', data.get('missing_fsp_interpolation', 'ffill')),
-        'FLDPLN_DoF_Signal': data.get('FLDPLN_DoF_Signal', data.get('dof_signal', 'min')),
 
         # Multipoint options
         'topwidth_threshold_m': float(data.get('MPI_TopWidth_Threshold_m', 200.0)),

@@ -57,7 +57,6 @@ def scottsbluff_params(output_file: Path) -> dict[str, str | int | bool]:
         "Filled_DEM_File": str(inputs / "fabdem_filled.tif"),
         "Stream_Info_File": str(inputs / "fabdem_stream_info.parquet"),
         "FLDPLN_Library": str(inputs / "fldpln_library.parquet"),
-        "max_wse_rise": "1.5",
         "TW_MultFact": "1.5",
         "TopWidthPlausibleLimit": 6000,
         "percentile": "0.5",
