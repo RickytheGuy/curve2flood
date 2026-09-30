@@ -25,7 +25,14 @@ class TestCurve2Flood(unittest.TestCase):
         self.assertEqual(params["DEM_File"], "path/to/dem.tif")
         self.assertEqual(params["TW_MultFact"], 1.0)
         self.assertTrue(params["LocalFloodOption"])
-    
+        self.assertEqual(params["Set_Depth"], 0.1)
+
+    def test_set_depth_keys(self):
+        # Either key sets the depth (FloodSpreader_SpecifyDepth is what nencarta writes); without one, depths come from flows
+        self.assertEqual(get_params(args={"FloodSpreader_SpecifyDepth": 0.3})["Set_Depth"], 0.3)
+        self.assertEqual(get_params(args={"Set_Depth": "0.2", "FloodSpreader_SpecifyDepth": 0.3})["Set_Depth"], 0.2)
+        self.assertLess(get_params(args={"DEM_File": "path/to/dem.tif"})["Set_Depth"], 0.0)
+
     def test_curve2flood_main_function(self):
         # Create a mock input file
         input_content = """

@@ -723,36 +723,54 @@ def spread_Bathy(
 
     # 3) For each valid bathy cell, spread its value using WeightBox
     tw = TW_for_WeightBox_ElipseMask
-    valid_donor = (Bathy > -98.99) & (ARBathyMask == 1)
+
+    # List the valid donors row by row. A mask cell's window holds few of them (a site can have 370,000 mask cells
+    # and 850 donors, in windows 500+ cells across), so each mask cell visits only the donors in its window's rows
+    # instead of every cell of the window. They are visited in the order the window scan met them, row-major, so
+    # the sums add the same terms in the same order and are bit-for-bit what scanning the window gave.
+    n_donors = 0
+    for rr in range(1, nrows + 1):
+        for cc in range(1, ncols + 1):
+            if Bathy[rr, cc] > -98.99 and ARBathyMask[rr, cc] == 1:
+                n_donors += 1
+    donor_r = np.empty(n_donors, dtype=np.int64)
+    donor_c = np.empty(n_donors, dtype=np.int64)
+    donor_v = np.empty(n_donors, dtype=Bathy.dtype)
+    row_start = np.zeros(nrows + 3, dtype=np.int64)  # row rr's donors are [row_start[rr], row_start[rr + 1])
+    k = 0
+    for rr in range(0, nrows + 2):
+        row_start[rr] = k
+        if 1 <= rr <= nrows:
+            for cc in range(1, ncols + 1):
+                if Bathy[rr, cc] > -98.99 and ARBathyMask[rr, cc] == 1:
+                    donor_r[k] = rr
+                    donor_c[k] = cc
+                    donor_v[k] = Bathy[rr, cc]
+                    k += 1
+    row_start[nrows + 2] = k
 
     for r in prange(1, nrows + 1):
+        # donors in the window's rows (same window as CreateSimpleFloodMap)
+        first = row_start[max(r - tw, 1)]
+        last = row_start[min(r + tw + 1, nrows + 1)]
+        if first == last:
+            continue
         for c in range(1, ncols + 1):
             if ARBathyMask[r, c] != 1:
                 continue
 
-            # window in Bathy space (same pattern as CreateSimpleFloodMap)
-            r_min = max(r - tw, 1)
-            r_max = min(r + tw + 1, nrows + 1)
-            c_min = max(c - tw, 1)
-            c_max = min(c + tw + 1, ncols + 1)
-
-            # corresponding window in WeightBox (centered on [tw, tw])
-            w_r_min = tw - (r - r_min)
-            w_c_min = tw - (c - c_min)
-
             acc_val = 0.0
             acc_w = 0.0
 
-            for rr in range(r_min, r_max):
-                wr = w_r_min + (rr - r_min)
-                for cc in range(c_min, c_max):
-                    if not valid_donor[rr, cc]:
-                        continue
-                    wc = w_c_min + (cc - c_min)
-                    w = WeightBox[wr, wc]
+            for j in range(first, last):
+                cc = donor_c[j]
+                if cc < c - tw or cc > c + tw:
+                    continue
+                # WeightBox is centered on [tw, tw]
+                w = WeightBox[tw + donor_r[j] - r, tw + cc - c]
 
-                    acc_val += Bathy[rr, cc] * w
-                    acc_w += w
+                acc_val += donor_v[j] * w
+                acc_w += w
 
             bathy_times_weight[r, c] = acc_val
             total_weight[r, c] = acc_w
@@ -1247,7 +1265,7 @@ def get_params(input_file: str = None, args: dict = None):
         'mapper': data.get('mapper', "Curve2Flood-Kernel Weighted"),
         'TopWidthPlausibleLimit': float(data.get('TopWidthPlausibleLimit', 1000.0)),
         'TW_MultFact': float(data.get('TW_MultFact', 3.0)),
-        'Set_Depth': min(float(data.get('Set_Depth', -1.1)), float(data.get('FloodSpreader_SpecifyDepth', -1.1))),
+        'Set_Depth': float(data.get('Set_Depth', data.get('FloodSpreader_SpecifyDepth', -1.1))),
         'LocalFloodOption': to_bool(data.get('LocalFloodOption', False)) or to_bool(data.get('FloodLocalOnly', False)),
         'BathyWaterMaskFileName': data.get('BathyWaterMask', ''),
         'BathyFromARFileName': data.get('BATHY_Out_File', ''),
@@ -1303,7 +1321,7 @@ def validate_params(params: dict):
     required_params = []
     if (params['Flood_File'] or params['OutDEP'] or params['OutWSE'] or params['OutVEL'] or \
         (params['BathyOutputFileName'] and params['BathyFromARFileName'] and not path_exists(params['BathyWaterMaskFileName']))) and \
-        not params['Set_Depth'] <= 0.0:
+        params['Set_Depth'] <= 0.0:
         required_params.append('FlowFileName')
 
     if params['mapper'] == "Curve2Flood-FLDPLNpy":
@@ -1418,15 +1436,15 @@ def main_flood_ouputs(
     COMID_Unique = np.unique(B[RR, CC]) # Always sorted
     COMID_Unique = COMID_Unique.astype(int) # Ensure it's treated as integers
 
-    #Order from highest to lowest flow
-    LOG.info('Opening and Reading ' + params['FlowFileName'])
-    num_flows = pd.read_csv(params['FlowFileName'], nrows=0).shape[1] - 1  #Subtract 1 for the COMID Column
-    LOG.info('Evaluating ' + str(num_flows) + ' Flow Events')
-
     #If you're setting a set-depth value for all streams, just need to simulate one flood event
-    if params['Set_Depth'] >= 0.0:
+    if params['Set_Depth'] > 0.0:
         num_flows = 1
-    
+    else:
+        #Order from highest to lowest flow
+        LOG.info('Opening and Reading ' + params['FlowFileName'])
+        num_flows = pd.read_csv(params['FlowFileName'], nrows=0).shape[1] - 1  #Subtract 1 for the COMID Column
+        LOG.info('Evaluating ' + str(num_flows) + ' Flow Events')
+
     # Create initial rasters once, outside the loop
     if params['mapper'] == "Curve2Flood-FLDPLNpy":
         T_Rast = None
@@ -1455,6 +1473,8 @@ def main_flood_ouputs(
         #Get an Average Flow rate associated with each stream reach.
         if params['Set_Depth'] <= 0.000000001:
             COMID_Unique_Flow = FindFlowRateForEachCOMID_Ensemble(params['FlowFileName'], flow_event_num)
+        else:
+            COMID_Unique_Flow = {}  # A set depth needs no flows
         Flood_array_this_flow, Depth_array, Slope_array = Curve2Flood(
             params, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique, 
             COMID_Unique_Flow, WeightBox, TW_for_WeightBox_ElipseMask, 
