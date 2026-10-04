@@ -129,6 +129,10 @@ _WINDOW_MARGINS = (128, 384, 1152)
 # leaving an int32 range worth hundreds of kilometres of depth.
 _DTF_UNITS_PER_METRE = 10000.0
 
+# Library rows the mapper joins at a time: one row group of a library written by
+# save_library.
+_LIBRARY_SLICE_ROWS = 1 << 20
+
 
 @register_jitable(cache=True, nogil=True, forceinline=True)
 def _pixel_to_rc(pixel: int, ncols: int) -> tuple[int, int]:
@@ -233,14 +237,18 @@ def _downstream_exclusion(stream_id: int, stream_info: np.ndarray, fdr: np.ndarr
 # ---------------------------------------------------------------------------
 
 def _window_bounds(pixels: np.ndarray, nrows: int, ncols: int,
-                   margin: int) -> tuple[int, int, int, int]:
-    """Usable window ``(r0, r1, c0, c1)`` around ``pixels``, clipped to the raster."""
+                   margins: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    """Usable window ``(r0, r1, c0, c1)`` around ``pixels``, clipped to the raster.
+
+    ``margins`` are the top, bottom, left and right margins, in cells.
+    """
+    top, bottom, left, right = margins
     rows = pixels // ncols
     cols = pixels % ncols
-    r0 = max(int(rows.min()) - margin, 0)
-    r1 = min(int(rows.max()) + margin + 1, nrows)
-    c0 = max(int(cols.min()) - margin, 0)
-    c1 = min(int(cols.max()) + margin + 1, ncols)
+    r0 = max(int(rows.min()) - top, 0)
+    r1 = min(int(rows.max()) + bottom + 1, nrows)
+    c0 = max(int(cols.min()) - left, 0)
+    c1 = min(int(cols.max()) + right + 1, ncols)
     return r0, r1, c0, c1
 
 def _crop(arr2d: np.ndarray, r0: int, r1: int, c0: int, c1: int, fill) -> np.ndarray:
@@ -267,23 +275,21 @@ def _in_window(pixels: np.ndarray, ncols: int,
     cols = pixels % ncols
     return (rows >= r0) & (rows < r1) & (cols >= c0) & (cols < c1)
 
-def _touches_edge(local: np.ndarray, wr: int, wc: int,
-                  r0: int, r1: int, c0: int, c1: int,
-                  nrows: int, ncols: int) -> bool:
-    """True if a solved cell sits on a usable window edge that is not a raster edge."""
+def _touched_edges(local: np.ndarray, wr: int, wc: int,
+                   r0: int, r1: int, c0: int, c1: int,
+                   nrows: int, ncols: int) -> tuple[bool, bool, bool, bool]:
+    """Which usable window edges that are not raster edges a solved cell sits on.
+
+    Returned as top, bottom, left, right, matching ``_window_bounds``' margins.
+    """
     if local.size == 0:
-        return False
+        return False, False, False, False
     lr = local // wc
     lc = local - lr * wc
-    if r0 > 0 and np.any(lr == 1):
-        return True
-    if r1 < nrows and np.any(lr == wr - 2):
-        return True
-    if c0 > 0 and np.any(lc == 1):
-        return True
-    if c1 < ncols and np.any(lc == wc - 2):
-        return True
-    return False
+    return (r0 > 0 and bool(np.any(lr == 1)),
+            r1 < nrows and bool(np.any(lr == wr - 2)),
+            c0 > 0 and bool(np.any(lc == 1)),
+            c1 < ncols and bool(np.any(lc == wc - 2)))
 
 
 # ---------------------------------------------------------------------------
@@ -941,9 +947,15 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
              "DTF": np.empty(0, np.float32)},
             columns=header)
 
+    # Each side of the window has its own margin and grows only when the
+    # floodplain reaches it: a floodplain usually runs off one way, and growing
+    # every side would solve a window several times its size.  The last margin
+    # reaches the raster edge, which can never be touched, so this ends.
     margins = _WINDOW_MARGINS + (max(nrows, ncols),)
-    for attempt, margin in enumerate(margins):
-        r0, r1, c0, c1 = _window_bounds(stream_pixels, nrows, ncols, margin)
+    level = [0, 0, 0, 0]
+    while True:
+        r0, r1, c0, c1 = _window_bounds(stream_pixels, nrows, ncols,
+                                        tuple(margins[i] for i in level))
         wr, wc = r1 - r0 + 2, c1 - c0 + 2
 
         win_fil = _crop(filled_dem, r0, r1, c0, c1, bg).ravel()
@@ -970,11 +982,14 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
                 win_fil, win_fdr, wc, sources, win_excluded,
                 dh, fldmn, fldmx, iterative_spill, global_max_wse, bg, spill_decay)
 
-        if attempt == len(margins) - 1 or not _touches_edge(
-                cells, wr, wc, r0, r1, c0, c1, nrows, ncols):
+        touched = _touched_edges(cells, wr, wc, r0, r1, c0, c1, nrows, ncols)
+        if not any(touched):
             break
-        LOG.debug("Stream %s reached its %d-cell window; retrying larger.",
-                  stream_id, margin)
+        LOG.debug("Stream %s reached its window's %s edge; retrying larger.", stream_id,
+                  "/".join(side for side, t in zip(("top", "bottom", "left", "right"), touched) if t))
+        level = [min(i + t, len(margins) - 1) for i, t in zip(level, touched)]
+        # Free this window before cropping the next one
+        del win_fil, win_fdr, win_excluded, cells, values, source_of
 
     # Left out only now, so that cells reached through them still grow the window
     if max_drop_below_source is not None:
@@ -996,6 +1011,21 @@ def _set_shared(name: str, shm: shared_memory.SharedMemory):
     global _SHARED_MEMORYS
     _SHARED_MEMORYS[name] = shm
 
+def _read_into(ds: gdal.Dataset, arr: np.ndarray):
+    """``arr[:] = ds.ReadAsArray()``, a strip of rows at a time.
+
+    Reading the whole raster at once holds a second copy in the file's own data
+    type (float64 for some filled DEMs) and keeps every block in GDAL's cache
+    until the file is closed; a strip at a time holds only a strip of each.
+    """
+    band = ds.GetRasterBand(1)
+    block_rows = band.GetBlockSize()[1]
+    step = block_rows * max(1, 512 // block_rows)
+    for r in range(0, arr.shape[0], step):
+        n = min(step, arr.shape[0] - r)
+        arr[r:r + n] = band.ReadAsArray(0, r, arr.shape[1], n)
+        band.FlushCache()
+
 def read_array_and_set_shared(file: str, dtype: np.dtype, set_shared: bool,
                               name: str = None):
     ds = gdal.Open(file)
@@ -1007,13 +1037,13 @@ def read_array_and_set_shared(file: str, dtype: np.dtype, set_shared: bool,
             shape, 
             dtype=dtype
         )
-        arr[:] = ds.ReadAsArray()
+        _read_into(ds, arr)
         return arr
     
     size = int(dtype.itemsize * np.prod(shape))
     shm = shared_memory.SharedMemory(name=name, create=True, size=size)
     arr = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
-    arr[:] = ds.ReadAsArray()
+    _read_into(ds, arr)
     globals()[name] = arr
     _set_shared(name, shm)
     return arr
@@ -1262,18 +1292,25 @@ def _build_fldpln_library(
     if vdt_file is None:
         max_depths = [fldmx] * len(stream_ids)
     else:
-        if Path(vdt_file).suffix in {'.parquet', '.pq'}:
-            vdt_df = pd.read_parquet(vdt_file)
+        # Read only the columns used: the VDT carries ~120 more
+        is_parquet = Path(vdt_file).suffix in {'.parquet', '.pq'}
+        if is_parquet:
+            vdt_columns = pq.read_schema(vdt_file).names
         else:
-            vdt_df = pd.read_csv(vdt_file)
-
-        vdt_df = vdt_df[vdt_df['COMID'].isin(stream_ids)]
+            vdt_columns = pd.read_csv(vdt_file, nrows=0).columns
         # Find last wse_* column
-        wse_cols = [col for col in vdt_df.columns if col.startswith('wse_')]
+        wse_cols = [col for col in vdt_columns if col.startswith('wse_')]
         assert wse_cols, "No wse_* columns found in VDT file"
         max_wse_col = wse_cols[-1]
+        usecols = ['COMID', 'Row', 'Col', max_wse_col]
+        if is_parquet:
+            vdt_df = pd.read_parquet(vdt_file, columns=usecols)
+        else:
+            vdt_df = pd.read_csv(vdt_file, usecols=usecols)
+
+        vdt_df = vdt_df[vdt_df['COMID'].isin(stream_ids)]
         # making a copy to resolve a fragmentation warning from pandas
-        vdt_df = vdt_df[['COMID', 'Row', 'Col', max_wse_col]].copy()
+        vdt_df = vdt_df[usecols].copy()
         elevation = filled_dem_array[vdt_df['Row'], vdt_df['Col']]
         vdt_df['depth'] = vdt_df[max_wse_col] - elevation
         # Background cells, like masked lakes, are never flooded from, and their depth would be measured from bg
@@ -1336,6 +1373,8 @@ def _build_fldpln_library(
             ))
 
     close_shared_memory(['filled_dem_array', 'flow_direction_array'])
+    # Not needed past the solves: free them before the library is assembled
+    del filled_dem_array, flow_direction_array
 
     if max_cells:
         limits = [d.attrs["depth_limit"] for d in dfs if d.attrs.get("depth_limit") is not None]
@@ -1346,7 +1385,12 @@ def _build_fldpln_library(
 
     df = pd.concat(dfs, ignore_index=True)
     dfs = None
-    df = df.sort_values(['FSP', 'FPP'], kind='stable', ignore_index=True) # Sorting like this allows very nice compression
+    # Sorting like this allows very nice compression.  sort_values(['FSP', 'FPP'],
+    # kind='stable') ends in this same np.lexsort, after first factorising both
+    # keys into copies.
+    order = np.lexsort((df['FPP'].to_numpy(), df['FSP'].to_numpy()))
+    df = pd.DataFrame({c: df[c].to_numpy()[order] for c in df.columns}, copy=False)
+    del order
     if Path(library_file).suffix in {'.parquet', '.pq'}:
         save_library(df, library_file)
     else:
@@ -1569,7 +1613,8 @@ def _make_fldpln_flood_map(
             if fsp == -1:
                 break
 
-    wse_array = np.full_like(dem, np.nan, dtype=np.float32)
+    # C order whatever ``dem``'s layout: the library's flat pixel ids index it
+    wse_array = np.full(dem.shape, np.nan, dtype=np.float32)
     if not stream_rows:
         return wse_array
     
@@ -1623,35 +1668,40 @@ def _make_fldpln_flood_map(
         orient='row',
     )
 
-    # merge the two dataframes on the row and column indices
-    joined = fldpln_library.join(df, on='FSP', how='inner').collect()
-    # Keep only the pairs whose source can still stand over the pixel once its
-    # stage is spent.  The library's downhill edges are free, so without this a
-    # stream pixel reaches every cell that drains past it, however far below.
-    joined = joined.with_columns(
-        FppFil=pl.Series('FppFil', filled_dem.ravel()[joined['FPP'].to_numpy()])
-    ).filter(
-        pl.col('SrcFil') - pl.col('FppFil') <= pl.col('DoF') + max_drop_below_source
-    )
-
-    fldpln_library = joined.lazy().with_columns(
-        DTF=(pl.col('DoF') - pl.col('DTF'))
-    )
-    # ``DoF - DTF`` is the head left over at the floodplain pixel, measured from
-    # the filled DEM, so it is allowed to be negative there -- the pixel is still
-    # wet whenever the filled surface sits above the mapping DEM by more.  Take
-    # the deepest of the sources that reach the pixel.
-    fldpln_library = fldpln_library.group_by('FPP').agg(pl.max('DTF'))
-
-    fldpln_library: pl.DataFrame = fldpln_library.collect()
-
-    rows = fldpln_library.with_columns(Row=(pl.col('FPP') // ncols).cast(pl.Int32))['Row']
-    cols = fldpln_library.with_columns(Col=(pl.col('FPP') % ncols).cast(pl.Int32))['Col']
-    # The water surface needs no DEM: a library built with a ``fill depth``
-    # column added ``dem + (DoF - DTF) + (filled_dem - dem)``, and ``dem``
-    # cancels.  Libraries that still carry that column simply go unused, so the
-    # two forms give identical maps.
-    wse_array[rows, cols] = fldpln_library['DTF'] + filled_dem[rows, cols]
+    # Join the library a slice at a time and keep only each pixel's highest water
+    # surface so far, in ``wse_array`` itself: joined whole, the library and its
+    # join were several times the size of every raster in the run.
+    fil_flat = filled_dem.ravel()
+    best = wse_array.ravel()
+    best[:] = -np.inf
+    max_drop = np.float32(max_drop_below_source)
+    n_library = fldpln_library.select(pl.len()).collect().item()
+    for offset in range(0, n_library, _LIBRARY_SLICE_ROWS):
+        part = (fldpln_library.slice(offset, _LIBRARY_SLICE_ROWS)
+                .join(df, on='FSP', how='inner')
+                .select('FPP', 'DTF', 'DoF', 'SrcFil')
+                .collect())
+        fpp = part['FPP'].to_numpy()
+        dof = part['DoF'].to_numpy()
+        fpp_fil = fil_flat[fpp]
+        # Keep only the pairs whose source can still stand over the pixel once its
+        # stage is spent.  The library's downhill edges are free, so without this a
+        # stream pixel reaches every cell that drains past it, however far below.
+        # The drop is measured in float64 and the allowance summed in float32.
+        keep = part['SrcFil'].to_numpy().astype(np.float64) - fpp_fil <= dof + max_drop
+        # ``DoF - DTF`` is the head left over at the floodplain pixel, measured from
+        # the filled DEM, so it is allowed to be negative there -- the pixel is still
+        # wet whenever the filled surface sits above the mapping DEM by more.  Take
+        # the deepest of the sources that reach the pixel.
+        head = dof[keep] - part['DTF'].to_numpy()[keep]
+        # The water surface needs no DEM: a library built with a ``fill depth``
+        # column added ``dem + (DoF - DTF) + (filled_dem - dem)``, and ``dem``
+        # cancels.  Libraries that still carry that column simply go unused, so the
+        # two forms give identical maps.  Adding the filled elevation, in float64,
+        # before the maximum instead of after changes nothing: rounding to float32
+        # never reorders two values.
+        np.maximum.at(best, fpp[keep], (head + fpp_fil[keep]).astype(np.float32))
+    best[best == -np.inf] = np.nan
     mask = (dem > -9998) & (wse_array > dem)
     wse_array[~mask] = np.nan
 

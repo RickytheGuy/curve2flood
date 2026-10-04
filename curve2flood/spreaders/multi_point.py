@@ -310,7 +310,7 @@ def read_curve2flood_table(table_filename: str) -> pd.DataFrame:
         raise ValueError("A table filename is required.")
     lower_name = table_filename.lower()
     if lower_name.endswith(".parquet"):
-        return pd.read_parquet(table_filename, engine="fastparquet")
+        return pd.read_parquet(table_filename)
     if lower_name.endswith(".tsv"):
         return pd.read_csv(table_filename, sep="\t")
     return pd.read_csv(table_filename)

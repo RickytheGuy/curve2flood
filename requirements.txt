@@ -1,6 +1,7 @@
 numba
 numpy
 pandas
+pyarrow
 gdal
 geopandas
 pyyaml

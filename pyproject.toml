@@ -23,6 +23,7 @@ classifiers = [
 dependencies = [
     "numpy",
     "pandas",
+    "pyarrow",
     # "gdal", # Let user install GDAL separately to avoid version conflicts
     "geopandas",
     "pyyaml",

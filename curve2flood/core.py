@@ -434,8 +434,9 @@ def calculate_interpolated_vdt(
     tw_mult_fact = (TW_MultFact * tw_scale).astype(np.float32)
     top_width, depth, wse, velocity = vdt_interpolate(flow, qb, flow_values, top_width_values, wse_values, vel_values, e_dem, tw_mult_fact)
 
-    # Add the interpolated values back to the DataFrame
-    vdt_df = vdt_df.with_columns([
+    # Add the interpolated values back to the DataFrame.  The ~120 curve columns
+    # they came from are dropped first, or every filter below would copy them.
+    vdt_df = vdt_df.drop(cs.starts_with('q_', 't_', 'wse_', 'v_')).with_columns([
         pl.Series('TopWidth', top_width),
         pl.Series('Depth', depth),
         pl.Series('WSE', wse),
@@ -906,7 +907,10 @@ def make_fldpln_flood_map(
     )
 
     Flood_array = (wse_array > E[1:-1, 1:-1]).astype(np.uint8)
-    Depth_array = np.where(Flood_array, wse_array - E[1:-1, 1:-1], np.nan).astype(np.float32)
+    # Depths are only used to write depth, WSE or velocity rasters
+    Depth_array = None
+    if params['OutDEP'] or params['OutWSE'] or params['OutVEL']:
+        Depth_array = np.where(Flood_array, wse_array - E[1:-1, 1:-1], np.nan).astype(np.float32)
 
     return Flood_array, Depth_array, None  # Slope_array is not computed in this method
 
@@ -1016,17 +1020,12 @@ def Flood_WaterLC_and_STRM_Cells_in_Flood_Map(Flood_Ensemble, S, LC_array, water
     # Any cell shown as water in the LC or the STRM RAster are now always shown as flooded in the Flood_Ensemble
     Flood_Ensemble = np.where(F > 0, 100, Flood_Ensemble)
     '''
-    # Identify streams in LC (1 for water, 0 otherwise)
-    LC_array = (LC_array == watervalue).astype(int)
+    # Streams in SN or water in LC, as one boolean mask: int64 copies of three
+    # rasters made this the memory peak of a whole run
+    F = (S > 0) | (LC_array == watervalue)
 
-    # Identify streams in SN (1 for streams, 0 otherwise)
-    SN = (S > 0).astype(int)
-
-    # Combine LC and SN values, prioritizing SN
-    F = SN | LC_array  # Logical OR operation prioritizes SN over LC
-
-    # Update Flood_Ensemble: mark flooded cells (100) wherever F > 0
-    Flood_Ensemble[F > 0] = 100
+    # Update Flood_Ensemble: mark flooded cells (100) wherever F is set
+    Flood_Ensemble[F] = 100
 
     return Flood_Ensemble
 
@@ -1417,6 +1416,8 @@ def main_flood_ouputs(
 
     COMID_Unique = np.unique(B[RR, CC]) # Always sorted
     COMID_Unique = COMID_Unique.astype(int) # Ensure it's treated as integers
+    if params['mapper'] == "Curve2Flood-FLDPLNpy":
+        B = None  # Only the curve-based mappers read it
 
     #Order from highest to lowest flow
     LOG.info('Opening and Reading ' + params['FlowFileName'])
