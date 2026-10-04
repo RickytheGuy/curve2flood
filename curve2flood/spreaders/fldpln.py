@@ -326,13 +326,25 @@ def _heap_pop(heap: np.ndarray, n: int) -> tuple[int, int]:
 def _solve_exact(fil: np.ndarray, fdr: np.ndarray, ncols: int,
                  sources: np.ndarray, excluded: np.ndarray,
                  fldmn: float, fldmx: float, global_max_wse: float,
-                 bg: float, spill_decay: float):
+                 bg: float, spill_decay: float, max_cells: int = 0,
+                 max_below: float = np.inf):
     """Dijkstra over ``w(u -> v) = max(0, E(v) - E(u))`` on the 8-neighbourhood.
 
-    Returns ``(cells, dtf, fsp)`` in window-local flat ids.  ``spill_decay`` is
+    Returns ``(cells, dtf, fsp, depth_limit)`` in window-local flat ids.  ``spill_decay`` is
     charged on a move to the D8 successor, which is where the depth-stepped
     solver charges it (``_forward_path``); backfill moves run strictly upstream
     and so can never be that edge.
+
+    ``max_cells`` caps the floodplain at that many cells (0 is no cap).  Cells
+    settle in order of DTF, so once the cap is full the sweep stops at the depth
+    ``d`` of the next cell and keeps only the cells shallower than ``d`` -- a
+    partly settled depth would make the result depend on pixel order.  That is
+    exactly the floodplain ``fldmx`` just below ``d`` gives, and ``depth_limit``
+    returns ``d`` in metres (-1 when the cap was not reached).  The cells the
+    segment floods at no depth at all are always kept, so ``d`` is never 0: there
+    is no shallower floodplain to cut them back to.  Cells more than
+    ``max_below`` metres below the stream pixel that floods them do not count
+    toward the cap: the caller leaves them out of the table.
 
     ``TD(R)`` is not a wall.  The reference applies it per operation, and each
     one maps onto an edge type here: ``_backfill_from_source`` never consults the
@@ -374,17 +386,24 @@ def _solve_exact(fil: np.ndarray, fdr: np.ndarray, ncols: int,
             heap = bigger
         heap_n = _heap_push(heap, heap_n, np.int64(source))
 
+    stop = np.int64(-1)
     n_settled = 0
+    n_kept = 0
     while heap_n > 0:
         key, heap_n = _heap_pop(heap, heap_n)
         pixel = np.int32(key & np.int64(0xFFFFFFFF))
         depth = np.int64(key >> 32)
         if settled[pixel] or depth != dist[pixel]:
             continue
+        if max_cells > 0 and n_kept >= max_cells and depth > 0:
+            stop = depth
+            break
         settled[pixel] = True
         n_settled += 1
 
         elevation = fil[pixel]
+        if fil[fsp[pixel]] - elevation <= max_below:
+            n_kept += 1
         from_excluded = excluded[pixel]
         code = fdr[pixel]
 
@@ -424,13 +443,14 @@ def _solve_exact(fil: np.ndarray, fdr: np.ndarray, ncols: int,
     out_fsp = np.empty(n_settled, dtype=np.int32)
     k = 0
     for pixel in range(n):
-        if settled[pixel]:
+        if settled[pixel] and (stop < 0 or dist[pixel] < stop):
             cells[k] = pixel
             value = dist[pixel] / _DTF_UNITS_PER_METRE
             out_dtf[k] = fldmn if value < fldmn else value
             out_fsp[k] = fsp[pixel]
             k += 1
-    return cells, out_dtf, out_fsp
+    depth_limit = stop / _DTF_UNITS_PER_METRE if stop >= 0 else -1.0
+    return cells[:k], out_dtf[:k], out_fsp[:k], depth_limit
 
 
 # ---------------------------------------------------------------------------
@@ -833,7 +853,9 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
                                global_max_wse: float = 0.0,
                                bg: float = -9999,
                                spill_decay: float = 0.0,
-                               solver: str = "exact") -> pd.DataFrame:
+                               solver: str = "exact",
+                               max_drop_below_source: float | None = None,
+                               max_cells: int = 0) -> pd.DataFrame:
     """Build an FLDPLN floodplain table for a single stream segment.
 
     Parameters
@@ -865,15 +887,33 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
         ``"exact"`` solves the depth-to-flood field in one monotone sweep -- the
         ``dh -> 0`` limit of the depth-stepped algorithm.  ``"iterative"`` runs
         the depth-stepped loop and honours ``dh``.
+    max_drop_below_source : float, optional
+        Leave out floodplain cells more than ``fldmx`` plus this many metres
+        below the stream pixel that floods them; None keeps them all.  The FLDPLN
+        mapper drops a cell more than ``DoF + FLDPLN_Max_Drop_Below_Source`` below
+        its source, and a stream pixel's ``DoF`` comes from the same VDT as
+        ``fldmx``, smoothed along the stream, so with this a few metres more than
+        the mapper's those cells are never mapped.  They are most of the table on
+        slopes, since a downhill step costs no depth.
+    max_cells : int, optional
+        Most floodplain cells (table rows) the segment may have, 0 for no limit.
+        A segment that would flood more stops at the shallowest depth that
+        exceeds it, as if its ``fldmx`` were just below that depth, which is
+        recorded as ``attrs["depth_limit"]``.  Cells left out by
+        ``max_drop_below_source`` do not count.  Exact solver only.
     Returns
     -------
     pandas.DataFrame
-        Table with FSP, FPP and DTF columns.
+        Table with FSP, FPP and DTF columns.  ``attrs["depth_limit"]`` is the
+        depth ``max_cells`` stopped the floodplain at, or None if it did not.
     """
     if solver not in SOLVERS:
         raise ValueError(f"solver must be one of {SOLVERS}, got {solver!r}.")
     if solver == "iterative" and dh <= 0:
         raise ValueError("dh must be positive.")
+    if max_cells and solver != "exact":
+        raise ValueError("max_cells needs solver='exact': the iterative solver can lower a cell's DTF "
+                         "in a later depth step, so its floodplain cannot be cut at a depth.")
 
     nrows, ncols = filled_dem.shape
     if flow_direction.shape != (nrows, ncols):
@@ -885,6 +925,8 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
     # Carried over from the MATLAB reference, where mxht0 was a flood height
     # rather than an absolute water-surface elevation.  Kept for fidelity.
     global_max_wse = np.finfo(np.float32).max if not global_max_wse else 0.99999 * global_max_wse
+
+    max_below = np.inf if max_drop_below_source is None else fldmx + max_drop_below_source
 
     flat_fdr = flow_direction.ravel()
     stream_pixels = np.asarray(
@@ -918,10 +960,11 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
         # exclusion stand.
         sources = _to_local(stream_pixels, ncols, r0, c0, wc)
 
+        depth_limit = -1.0
         if solver == "exact":
-            cells, values, source_of = _solve_exact(
+            cells, values, source_of, depth_limit = _solve_exact(
                 win_fil, win_fdr, wc, sources, win_excluded,
-                fldmn, fldmx, global_max_wse, bg, spill_decay)
+                fldmn, fldmx, global_max_wse, bg, spill_decay, max_cells, max_below)
         else:
             cells, values, source_of = _solve_iterative(
                 win_fil, win_fdr, wc, sources, win_excluded,
@@ -933,9 +976,16 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
         LOG.debug("Stream %s reached its %d-cell window; retrying larger.",
                   stream_id, margin)
 
+    # Left out only now, so that cells reached through them still grow the window
+    if max_drop_below_source is not None:
+        kept = win_fil[source_of] - win_fil[cells] <= max_below
+        cells, values, source_of = cells[kept], values[kept], source_of[kept]
+
     fpp = _to_global(cells, ncols, r0, c0, wc)
     fsp = _to_global(source_of, ncols, r0, c0, wc)
-    return pd.DataFrame({"FSP": fsp, "FPP": fpp, "DTF": values}, columns=header)
+    table = pd.DataFrame({"FSP": fsp, "FPP": fpp, "DTF": values}, columns=header)
+    table.attrs["depth_limit"] = float(depth_limit) if depth_limit >= 0 else None
+    return table
 
 
 def _set_shared(name: str, shm: shared_memory.SharedMemory):
@@ -1033,7 +1083,9 @@ def build_fldpln_library(
     pbar: bool = True,
     processes: int | None = None,
     spill_decay: float = 0.0,
-    solver: str = "exact"
+    solver: str = "exact",
+    max_drop_below_source: float | None = None,
+    max_cells_per_segment: int | None = None
 ):
     """
     Build floodplain library.
@@ -1078,13 +1130,32 @@ def build_fldpln_library(
         "exact" (default) solves each segment in a single monotone sweep -- the
         dh -> 0 limit of the depth-stepped algorithm -- and ignores dh.
         "iterative" runs the depth-stepped loop and honours dh.
+    max_drop_below_source: float | None
+        Leave out floodplain cells more than a segment's maximum depth plus this
+        many metres below the stream pixel that floods them.  The mapper drops a
+        cell more than its stage plus FLDPLN_Max_Drop_Below_Source below the
+        stream pixel, and that stage comes from the same VDT as the maximum depth,
+        smoothed along the stream; with this a few metres more than the mapper's
+        (4 m more kept the maps of a 213M-row desert tile identical, at 10M rows),
+        those cells are never used.  On slopes they are most of the library: a
+        downhill step costs no depth, so every stream pixel reaches the whole
+        slope beneath it.  None (default) keeps them all.
+    max_cells_per_segment: int | None
+        Most floodplain cells (library rows) one stream segment may contribute.
+        On flat ground a segment can reach millions of cells well within its
+        maximum depth; one that would exceed this instead stops at the depth
+        where it fills up, so its maximum depth is found from the terrain rather
+        than the VDT.  Floods deeper than that depth are mapped only that far, so
+        this trades the largest floods on flat ground for memory.  Cells left out
+        by max_drop_below_source do not count.  None (default) for no limit.
+        Needs solver="exact".
     """
     try:
         _build_fldpln_library(
             filled_dem, stream_info_file, flow_direction_file, library_file,
             dh, fldmn, fldmx, iterative_spill, vdt_file, stream_ids,
             global_max_wse, bg, parallel, pbar, processes, bg_mask,
-            spill_decay, solver
+            spill_decay, solver, max_drop_below_source, max_cells_per_segment
         )
     finally:
         close_shared_memory(['filled_dem_array', 'flow_direction_array'])
@@ -1107,7 +1178,9 @@ def _build_fldpln_library(
     processes: int | None = None,
     bg_mask: np.ndarray | None = None,
     spill_decay: float = 0.0,
-    solver: str = "exact"
+    solver: str = "exact",
+    max_drop_below_source: float | None = None,
+    max_cells_per_segment: int | None = None
 ):
     """
     Build floodplain library.
@@ -1150,9 +1223,20 @@ def _build_fldpln_library(
         "exact" (default) solves each segment in a single monotone sweep -- the
         dh -> 0 limit of the depth-stepped algorithm -- and ignores dh.
         "iterative" runs the depth-stepped loop and honours dh.
+    max_drop_below_source: float | None
+        How far below its maximum depth a cell may lie under its stream pixel; see build_fldpln_library.
+    max_cells_per_segment: int | None
+        Most floodplain cells one stream segment may contribute; see build_fldpln_library.
     """
     if solver not in SOLVERS:
         raise ValueError(f"solver must be one of {SOLVERS}, got {solver!r}.")
+    if max_drop_below_source is not None and not max_drop_below_source >= 0:
+        raise ValueError(f"max_drop_below_source must be at least 0 or None, got {max_drop_below_source!r}.")
+    if max_cells_per_segment is not None and (int(max_cells_per_segment) != max_cells_per_segment or max_cells_per_segment < 1):
+        raise ValueError(f"max_cells_per_segment must be a positive whole number or None, got {max_cells_per_segment!r}.")
+    if max_cells_per_segment is not None and solver != "exact":
+        raise ValueError("max_cells_per_segment needs solver='exact'.")
+    max_cells = int(max_cells_per_segment or 0)
 
     if Path(stream_info_file).suffix in {'.parquet', '.pq'}:
         stream_info = pd.read_parquet(stream_info_file)
@@ -1168,6 +1252,10 @@ def _build_fldpln_library(
     flow_direction_array = read_array_and_set_shared(flow_direction_file, np.uint8, set_shared=parallel, name='flow_direction_array')
 
     if bg_mask is not None:
+        # A 0/1 integer mask would index rows 0 and 1 instead of the masked cells
+        bg_mask = np.asarray(bg_mask, dtype=bool)
+        if bg_mask.shape != filled_dem_array.shape:
+            raise ValueError(f"bg_mask has shape {bg_mask.shape}, but the filled DEM has {filled_dem_array.shape}.")
         filled_dem_array[bg_mask] = bg
 
     stream_ids = stream_info.iloc[:, 3].unique()
@@ -1186,7 +1274,10 @@ def _build_fldpln_library(
         max_wse_col = wse_cols[-1]
         # making a copy to resolve a fragmentation warning from pandas
         vdt_df = vdt_df[['COMID', 'Row', 'Col', max_wse_col]].copy()
-        vdt_df['depth'] = vdt_df[max_wse_col] - filled_dem_array[vdt_df['Row'], vdt_df['Col']]
+        elevation = filled_dem_array[vdt_df['Row'], vdt_df['Col']]
+        vdt_df['depth'] = vdt_df[max_wse_col] - elevation
+        # Background cells, like masked lakes, are never flooded from, and their depth would be measured from bg
+        vdt_df = vdt_df[elevation != bg]
         ids_max_depths = vdt_df.groupby('COMID', sort=False, as_index=False)['depth'].max().values
         stream_ids = ids_max_depths[:, 0].astype(np.int32)
         max_depths = np.minimum(ids_max_depths[:, 1], fldmx)
@@ -1219,7 +1310,9 @@ def _build_fldpln_library(
             global_max_wse,
             bg,
             spill_decay,
-            solver
+            solver,
+            max_drop_below_source,
+            max_cells
         )
         for i, stream_id in enumerate(stream_ids)
     ]
@@ -1243,6 +1336,13 @@ def _build_fldpln_library(
             ))
 
     close_shared_memory(['filled_dem_array', 'flow_direction_array'])
+
+    if max_cells:
+        limits = [d.attrs["depth_limit"] for d in dfs if d.attrs.get("depth_limit") is not None]
+        if limits:
+            LOG.info(f"{len(limits)} of {len(dfs)} stream segments reached max_cells_per_segment={max_cells:,}; "
+                     f"their floodplains stop at depths of {min(limits):.2f}-{max(limits):.2f} m "
+                     f"(median {np.median(limits):.2f} m).")
 
     df = pd.concat(dfs, ignore_index=True)
     dfs = None

@@ -47,18 +47,29 @@ def rasters():
     return dem, fil, fdr, info
 
 
-def _segment(rasters, stream_id, solver, dh, fldmx, iterative_spill=True, margins=None):
-    dem, fil, fdr, info = rasters
+def _segment(rasters, stream_id, solver, dh, fldmx, iterative_spill=True, margins=None, max_cells=0):
+    _, fil, fdr, info = rasters
     previous = F._WINDOW_MARGINS
     if margins is not None:
         F._WINDOW_MARGINS = margins
     try:
         table = F.fldpln_library_for_segment(
-            dem, fil, fdr, int(stream_id), info.values, dh, 0.1, fldmx,
-            iterative_spill, 0.0, BG, 0.0, solver)
+            fil, fdr, int(stream_id), info.values, dh, 0.1, fldmx,
+            iterative_spill, 0.0, BG, 0.0, solver, None, max_cells)
     finally:
         F._WINDOW_MARGINS = previous
     return table.sort_values("FPP").reset_index(drop=True)
+
+
+def _library(tmp_path, name, **kwargs):
+    path = tmp_path / f"{name}.parquet"
+    F.build_fldpln_library(
+        str(DATA_DIR / "fabdem_filled.tif"), str(DATA_DIR / "fabdem_stream_info.parquet"),
+        str(DATA_DIR / "fabdem_flowdir.tif"), str(path), dh=0.5, fldmn=0.1, iterative_spill=False,
+        pbar=False, **kwargs)
+    library = pd.read_parquet(path)
+    library["DTF"] = library["DTF"].astype(float)
+    return library
 
 
 # --------------------------------------------------------------------------
@@ -207,3 +218,175 @@ def test_exact_ignores_dh(rasters):
     b = _segment(rasters, SEGMENTS[0], "exact", 5.00, 3.0)
     assert np.array_equal(a["FPP"].values, b["FPP"].values)
     assert np.array_equal(a["DTF"].values, b["DTF"].values)
+
+
+# --------------------------------------------------------------------------
+# max_cells: a floodplain budget per segment
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("stream_id", SEGMENTS)
+def test_max_cells_is_a_lower_max_depth(rasters, stream_id):
+    """A segment cut by max_cells is the segment solved with fldmx just below
+    the depth it stopped at, so the cap finds a max depth rather than dropping
+    arbitrary cells."""
+    full = _segment(rasters, stream_id, "exact", 0.1, 5.0)
+    zero_depth = len(_segment(rasters, stream_id, "exact", 0.1, 0.0))
+    if len(full) - zero_depth < 2:
+        pytest.skip("the segment floods (almost) nothing above zero depth, so there is no depth to cut at")
+    max_cells = zero_depth + (len(full) - zero_depth) // 2
+    capped = _segment(rasters, stream_id, "exact", 0.1, 5.0, max_cells=max_cells)
+    limit = capped.attrs["depth_limit"]
+    assert limit is not None and len(capped) <= max_cells
+    assert capped["DTF"].max() <= max(limit, 0.1) + 1e-6  # DTFs below fldmn are reported at fldmn
+    lowered = _segment(rasters, stream_id, "exact", 0.1, limit - 1 / F._DTF_UNITS_PER_METRE)
+    assert np.array_equal(capped["FPP"].values, lowered["FPP"].values)
+    assert np.array_equal(capped["DTF"].values, lowered["DTF"].values)
+    assert np.array_equal(capped["FSP"].values, lowered["FSP"].values)
+
+
+def test_max_cells_keeps_the_cells_flooded_at_no_depth(rasters):
+    """There is no depth to cut the zero-depth floodplain back to, so a budget
+    smaller than it keeps exactly that."""
+    zero_depth = _segment(rasters, SEGMENTS[0], "exact", 0.1, 0.0)
+    capped = _segment(rasters, SEGMENTS[0], "exact", 0.1, 5.0, max_cells=1)
+    assert capped.attrs["depth_limit"] > 0
+    assert np.array_equal(capped["FPP"].values, zero_depth["FPP"].values)
+    assert np.array_equal(capped["FSP"].values, zero_depth["FSP"].values)
+
+
+def test_max_cells_above_the_floodplain_changes_nothing(rasters):
+    full = _segment(rasters, SEGMENTS[0], "exact", 0.1, 5.0)
+    capped = _segment(rasters, SEGMENTS[0], "exact", 0.1, 5.0, max_cells=len(full))
+    assert capped.attrs["depth_limit"] is None
+    assert np.array_equal(capped["FPP"].values, full["FPP"].values)
+    assert np.array_equal(capped["DTF"].values, full["DTF"].values)
+
+
+def test_max_cells_needs_the_exact_solver(rasters):
+    with pytest.raises(ValueError, match="max_cells needs solver='exact'"):
+        _segment(rasters, SEGMENTS[0], "iterative", 0.5, 1.0, max_cells=10)
+
+
+def test_library_caps_each_segment(rasters, tmp_path):
+    """The capped library is the full one with each segment cut at its own depth."""
+    full = _library(tmp_path, "full", fldmx=5.0, stream_ids=SEGMENTS[:2])
+    capped = _library(tmp_path, "capped", fldmx=5.0, stream_ids=SEGMENTS[:2], max_cells_per_segment=len(full) // 4)
+    assert 0 < len(capped) < len(full)
+    both = capped.merge(full, on=["FSP", "FPP"], how="left", suffixes=("", "_full"))
+    assert both["DTF_full"].notna().all() and (both["DTF"] == both["DTF_full"]).all()
+
+
+@pytest.mark.parametrize("bad", [0, -5, 2.5])
+def test_library_rejects_bad_max_cells(rasters, tmp_path, bad):
+    with pytest.raises(ValueError, match="max_cells_per_segment must be"):
+        _library(tmp_path, "bad", fldmx=1.0, stream_ids=SEGMENTS[:1], max_cells_per_segment=bad)
+
+
+def test_library_max_cells_needs_the_exact_solver(rasters, tmp_path):
+    with pytest.raises(ValueError, match="needs solver='exact'"):
+        _library(tmp_path, "bad", fldmx=1.0, stream_ids=SEGMENTS[:1], max_cells_per_segment=10, solver="iterative")
+
+
+# --------------------------------------------------------------------------
+# max_drop_below_source: cells the mapper can never use
+# --------------------------------------------------------------------------
+
+def _slope(nrows=40, ncols=40, drop_per_row=0.5):
+    """A plane falling south with a stream running east along row 5.  A downhill
+    step costs no depth, so the stream reaches every cell south of it at DTF 0 --
+    the hillside the mapper's max_drop_below_source then throws away."""
+    rows = np.arange(nrows, dtype=np.float32)[:, None]
+    fil = np.repeat(100.0 - drop_per_row * rows, ncols, axis=1).astype(np.float32)
+    fdr = np.full((nrows, ncols), 8, dtype=np.uint8)  # Whitebox D8: south
+    fdr[5, 10:20] = 2                                   # east, along the stream
+    info = np.array([[5 * ncols + 10, 5 * ncols + 20, 11, 1]], dtype=np.int64)
+    return fil, fdr, info
+
+
+def _slope_segment(fldmx, solver="exact", dh=0.1, max_drop_below_source=None, max_cells=0):
+    fil, fdr, info = _slope()
+    return F.fldpln_library_for_segment(fil, fdr, 1, info, dh, 0.1, fldmx, True, 0.0, BG, 0.0,
+                                        solver, max_drop_below_source, max_cells)
+
+
+@pytest.mark.parametrize("solver,dh", [("exact", 0.1), ("iterative", 0.5)])
+def test_max_drop_below_source_leaves_out_only_the_deep_cells(solver, dh):
+    """The pruned table is the full one less the cells more than fldmx plus the
+    drop below their source, with every other row unchanged."""
+    flat = _slope()[0].ravel()
+    full = _slope_segment(1.0, solver, dh)
+    pruned = _slope_segment(1.0, solver, dh, max_drop_below_source=0.5)
+    expected = full[flat[full["FSP"].values] - flat[full["FPP"].values] <= 1.5].reset_index(drop=True)
+    assert 0 < len(pruned) < len(full)
+    assert pruned.equals(expected)
+
+
+def test_pruned_cells_do_not_count_toward_max_cells():
+    """Left-out cells must not use up a segment's budget: on a slope the cells
+    reached at no depth fill any budget, but most of them are pruned."""
+    kept_at_zero_depth = len(_slope_segment(0.0, max_drop_below_source=3.5))
+    max_cells = kept_at_zero_depth + 60
+    capped = _slope_segment(3.0, max_cells=max_cells)
+    both = _slope_segment(3.0, max_cells=max_cells, max_drop_below_source=0.5)
+    assert len(capped) > max_cells  # all zero-depth, nothing to cut back to
+    assert len(both) <= max_cells
+    assert both.attrs["depth_limit"] > capped.attrs["depth_limit"]
+
+
+def test_library_prunes_below_source(tmp_path):
+    from osgeo import gdal
+    fil, fdr, info = _slope()
+    for name, array, dtype in (("filled", fil, gdal.GDT_Float32), ("flowdir", fdr, gdal.GDT_Byte)):
+        ds = gdal.GetDriverByName("GTiff").Create(str(tmp_path / f"{name}.tif"), fil.shape[1], fil.shape[0], 1, dtype)
+        ds.GetRasterBand(1).WriteArray(array)
+        ds = None
+    pd.DataFrame(info, columns=["start_pixel", "end_pixel", "length", "stream_id"]).to_parquet(tmp_path / "info.parquet")
+
+    def library(name, **kwargs):
+        F.build_fldpln_library(str(tmp_path / "filled.tif"), str(tmp_path / "info.parquet"), str(tmp_path / "flowdir.tif"),
+                               str(tmp_path / f"{name}.parquet"), dh=0.1, fldmn=0.1, fldmx=1.0, iterative_spill=False,
+                               pbar=False, **kwargs)
+        return pd.read_parquet(tmp_path / f"{name}.parquet")
+
+    full, pruned = library("full"), library("pruned", max_drop_below_source=0.5)
+    keep = fil.ravel()[full["FSP"].values] - fil.ravel()[full["FPP"].values] <= 1.5
+    assert 0 < len(pruned) < len(full)
+    assert pruned.equals(full[keep].reset_index(drop=True))
+
+
+def test_library_rejects_a_negative_drop(rasters, tmp_path):
+    with pytest.raises(ValueError, match="max_drop_below_source must be"):
+        _library(tmp_path, "bad", fldmx=1.0, stream_ids=SEGMENTS[:1], max_drop_below_source=-1.0)
+
+
+# --------------------------------------------------------------------------
+# Background mask
+# --------------------------------------------------------------------------
+
+def test_library_masks_with_an_integer_bg_mask(rasters, tmp_path):
+    """A 0/1 integer mask, like a lake raster read from disk, masks the same
+    cells as a boolean one -- indexed as is, it would mask rows 0 and 1."""
+    _, fil, _, _ = rasters
+    floodplain = _segment(rasters, SEGMENTS[0], "exact", 0.1, 3.0)["FPP"].values
+    mask = np.zeros(fil.shape, dtype=np.uint8)
+    mask.ravel()[floodplain[::2]] = 1
+    as_int = _library(tmp_path, "int", fldmx=3.0, stream_ids=SEGMENTS[:1], bg_mask=mask)
+    as_bool = _library(tmp_path, "bool", fldmx=3.0, stream_ids=SEGMENTS[:1], bg_mask=mask.astype(bool))
+    assert len(as_int) and not mask.ravel()[as_int["FPP"].values].any()
+    assert as_int.equals(as_bool)
+
+
+def test_masked_vdt_cells_do_not_set_the_max_depth(rasters, tmp_path):
+    """A VDT cell under bg_mask (a lake) is never flooded from, so it must not
+    count toward its segment's max depth: measured from bg it would be thousands
+    of metres, and the segment would flood to fldmx."""
+    _, fil, fdr, info = rasters
+    stream_id = SEGMENTS[0]
+    pixels = np.asarray(F._segment_pixels(stream_id, info.values, fdr.ravel(), *fil.shape))
+    rows, cols = np.divmod(pixels, fil.shape[1])
+    vdt_file = tmp_path / "vdt.parquet"
+    pd.DataFrame({"COMID": stream_id, "Row": rows, "Col": cols, "wse_1": fil[rows, cols] + 1.0}).to_parquet(vdt_file)
+    mask = np.zeros(fil.shape, dtype=bool)
+    mask[rows[0], cols[0]] = True
+    library = _library(tmp_path, "vdt", fldmx=5.0, vdt_file=str(vdt_file), bg_mask=mask, stream_ids=[stream_id])
+    assert len(library) and library["DTF"].max() <= 1.0 + 0.01
