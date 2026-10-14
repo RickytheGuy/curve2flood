@@ -1,109 +1,52 @@
+"""Multi-point interpolation flood mapper, ported from FHS_FloodMapper_AllInOne.
+
+Water-surface points are placed on the stream cells (and, for wide rivers,
+across their cross sections), interpolated by inverse-distance weighting
+inside a buffered corridor around the points, and the cells below that surface
+that connect to the points are flooded.  Point coordinates are metres on a
+local grid whose origin is the DEM's top-left corner.
+"""
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from osgeo import gdal, osr, ogr, gdal_array
+from osgeo import gdal, ogr
 from scipy import ndimage as ndi
 from scipy.spatial import cKDTree
-from shapely.geometry import Point, shape
+from shapely.geometry import Point
 
 from curve2flood._log import LOG
 
 ID_SYNONYMS = ["COMID", "RIVID", "river_id", "LINKNO"]
 GeoTransform = tuple[float, float, float, float, float, float]
 
-def _normalize_geotransform(transform) -> GeoTransform:
+def rasterize_shapes_gdal(shapes, out_shape: tuple[int, int], transform: GeoTransform) -> np.ndarray:
+    """Burn shapely geometries into a uint8 raster: 1 inside any of them, 0 elsewhere.
+
+    ``transform`` is a GDAL geotransform; empty and None geometries are skipped.
     """
-    Return a GDAL geotransform tuple.
-
-    Accepts native GDAL tuples and Affine-like objects that expose `to_gdal()`.
-    """
-    if hasattr(transform, "to_gdal"):
-        values = tuple(float(v) for v in transform.to_gdal())
-    else:
-        values = tuple(float(v) for v in transform)
-    if len(values) != 6:
-        raise ValueError(f"Expected a 6-element geotransform, received {len(values)} values.")
-    return values
-
-def _numpy_dtype_from_output_type(output_type) -> np.dtype:
-    if isinstance(output_type, int):
-        np_type = gdal_array.GDALTypeCodeToNumericTypeCode(output_type)
-        if np_type is None:
-            raise TypeError(f"Unsupported GDAL output type: {output_type}")
-        return np.dtype(np_type)
-    return np.dtype(output_type)
-
-def _gdal_dtype_from_output_type(output_type) -> int:
-    if isinstance(output_type, int):
-        return int(output_type)
-    np_dtype = np.dtype(output_type)
-    if np_dtype == np.dtype(bool):
-        return int(gdal.GDT_Byte)
-    gdal_type = gdal_array.NumericTypeCodeToGDALTypeCode(np_dtype)
-    if gdal_type is None:
-        raise TypeError(f"Unsupported NumPy output type: {output_type}")
-    return int(gdal_type)
-
-def rasterize_shapes_gdal(
-    shapes,
-    out_shape: tuple[int, int],
-    transform,
-    fill=0,
-    dtype=np.uint8,
-    all_touched: bool = False,
-    projection_wkt: str | None = None,
-) -> np.ndarray:
-    """
-    Rasterize shapely geometries to a NumPy array using GDAL.
-    """
-    geotransform = _normalize_geotransform(transform)
-    np_dtype = _numpy_dtype_from_output_type(dtype)
-    gdal_dtype = _gdal_dtype_from_output_type(dtype)
-
-    raster_driver = gdal.GetDriverByName("MEM")
-    raster_ds = raster_driver.Create("", xsize=int(out_shape[1]), ysize=int(out_shape[0]), bands=1, eType=gdal_dtype)
-    raster_ds.SetGeoTransform(geotransform)
-    if projection_wkt:
-        raster_ds.SetProjection(str(projection_wkt))
-
+    raster_ds = gdal.GetDriverByName("MEM").Create("", xsize=int(out_shape[1]), ysize=int(out_shape[0]), bands=1, eType=gdal.GDT_Byte)
+    raster_ds.SetGeoTransform(tuple(float(v) for v in transform))
     band = raster_ds.GetRasterBand(1)
-    band.WriteArray(np.full(out_shape, fill, dtype=np_dtype))
+    band.Fill(0)
 
     vector_driver = ogr.GetDriverByName("MEM") or ogr.GetDriverByName("Memory")
     vector_ds = vector_driver.CreateDataSource("")
-    layer_srs = None
-    if projection_wkt:
-        layer_srs = osr.SpatialReference()
-        layer_srs.ImportFromWkt(str(projection_wkt))
-    layer = vector_ds.CreateLayer("shapes", srs=layer_srs, geom_type=ogr.wkbUnknown)
-
-    field_name = "burn"
-    layer.CreateField(ogr.FieldDefn(field_name, ogr.OFTReal))
+    layer = vector_ds.CreateLayer("shapes", geom_type=ogr.wkbUnknown)
     layer_defn = layer.GetLayerDefn()
 
     feature_count = 0
-    for geom, value in shapes:
-        if geom is None or value is None:
+    for geom in shapes:
+        if geom is None or geom.is_empty:
             continue
-        if hasattr(geom, "is_empty") and geom.is_empty:
-            continue
-        if isinstance(value, (float, np.floating)) and not np.isfinite(value):
-            continue
-        shapely_geom = geom if hasattr(geom, "wkb") else shape(geom)
-        ogr_geom = ogr.CreateGeometryFromWkb(shapely_geom.wkb)
         feature = ogr.Feature(layer_defn)
-        feature.SetField(field_name, float(value))
-        feature.SetGeometry(ogr_geom)
+        feature.SetGeometry(ogr.CreateGeometryFromWkb(geom.wkb))
         layer.CreateFeature(feature)
         feature = None
         feature_count += 1
 
     if feature_count > 0:
-        options = [f"ATTRIBUTE={field_name}"]
-        if all_touched:
-            options.append("ALL_TOUCHED=TRUE")
-        err = gdal.RasterizeLayer(raster_ds, [1], layer, options=options)
+        err = gdal.RasterizeLayer(raster_ds, [1], layer, burn_values=[1])
         if err != 0:
             raise RuntimeError(f"GDAL rasterization failed with error code {err}.")
 
@@ -130,9 +73,10 @@ def _coerce_fhs_metadata_columns(
     table_filename: str,
     one_based_rc: bool = False,
 ) -> pd.DataFrame:
-    """
-    Normalize COMID/row/col/elevation/slope/angle metadata into the shape used
-    by the FHS point-generation helpers.
+    """Reduce a VDT or curve table to ``COMID, Row, Col, Elev, Slope, XS_Angle``.
+
+    The id column may be any of ``ID_SYNONYMS``; missing optional columns are
+    NaN.  ``one_based_rc`` converts 1-based rows and columns to 0-based.
     """
     if table_df.empty:
         return pd.DataFrame(columns=["COMID", "Row", "Col", "Elev", "Slope", "XS_Angle"])
@@ -187,10 +131,7 @@ def merge_missing_fhs_metadata(
     scenario_df: pd.DataFrame,
     metadata_df: pd.DataFrame | None,
 ) -> pd.DataFrame:
-    """
-    Fill missing `Elev`, `Slope`, and `XS_Angle` values in a scenario table from
-    a secondary metadata table keyed by COMID/Row/Col.
-    """
+    """Fill missing ``Elev``, ``Slope`` and ``XS_Angle`` values from another table, matched on COMID, Row and Col."""
     if scenario_df.empty or metadata_df is None or metadata_df.empty:
         return scenario_df
 
@@ -217,8 +158,9 @@ def merge_missing_fhs_metadata(
 
 
 def _compute_outlier_mask(values: np.ndarray, method: str = "mad", threshold: float = 3.5) -> np.ndarray:
-    """
-    FHS outlier-mask helper for depth-based HWM filtering.
+    """Flag outliers by robust z-score (``"mad"``) or interquartile range (``"iqr"``).
+
+    Nothing is flagged with fewer than four finite values.
     """
     values = np.asarray(values, dtype=np.float64)
     finite = np.isfinite(values)
@@ -255,12 +197,10 @@ def filter_hwm_outliers_single_scenario(
     group_by: str = "comid",
     min_samples: int = 5,
 ) -> pd.DataFrame:
-    """
-    Apply the FHS HWM outlier filter to one interpolated scenario table.
+    """Drop the points whose depth (``WaterSurfaceElev_m - Elev``) is an outlier.
 
-    The filter operates on flood depth (`WaterSurfaceElev_m - Elev`) and can
-    run globally or per COMID. Rows that lose their scenario values are
-    dropped from the returned DataFrame.
+    Outliers are found over all points (``group_by="global"``) or within each
+    reach (``"comid"``); groups with fewer than ``min_samples`` points are kept.
     """
     filtered_df = results_df.copy()
     group_by = str(group_by).lower()
@@ -303,9 +243,7 @@ def filter_hwm_outliers_single_scenario(
     return filtered_df.loc[keep_rows].copy()
 
 def read_curve2flood_table(table_filename: str) -> pd.DataFrame:
-    """
-    Read a CSV/TSV/parquet table used by Curve2Flood and FHS helper paths.
-    """
+    """Read a CSV, TSV or Parquet table."""
     if not table_filename:
         raise ValueError("A table filename is required.")
     lower_name = table_filename.lower()
@@ -316,9 +254,7 @@ def read_curve2flood_table(table_filename: str) -> pd.DataFrame:
     return pd.read_csv(table_filename)
 
 def get_curve_columns(columns) -> tuple[list[str], list[str], list[str], list[str]]:
-    """
-    Return sorted q_, v_, t_, and wse_ column groups from an FHS/VDT table.
-    """
+    """The VDT's ``q_*``, ``v_*``, ``t_*`` and ``wse_*`` columns, each sorted by number."""
     q_cols = sorted([c for c in columns if str(c).startswith("q_")], key=lambda x: int(str(x).split("_")[1]))
     v_cols = sorted([c for c in columns if str(c).startswith("v_")], key=lambda x: int(str(x).split("_")[1]))
     t_cols = sorted([c for c in columns if str(c).startswith("t_")], key=lambda x: int(str(x).split("_")[1]))
@@ -331,9 +267,7 @@ def get_curve_columns(columns) -> tuple[list[str], list[str], list[str], list[st
 
 
 def interp_row_clamped(x: float, xp: np.ndarray, fp: np.ndarray) -> float:
-    """
-    FHS-style 1D interpolation with endpoint clamping.
-    """
+    """Linear interpolation that holds the end values outside ``xp``."""
     n = xp.size
     if n == 0:
         return np.nan
@@ -354,9 +288,10 @@ def interp_row_clamped(x: float, xp: np.ndarray, fp: np.ndarray) -> float:
     return float(y0 + w * (y1 - y0))
 
 def clean_and_interp_one_row(target_q: float, q_row: np.ndarray, v_row: np.ndarray, t_row: np.ndarray, wse_row: np.ndarray) -> tuple[float, float, float]:
-    """
-    Clean one VDT row and interpolate velocity, top width, and WSE at `target_q`.
-    This is a direct port of the FHS row-interpolation logic.
+    """Interpolate one VDT row's velocity, top width and WSE at ``target_q``.
+
+    Invalid entries (non-positive flow or top width, negative velocity, WSE of
+    -90 or below) are dropped first.  Returns NaNs when nothing is left.
     """
     valid = (
         np.isfinite(q_row) &
@@ -397,13 +332,11 @@ def build_fhs_scenario_dataframe_from_vdt(
     comid_unique_flow: dict,
     one_based_rc: bool = False,
 ) -> pd.DataFrame:
-    """
-    Build a single-scenario HWM-style table directly from a VDT database and a
-    COMID->flow mapping, following the interpolation behavior of
-    `FHS_FloodMapper_AllInOne.py`.
+    """One water-surface point per VDT stream cell at its reach's flow.
 
-    Returns a DataFrame with one row per interpolated centerline point and the
-    columns needed by the FHS point-expansion and flood-mapping steps.
+    Returns ``COMID, Row, Col, Elev, Slope, XS_Angle, Flow, Velocity_mps,
+    TopWidth_m, WaterSurfaceElev_m``; cells without a flow or a valid curve
+    are dropped.
     """
     if not vdt_database_filename:
         raise ValueError("A VDT database is required for FHS VDT point generation.")
@@ -453,35 +386,16 @@ def build_fhs_scenario_dataframe_from_vdt(
     ]]
 
 def filter_outliers(group):
+    """Drop rows more than two standard deviations from the mean, for TopWidth, then WSE, then Velocity.
+
+    Applied to one reach (COMID) at a time.  Rows whose value is NaN are dropped.
     """
-    A function to filter outliers based on mean and standard deviation for each COMID group
-    """
-    # Calculate mean and standard deviation for TopWidth
-    topwidth_mean = group['TopWidth'].mean()
-    topwidth_std = group['TopWidth'].std()
-    lower_bound_tw = topwidth_mean - 2 * topwidth_std
-    upper_bound_tw = topwidth_mean + 2 * topwidth_std
-
-    # Filter TopWidth outliers
-    group = group[(group['TopWidth'] >= lower_bound_tw) & (group['TopWidth'] <= upper_bound_tw)]
-
-    # Calculate mean and standard deviation for WSE
-    wse_mean = group['WSE'].mean()
-    wse_std = group['WSE'].std()
-    lower_bound_wse = wse_mean - 2 * wse_std
-    upper_bound_wse = wse_mean + 2 * wse_std
-
-    # Filter WSE outliers
-    group = group[(group['WSE'] >= lower_bound_wse) & (group['WSE'] <= upper_bound_wse)]
-
-    # Calculate mean and standard deviation for Velocity
-    wse_mean = group['Velocity'].mean()
-    wse_std = group['Velocity'].std()
-    lower_bound_wse = wse_mean - 2 * wse_std
-    upper_bound_wse = wse_mean + 2 * wse_std
-
-    # Filter WSE outliers
-    group = group[(group['Velocity'] >= lower_bound_wse) & (group['Velocity'] <= upper_bound_wse)]
+    for col in ('TopWidth', 'WSE', 'Velocity'):
+        mean = group[col].mean()
+        std = group[col].std()
+        if np.isnan(std):
+            std = 0.0  # A single row has no spread, and is not an outlier
+        group = group[(group[col] >= mean - 2 * std) & (group[col] <= mean + 2 * std)]
 
     return group
 
@@ -490,6 +404,10 @@ def compute_tw_multfact_scale(flow: np.ndarray,
                               k: float = 1,
                               min_s: float = 0.1,
                               max_s: float = 3) -> np.ndarray:
+    """Top-width scale factor ``(flow / qbase) ** k``, clipped to ``[min_s, max_s]``.
+
+    The factor is 1 where ``qbase`` is not positive or the ratio is not finite.
+    """
     flow = flow.astype(np.float32, copy=False)
     qbase = qbase.astype(np.float32, copy=False)
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -505,20 +423,13 @@ def build_fhs_scenario_dataframe_from_curve_file(
     tw_multfact: float,
     one_based_rc: bool = False,
 ) -> pd.DataFrame:
-    """
-    Build a single-scenario FHS point table from a Curve2Flood curve-parameter
-    file.
+    """One water-surface point per curve-file stream cell at its reach's flow.
 
-    Supported curve-file layouts:
-    - legacy coefficient tables with `depth_*`, `tw_*`, and `vel_*` columns
-    - ARC reach-average outputs that also carry `q_*`, `v_*`, `t_*`, and
-      `wse_*` columns
-
-    When both VDT and curve files exist, `multi_point_interpolation(...)`
-    continues to prefer the VDT interpolation path because that is the original
-    FHS workflow. This builder is used when the curve file is the only source of
-    usable scenario points or when it carries the only available `XS_Angle`
-    values.
+    Curve files with VDT-style ``q_*``/``v_*``/``t_*``/``wse_*`` columns are
+    interpolated like a VDT; otherwise the ``depth_*``, ``tw_*`` and ``vel_*``
+    power laws are evaluated, outliers are dropped and top widths are scaled by
+    ``tw_multfact``.  Returns the same columns as
+    ``build_fhs_scenario_dataframe_from_vdt``.
     """
     if not curve_param_filename:
         raise ValueError("A curve-parameter file is required for curve-driven FHS point generation.")
@@ -638,9 +549,7 @@ def build_fhs_scenario_dataframe_from_curve_file(
     ]]
 
 def sample_dem_elevation_at_local_xy(dem_array: np.ndarray, x: float, y: float, dx: float, dy: float) -> float:
-    """
-    Sample the DEM using local metric coordinates generated by `_grid_xy_from_rc`.
-    """
+    """DEM elevation at local grid coordinates (see ``_grid_xy_from_rc``); NaN outside the DEM."""
     col = int(np.floor(float(x) / float(dx)))
     row = int(np.floor(-float(y) / float(dy)))
     if row < 0 or col < 0 or row >= dem_array.shape[0] or col >= dem_array.shape[1]:
@@ -655,10 +564,7 @@ def _normalize_xs_angle(xs_angle: float) -> float:
     return xs_angle
 
 def _get_xs_unit_vector_in_local_grid(xs_angle: float, dx: float, dy: float) -> tuple[float, float]:
-    """
-    Convert an FHS/VDT `XS_Angle` to a unit vector on Curve2Flood's local
-    metric grid.
-    """
+    """Unit vector along a cross section, from the VDT's ``XS_Angle`` (radians)."""
     xs_angle = _normalize_xs_angle(xs_angle)
     dc = np.cos(xs_angle)
     dr = np.sin(xs_angle)
@@ -677,16 +583,12 @@ def create_fhs_points_from_scenario_dataframe(
     topwidth_threshold_m: float | None = None,
     xs_point_spacing_m: float = 100.0,
 ) -> dict[str, np.ndarray]:
-    """
-    Convert one FHS-style scenario DataFrame into point arrays for
-    `create_fhs_flood_map_from_points`.
+    """Turn a scenario table into the point arrays ``create_fhs_flood_map_from_points`` takes.
 
-    This ports the point-generation behavior of `create_geojson_features(...)`
-    into an array-native form suited to Curve2Flood. Centerline points are
-    always included. If `topwidth_threshold_m` is provided and `XS_Angle`
-    values are available, cross-section extension points are added on both
-    sides until the water surface is blocked by terrain or the half-topwidth is
-    exhausted.
+    Every row is a centreline point.  Where the top width is above
+    ``topwidth_threshold_m`` and ``XS_Angle`` is known, points are also added
+    across the cross section every ``xs_point_spacing_m``, on both sides, until
+    the ground rises above the water or half the top width is reached.
     """
     if results_df.empty:
         empty_float = np.empty(0, dtype=np.float32)
@@ -821,13 +723,7 @@ def create_fhs_points_from_scenario_dataframe(
 
 
 def _grid_xy_from_rc(rows: np.ndarray, cols: np.ndarray, dx: float, dy: float) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Convert zero-based raster row/column indices to cell-center coordinates on a
-    local projected grid measured in meters.
-
-    The x axis increases to the right. The y axis is negative downward so the
-    generated geotransform matches raster row indexing.
-    """
+    """Cell-centre coordinates in metres from the DEM's top-left corner; y is negative downward."""
     x = (cols.astype(np.float32) + np.float32(0.5)) * np.float32(dx)
     y = -((rows.astype(np.float32) + np.float32(0.5)) * np.float32(dy))
     return x.astype(np.float32), y.astype(np.float32)
@@ -846,55 +742,16 @@ def build_fhs_points_from_curve2flood_inputs(
     Set_Depth: float,
     dx: float,
     dy: float,
-    COMID_Averaging_Method: int = 0,
-    extra_points: dict | None = None,
 ) -> dict[str, np.ndarray]:
-    """
-    Build an HWM-style point set from the stream cells already available inside
-    Curve2Flood.
+    """One water-surface point per stream cell, from the rasters the other mappers use.
 
-    This is the array-based bridge between Curve2Flood's centerline/VDT inputs
-    and the FHS flood-mapping engine. By default it emits one point per stream
-    cell. Optional `extra_points` can be supplied to append any off-center
-    points, such as cross-section extension points generated elsewhere.
-
-    Parameters
-    ----------
-    RR, CC : ndarray
-        Padded stream-cell row/column indices, as used throughout Curve2Flood.
-    T_Rast, W_Rast, S_Rast : ndarray
-        AutoRoute/ARC top-width, WSE, and slope rasters on the unpadded DEM
-        grid. `S_Rast` may be None.
-    E, B : ndarray
-        Padded DEM and stream-ID rasters.
-    COMID_Unique_TW, COMID_Unique_Depth : dict
-        Per-COMID fallback top width and depth values.
-    TopWidthPlausibleLimit : float
-        Maximum plausible top width in meters, used when Set_Depth is active.
-    Set_Depth : float
-        Fixed depth override. When positive, WSE is computed as E + Set_Depth.
-    dx, dy : float
-        Cell spacing in meters.
-    COMID_Averaging_Method : int, default 0
-        Non-zero forces use of COMID-mean depth/top-width rather than cellwise
-        ARC rasters.
-    extra_points : dict, optional
-        Optional additional HWM-style points. Supported keys are:
-        `rows`, `cols`, `x`, `y`, `wse`, `topwidth`, `dem`, `ids`, `types`,
-        and `slope`.
-
-    Returns
-    -------
-    dict
-        Dictionary containing point arrays: `rows`, `cols`, `x`, `y`, `wse`,
-        `topwidth`, `dem`, `ids`, `types`, and `slope`.
-
-    Notes
-    -----
-    This adapter does not generate the cross-section expansion points from the
-    original FHS script on its own because Curve2Flood does not currently carry
-    XS angle metadata through this code path. To reproduce the exact FHS point
-    cloud, pass those extra points through `extra_points`.
+    The fallback when no scenario table can be built.  With ``Set_Depth > 0``
+    the WSE is the DEM plus ``Set_Depth``; otherwise it comes from ``W_Rast``
+    and ``T_Rast``, or from the reach's median depth and top width where those
+    are empty.  ``RR``/``CC`` index the stream cells of the padded ``E`` (DEM)
+    and ``B`` (stream ids).  Returns the point arrays ``rows``, ``cols``,
+    ``x``, ``y``, ``wse``, ``topwidth``, ``dem``, ``ids``, ``types`` and
+    ``slope``.
     """
     rows = []
     cols = []
@@ -910,13 +767,13 @@ def build_fhs_points_from_curve2flood_inputs(
         comid_value = int(B[r, c])
         point_dem = float(E[r, c])
 
-        # Match Curve2Flood's existing precedence: fixed-depth override first,
-        # then COMID fallback hydraulics, then cellwise raster values.
+        # Fixed depth first, then the reach's medians where the cell has no
+        # values, then the cell's own values
         if Set_Depth > 0.0:
             point_wse = point_dem + float(Set_Depth)
             point_topwidth = float(TopWidthPlausibleLimit)
             point_slope = float(S_Rast[r - 1, c - 1]) if S_Rast is not None else np.nan
-        elif COMID_Averaging_Method != 0 or W_Rast[r - 1, c - 1] < 0.001 or T_Rast[r - 1, c - 1] < 0.00001:
+        elif W_Rast[r - 1, c - 1] < 0.001 or T_Rast[r - 1, c - 1] < 0.00001:
             point_topwidth = float(COMID_Unique_TW.get(comid_value, 0.0))
             point_depth = float(COMID_Unique_Depth.get(comid_value, 0.0))
             point_wse = point_dem + point_depth
@@ -960,70 +817,6 @@ def build_fhs_points_from_curve2flood_inputs(
         "slope": np.asarray(slope_vals, dtype=np.float32),
     }
 
-    if extra_points is None:
-        return point_data
-
-    if "wse" not in extra_points:
-        raise ValueError("extra_points must include a 'wse' array.")
-
-    extra_wse = np.asarray(extra_points["wse"], dtype=np.float32)
-    extra_count = len(extra_wse)
-    if extra_count == 0:
-        return point_data
-
-    if "x" in extra_points and "y" in extra_points:
-        extra_x = np.asarray(extra_points["x"], dtype=np.float32)
-        extra_y = np.asarray(extra_points["y"], dtype=np.float32)
-        if len(extra_x) != extra_count or len(extra_y) != extra_count:
-            raise ValueError("extra_points x/y arrays must match the length of extra_points['wse'].")
-        if "rows" in extra_points and "cols" in extra_points:
-            extra_rows = np.asarray(extra_points["rows"], dtype=np.int32)
-            extra_cols = np.asarray(extra_points["cols"], dtype=np.int32)
-        else:
-            extra_rows = np.full(extra_count, -1, dtype=np.int32)
-            extra_cols = np.full(extra_count, -1, dtype=np.int32)
-    elif "rows" in extra_points and "cols" in extra_points:
-        extra_rows = np.asarray(extra_points["rows"], dtype=np.int32)
-        extra_cols = np.asarray(extra_points["cols"], dtype=np.int32)
-        if len(extra_rows) != extra_count or len(extra_cols) != extra_count:
-            raise ValueError("extra_points rows/cols arrays must match the length of extra_points['wse'].")
-        extra_x, extra_y = _grid_xy_from_rc(extra_rows, extra_cols, dx, dy)
-    else:
-        raise ValueError("extra_points must provide either x/y arrays or rows/cols arrays.")
-
-    extra_topwidth = np.asarray(
-        extra_points.get("topwidth", np.full(extra_count, TopWidthPlausibleLimit, dtype=np.float32)),
-        dtype=np.float32,
-    )
-    extra_dem = np.asarray(extra_points.get("dem", np.full(extra_count, np.nan, dtype=np.float32)), dtype=np.float32)
-    extra_ids = np.asarray(extra_points.get("ids", np.full(extra_count, -1, dtype=np.int32)), dtype=np.int32)
-    extra_types = np.asarray(extra_points.get("types", np.full(extra_count, "XS_Extension", dtype=object)), dtype=object)
-    extra_slope = np.asarray(extra_points.get("slope", np.full(extra_count, np.nan, dtype=np.float32)), dtype=np.float32)
-
-    for key, arr in {
-        "topwidth": extra_topwidth,
-        "dem": extra_dem,
-        "ids": extra_ids,
-        "types": extra_types,
-        "slope": extra_slope,
-    }.items():
-        if len(arr) != extra_count:
-            raise ValueError(f"extra_points['{key}'] must match the length of extra_points['wse'].")
-
-    for key, arr in {
-        "rows": extra_rows,
-        "cols": extra_cols,
-        "x": extra_x,
-        "y": extra_y,
-        "wse": extra_wse,
-        "topwidth": extra_topwidth,
-        "dem": extra_dem,
-        "ids": extra_ids,
-        "types": extra_types,
-        "slope": extra_slope,
-    }.items():
-        point_data[key] = np.concatenate((point_data[key], arr))
-
     return point_data
 
 def build_variable_buffer_masks_from_points(
@@ -1038,50 +831,32 @@ def build_variable_buffer_masks_from_points(
     corridor_topwidth_factor: float = 1.5,
     anchor_topwidth_factor: float = 0.5,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Array-based version of the FHS point buffering step.
+    """Rasterised buffers around the points: ``(corridor, anchor)`` boolean masks.
 
-    Each point produces two raster masks:
-    - `corridor`: the area eligible for IDW interpolation
-    - `anchor`: the seed region used for hydraulic connectivity propagation
+    The corridor is where WSE is interpolated, and the anchor is where the
+    connected flood starts.  Buffer radii are the top width times a factor, or
+    fixed distances when ``use_topwidth_buffers`` is False.
     """
     if len(x) == 0:
         empty = np.zeros(dem_shape, dtype=bool)
         return empty, empty
 
-    # Rasterize per-point buffers so interpolation is constrained to the stream
-    # corridor and connectivity starts from an anchor region near the points.
     points = [Point(float(px), float(py)) for px, py in zip(x, y)]
     if use_topwidth_buffers:
-        corridor_shapes = (
-            (geom.buffer(float(max(width, 0.0) * corridor_topwidth_factor)), 1)
-            for geom, width in zip(points, topwidth)
-        )
-        anchor_shapes = (
-            (geom.buffer(float(max(width, 0.0) * anchor_topwidth_factor)), 1)
-            for geom, width in zip(points, topwidth)
-        )
+        corridor_shapes = (geom.buffer(float(max(width, 0.0) * corridor_topwidth_factor))
+                           for geom, width in zip(points, topwidth))
+        anchor_shapes = (geom.buffer(float(max(width, 0.0) * anchor_topwidth_factor))
+                         for geom, width in zip(points, topwidth))
     else:
-        corridor_shapes = ((geom.buffer(float(fixed_corridor_buffer_m)), 1) for geom in points)
-        anchor_shapes = ((geom.buffer(float(fixed_anchor_buffer_m)), 1) for geom in points)
+        corridor_shapes = (geom.buffer(float(fixed_corridor_buffer_m)) for geom in points)
+        anchor_shapes = (geom.buffer(float(fixed_anchor_buffer_m)) for geom in points)
 
-    corridor = rasterize_shapes_gdal(
-        corridor_shapes,
-        out_shape=dem_shape,
-        transform=transform,
-        dtype=np.uint8,
-        all_touched=False,
-    ).astype(bool)
-    anchor = rasterize_shapes_gdal(
-        anchor_shapes,
-        out_shape=dem_shape,
-        transform=transform,
-        dtype=np.uint8,
-        all_touched=False,
-    ).astype(bool)
+    corridor = rasterize_shapes_gdal(corridor_shapes, out_shape=dem_shape, transform=transform).astype(bool)
+    anchor = rasterize_shapes_gdal(anchor_shapes, out_shape=dem_shape, transform=transform).astype(bool)
     return corridor, anchor
 
 def build_target_coordinates(xs: np.ndarray, ys: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Coordinates, rows and columns of the cells where ``mask`` is True."""
     rows, cols = np.where(mask)
     return xs[cols].astype(np.float32), ys[rows].astype(np.float32), rows.astype(np.int32), cols.astype(np.int32)
 
@@ -1096,9 +871,10 @@ def precompute_idw_neighbors(
     target_cols: np.ndarray,
     k: int,
 ) -> dict[str, np.ndarray | tuple[int, int]]:
-    """Precompute KD-tree neighbors for repeated IDW evaluations."""
-    # Query the nearest points once, then record which of those neighbors are
-    # actually usable after applying each point's interpolation radius.
+    """The ``k`` nearest points of each target cell, for ``idw_from_precomputed``.
+
+    A point is usable for a cell only within its own ``point_max_distance``.
+    """
     pts = np.column_stack((x, y))
     tree = cKDTree(pts)
     xy = np.column_stack((target_x, target_y))
@@ -1123,11 +899,10 @@ def precompute_idw_neighbors(
     }
 
 def idw_from_precomputed(z: np.ndarray, valid_points: np.ndarray, pre: dict, power: float) -> np.ndarray:
-    """
-    Evaluate IDW interpolation from a precomputed neighbor table.
+    """Inverse-distance-weighted values of ``z`` (weights ``1 / distance**power``) on the target cells.
 
-    This is a direct port of the FHS interpolation routine, including the
-    `len(z)` sentinel handling used by `cKDTree.query(..., distance_upper_bound=...)`.
+    A cell exactly on a point takes that point's value; cells with no usable
+    point are NaN.  ``valid_points`` switches individual points off.
     """
     dist = pre["dist"]
     idx = pre["idx"]
@@ -1170,9 +945,8 @@ def idw_from_precomputed(z: np.ndarray, valid_points: np.ndarray, pre: dict, pow
     return out
 
 
-
 def summarize_sanity_filter(prefix: str, valid_before: np.ndarray, valid_after: np.ndarray, point_types: np.ndarray | None = None) -> str:
-    """Build the same human-readable WSE sanity-filter summary used by FHS."""
+    """One-line summary of how many points the WSE sanity filter kept."""
     dropped = valid_before & ~valid_after
     total_before = int(np.count_nonzero(valid_before))
     total_after = int(np.count_nonzero(valid_after))
@@ -1207,11 +981,12 @@ def compute_fhs_flood_from_wse(
     anchor: np.ndarray,
     connectivity: int,
     smooth_sigma_pixels: float,
-    permanent_water_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Convert an interpolated WSE surface to a flood mask using the original FHS
-    corridor/anchor/connectivity rules.
+    """Flood mask and WSE from an interpolated water surface: ``(flood, wse)``.
+
+    After optional Gaussian smoothing, a corridor cell floods where the WSE is
+    above the DEM and it connects (4- or 8-connected) to the anchor cells.
+    WSE is NaN wherever the ground is at or above it.
     """
     if smooth_sigma_pixels > 0:
         wse = smooth_nan(wse, smooth_sigma_pixels)
@@ -1229,9 +1004,6 @@ def compute_fhs_flood_from_wse(
     wse = wse.copy()
     wse[dry_cells] = np.nan
     flood[dry_cells] = False
-
-    if permanent_water_mask is not None:
-        flood |= permanent_water_mask
 
     return flood.astype(np.uint8), wse.astype(np.float32)
 
@@ -1267,88 +1039,54 @@ def create_fhs_flood_map_from_points(
     smooth_sigma_pixels: float = 0.5,
     apply_wse_sanity_filter: bool = True,
     wse_sanity_tolerance_m: float = 0.0,
-    permanent_water_mask: np.ndarray | None = None,
     fast_mode: bool = False,
-    precomputed_neighbors: dict | None = None,
-    precomputed_corridor_mask: np.ndarray | None = None,
-    precomputed_anchor_mask: np.ndarray | None = None,
 ) -> dict[str, np.ndarray | str | bool]:
-    """
-    Port of the FHS `create_flood_map_from_hwms` single-scenario flood engine.
+    """Flood map for one event from water-surface points.
+
+    The points' WSEs are interpolated by inverse-distance weighting (``k``
+    nearest points, weight ``1 / distance**power``) inside a corridor buffered
+    around them, then turned into a flood mask by ``compute_fhs_flood_from_wse``.
 
     Parameters
     ----------
     dem : ndarray
-        Unpadded DEM array for the working grid.
+        The DEM, not padded.
     point_wse : ndarray
-        Water-surface elevations for one scenario.
-    point_rows, point_cols : ndarray, optional
-        Zero-based raster indices for the points. Required when `point_x` and
-        `point_y` are not provided and also used to sample DEM elevations when
-        `point_dem` is omitted.
-    point_x, point_y : ndarray, optional
-        Point coordinates on a local projected grid measured in meters.
-    point_topwidth : ndarray, optional
-        Per-point top width values in meters. If omitted, a constant fallback is
-        used.
-    point_ids : ndarray, optional
-        Point IDs used for COMID-wise median interpolation distances.
-    point_dem : ndarray, optional
-        DEM elevation at the point locations. If omitted and rows/cols are
-        available, values are sampled from `dem`.
-    point_types : ndarray, optional
-        Optional labels used in the sanity-filter summary.
-    point_slope : ndarray, optional
-        Optional slope values interpolated with the same IDW neighbors so the
-        caller can still build velocity products.
+        Each point's water-surface elevation.
+    point_rows, point_cols, point_x, point_y : ndarray, optional
+        Where the points are: x/y in metres on the local grid (see
+        ``_grid_xy_from_rc``), or rows and columns.
+    point_topwidth, point_ids, point_dem, point_types, point_slope : ndarray, optional
+        Each point's top width, reach id, ground elevation (sampled from
+        ``dem`` if omitted), label for the summary message, and slope (also
+        interpolated, for velocity).
     dx, dy : float
-        Cell spacing in meters.
-    prefix : str, default "default"
-        Scenario label used in the returned summary string.
-    corridor_buffer_m, anchor_buffer_m : float
-        Fixed buffer distances used when top-width buffers are disabled.
-    use_topwidth_buffers : bool
-        If True, corridor/anchor radii are derived from point top widths.
-    corridor_topwidth_factor, anchor_topwidth_factor : float
-        Multipliers converting top width to corridor/anchor radii.
+        Cell size in metres.
+    prefix : str
+        Label for the summary message.
+    corridor_buffer_m, anchor_buffer_m, use_topwidth_buffers, corridor_topwidth_factor, anchor_topwidth_factor
+        Buffer sizes; see ``build_variable_buffer_masks_from_points``.
     connectivity : int
-        Either 4 or 8. Controls raster connectivity during flood propagation.
+        4 or 8, the neighbours through which the flood connects.
     k, power : int, float
-        IDW nearest-neighbor count and inverse-distance power.
-    max_distance_m : float
-        Fixed interpolation radius in meters.
-    use_topwidth_max_distance : bool
-        If True and `point_ids` are available, per-point max distance is the
-        COMID-wise median top width times `maxdist_topwidth_factor`.
+        Number of nearest points and the inverse-distance power.
+    max_distance_m, use_topwidth_max_distance, maxdist_topwidth_factor
+        How far a point reaches: ``max_distance_m``, or its reach's median top
+        width times ``maxdist_topwidth_factor``.
     min_topwidth_m, max_topwidth_m, fallback_topwidth_m : float
-        Top-width clipping and fallback settings.
+        Top widths are clipped to this range, and missing ones replaced.
     smooth_sigma_pixels : float
-        Gaussian smoothing applied to the interpolated WSE grid.
-    apply_wse_sanity_filter : bool
-        If True, drop points whose WSE falls below the DEM at the point.
-    wse_sanity_tolerance_m : float
-        Non-negative tolerance added before the WSE-vs-DEM sanity comparison.
-    permanent_water_mask : ndarray, optional
-        Boolean mask of always-wet cells.
+        Gaussian smoothing of the interpolated WSE, in cells.
+    apply_wse_sanity_filter, wse_sanity_tolerance_m
+        Drop points whose WSE (plus the tolerance) is below their ground.
     fast_mode : bool
-        Mirrors the FHS fast-mode overrides by disabling top-width-based buffers
-        and top-width-based max interpolation distance.
-    precomputed_neighbors, precomputed_corridor_mask, precomputed_anchor_mask : optional
-        Optional reusable state for repeated scenario evaluation. If supplied,
-        they are used exactly as in the original FHS fast worker.
+        Use the fixed buffers and distance instead of top-width-based ones.
 
     Returns
     -------
     dict
-        Keys: `flood`, `wse`, `depth`, `slope`, `stats_message`,
-        `valid_point_mask`, and `has_valid_points`.
-
-    Notes
-    -----
-    This function ports the flood-raster generation part of
-    `FHS_FloodMapper_AllInOne.py`. It intentionally does not reimplement the
-    original CLI, raster reprojection, or VDT-to-HWM point generation wrapper.
-    Those are better handled outside this low-level helper.
+        ``flood``, ``wse``, ``depth``, ``slope``, ``stats_message``,
+        ``valid_point_mask`` and ``has_valid_points``.
     """
     dem = np.asarray(dem, dtype=np.float32)
     if dem.ndim != 2:
@@ -1435,35 +1173,25 @@ def create_fhs_flood_map_from_points(
     xs = (np.arange(ncols, dtype=np.float32) + np.float32(0.5)) * np.float32(dx)
     ys = -((np.arange(nrows, dtype=np.float32) + np.float32(0.5)) * np.float32(dy))
 
-    # Build or reuse the masks that define where IDW can populate WSE values
-    # and where hydraulic connectivity is allowed to start.
-    if precomputed_corridor_mask is not None and precomputed_anchor_mask is not None:
-        corridor = np.asarray(precomputed_corridor_mask, dtype=bool)
-        anchor = np.asarray(precomputed_anchor_mask, dtype=bool)
-    else:
-        x_valid = point_x[valid]
-        y_valid = point_y[valid]
-        tw_valid = point_topwidth[valid]
-        corridor, anchor = build_variable_buffer_masks_from_points(
-            x=x_valid,
-            y=y_valid,
-            topwidth=tw_valid,
-            dem_shape=dem.shape,
-            transform=transform,
-            fixed_corridor_buffer_m=corridor_buffer_m,
-            fixed_anchor_buffer_m=anchor_buffer_m,
-            use_topwidth_buffers=use_topwidth_buffers,
-            corridor_topwidth_factor=corridor_topwidth_factor,
-            anchor_topwidth_factor=anchor_topwidth_factor,
-        )
+    # Where IDW can populate WSE values, and where the connected flood starts
+    corridor, anchor = build_variable_buffer_masks_from_points(
+        x=point_x[valid],
+        y=point_y[valid],
+        topwidth=point_topwidth[valid],
+        dem_shape=dem.shape,
+        transform=transform,
+        fixed_corridor_buffer_m=corridor_buffer_m,
+        fixed_anchor_buffer_m=anchor_buffer_m,
+        use_topwidth_buffers=use_topwidth_buffers,
+        corridor_topwidth_factor=corridor_topwidth_factor,
+        anchor_topwidth_factor=anchor_topwidth_factor,
+    )
 
     if not np.any(valid):
         flood = np.zeros(dem.shape, dtype=np.uint8)
         wse = np.full(dem.shape, np.nan, dtype=np.float32)
         depth = np.full(dem.shape, np.nan, dtype=np.float32)
         slope = np.full(dem.shape, np.nan, dtype=np.float32) if point_slope is not None else None
-        if permanent_water_mask is not None:
-            flood = np.where(permanent_water_mask, 1, flood).astype(np.uint8)
         return {
             "flood": flood,
             "wse": wse,
@@ -1474,56 +1202,46 @@ def create_fhs_flood_map_from_points(
             "has_valid_points": False,
         }
 
-    if precomputed_neighbors is not None:
-        z_all = np.where(valid, point_wse.astype(np.float32), 0.0).astype(np.float32)
-        wse = idw_from_precomputed(z_all, valid, precomputed_neighbors, power)
+    x_valid = point_x[valid]
+    y_valid = point_y[valid]
+    z_valid = point_wse[valid].astype(np.float32)
+    tw_valid = point_topwidth[valid].astype(np.float32)
+
+    # Each reach's points reach as far as its median top width, so larger
+    # rivers influence a wider neighbourhood
+    if point_ids is not None and use_topwidth_max_distance:
+        tmp_df = pd.DataFrame({"id_col": point_ids[valid], "tw_based_dist": maxdist_topwidth_factor * tw_valid})
+        grouped = tmp_df.groupby("id_col")["tw_based_dist"].median()
+        point_max_distance = tmp_df["id_col"].map(grouped).to_numpy(dtype=np.float32, copy=True)
+        bad = ~np.isfinite(point_max_distance)
+        point_max_distance[bad] = max_distance_m
+    else:
+        point_max_distance = np.full(len(z_valid), max_distance_m, dtype=np.float32)
+
+    # Interpolate only within the buffered corridor; cells outside it stay NaN
+    interp_mask = corridor & np.isfinite(dem)
+    target_x, target_y, target_rows, target_cols = build_target_coordinates(xs, ys, interp_mask)
+    if len(target_x) == 0:
+        wse = np.full(dem.shape, np.nan, dtype=np.float32)
+        slope_interp = np.full(dem.shape, np.nan, dtype=np.float32) if point_slope is not None else None
+    else:
+        pre = precompute_idw_neighbors(
+            x=x_valid,
+            y=y_valid,
+            point_max_distance=point_max_distance,
+            target_x=target_x,
+            target_y=target_y,
+            out_shape=dem.shape,
+            target_rows=target_rows,
+            target_cols=target_cols,
+            k=k,
+        )
+        valid_points = np.ones(len(z_valid), dtype=bool)
+        wse = idw_from_precomputed(z_valid, valid_points, pre, power)
         if point_slope is not None:
-            slope_seed = np.where(valid, point_slope.astype(np.float32), 0.0).astype(np.float32)
-            slope_interp = idw_from_precomputed(slope_seed, valid, precomputed_neighbors, power)
+            slope_interp = idw_from_precomputed(point_slope[valid].astype(np.float32), valid_points, pre, power)
         else:
             slope_interp = None
-    else:
-        x_valid = point_x[valid]
-        y_valid = point_y[valid]
-        z_valid = point_wse[valid].astype(np.float32)
-        tw_valid = point_topwidth[valid].astype(np.float32)
-
-        # FHS can scale the interpolation reach by COMID using the median top
-        # width, allowing larger rivers to influence a wider neighborhood.
-        if point_ids is not None and use_topwidth_max_distance:
-            tmp_df = pd.DataFrame({"id_col": point_ids[valid], "tw_based_dist": maxdist_topwidth_factor * tw_valid})
-            grouped = tmp_df.groupby("id_col")["tw_based_dist"].median()
-            point_max_distance = tmp_df["id_col"].map(grouped).to_numpy(dtype=np.float32, copy=True)
-            bad = ~np.isfinite(point_max_distance)
-            point_max_distance[bad] = max_distance_m
-        else:
-            point_max_distance = np.full(len(z_valid), max_distance_m, dtype=np.float32)
-
-        # Interpolate only within the buffered corridor; cells outside it stay
-        # NaN unless they are later forced wet by another rule.
-        interp_mask = corridor & np.isfinite(dem)
-        target_x, target_y, target_rows, target_cols = build_target_coordinates(xs, ys, interp_mask)
-        if len(target_x) == 0:
-            wse = np.full(dem.shape, np.nan, dtype=np.float32)
-            slope_interp = np.full(dem.shape, np.nan, dtype=np.float32) if point_slope is not None else None
-        else:
-            pre = precompute_idw_neighbors(
-                x=x_valid,
-                y=y_valid,
-                point_max_distance=point_max_distance,
-                target_x=target_x,
-                target_y=target_y,
-                out_shape=dem.shape,
-                target_rows=target_rows,
-                target_cols=target_cols,
-                k=k,
-            )
-            valid_points = np.ones(len(z_valid), dtype=bool)
-            wse = idw_from_precomputed(z_valid, valid_points, pre, power)
-            if point_slope is not None:
-                slope_interp = idw_from_precomputed(point_slope[valid].astype(np.float32), valid_points, pre, power)
-            else:
-                slope_interp = None
 
     flood, wse = compute_fhs_flood_from_wse(
         wse=wse,
@@ -1532,7 +1250,6 @@ def create_fhs_flood_map_from_points(
         anchor=anchor,
         connectivity=connectivity,
         smooth_sigma_pixels=smooth_sigma_pixels,
-        permanent_water_mask=permanent_water_mask,
     )
     depth = np.where(np.isfinite(wse), np.maximum(wse - dem, 0.0), np.nan).astype(np.float32)
 
@@ -1574,73 +1291,22 @@ def multi_point_interpolation(
     flood_vdt_cells: bool,
     mapper_options: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, str]:
-    """
-    Curve2Flood-side wrapper for the FHS FloodMapper workflow.
+    """Multi-point interpolation mapper: ``(flood, depth, slope, message)`` for one flow event.
 
-    This function ports the FHS end-to-end logic that is relevant inside
-    Curve2Flood's per-flow event loop:
+    1. Build one water-surface point per stream cell from the VDT database
+       (preferred) or the curve file, at each reach's flow; missing ``Elev``,
+       ``Slope`` and ``XS_Angle`` values are borrowed from the other table.
+    2. Optionally drop points with outlying depths.
+    3. Add points across the cross sections of wide rivers.
+    4. Interpolate and map the flood with ``create_fhs_flood_map_from_points``.
 
-    1. Optionally rebuild scenario HWM-style centerline points directly from the
-       VDT database and the current COMID->flow mapping.
-    2. Optionally filter HWM outliers using the FHS MAD/IQR depth filter.
-    3. Optionally expand points across the cross section using `XS_Angle`,
-       top width, and DEM blocking.
-    4. Generate a flood raster via FHS inverse-distance interpolation,
-       corridor/anchor buffering, smoothing, and connectivity enforcement.
-
-    Parameters
-    ----------
-    E, B, RR, CC, T_Rast, W_Rast, S_Rast : ndarray
-        The current Curve2Flood padded DEM/stream arrays and per-cell hydraulic
-        rasters for the active flow event.
-    COMID_Unique_TW, COMID_Unique_Depth : mapping
-        Per-COMID fallback top width and depth used when a VDT-driven point set
-        cannot be built.
-    COMID_Unique_Flow : dict
-        Current event COMID->flow mapping.
-    CurveParamFileName, VDTDatabaseFileName : str
-        Optional curve and VDT source tables. This function prefers the original
-        FHS VDT->HWM interpolation path when the VDT database is available.
-        Missing `XS_Angle`, `Slope`, or `Elev` values can be backfilled from the
-        other table when possible.
-    TW_MultFact : float
-        Curve2Flood top-width multiplier. This is required so curve-file driven
-        scenario generation produces the same scaled top widths as the rest of
-        the run.
-    dx, dy : float
-        Cell spacing in meters on the local working grid.
-    TopWidthPlausibleLimit, Set_Depth : float
-        Curve2Flood fixed-depth controls used by the fallback centerline-point
-        builder when VDT-driven point generation is unavailable.
-    flood_vdt_cells : bool
-        If True, centerline cells are forced into the returned flood mask.
-    mapper_options : dict, optional
-        Optional FHS tuning parameters. Supported keys:
-        `topwidth_threshold_m`, `xs_point_spacing_m`,
-        `remove_hwm_outliers`, `hwm_outlier_method`,
-        `hwm_outlier_threshold`, `hwm_outlier_group_by`,
-        `hwm_outlier_min_samples`, `corridor_buffer_m`,
-        `anchor_buffer_m`, `use_topwidth_buffers`,
-        `corridor_topwidth_factor`, `anchor_topwidth_factor`,
-        `connectivity`, `k`, `power`, `max_distance_m`,
-        `use_topwidth_max_distance`, `maxdist_topwidth_factor`,
-        `min_topwidth_m`, `max_topwidth_m`, `fallback_topwidth_m`,
-        `smooth_sigma_pixels`, `apply_wse_sanity_filter`,
-        `wse_sanity_tolerance_m`, `fast_mode`, and `permanent_water_mask`.
-
-    Returns
-    -------
-    tuple
-        `(flood, depth, slope, stats_message)` for the current flow event.
-
-    Notes
-    -----
-    The wrapper prefers rebuilding points from the VDT because that most
-    closely matches `FHS_FloodMapper_AllInOne.py`. If VDT metadata is missing,
-    it is backfilled from the curve file when possible. If a usable VDT table
-    is not available, the function builds the scenario table from the curve
-    file directly before falling back to the currently-available Curve2Flood
-    centerline rasters.
+    If no point table can be built (or with ``Set_Depth``), the points come
+    from the stream cells and the ``T_Rast``/``W_Rast`` rasters instead (see
+    ``build_fhs_points_from_curve2flood_inputs``).  ``E``, ``B``, ``RR`` and
+    ``CC`` are the padded DEM and stream-id rasters and the stream-cell
+    indices.  ``mapper_options`` overrides the tuning defaults below; their
+    input-file keys start with ``MPI_``.  With ``flood_vdt_cells`` the stream
+    cells are always flooded.
     """
     options = {
         "topwidth_threshold_m": 200.0,
@@ -1668,7 +1334,6 @@ def multi_point_interpolation(
         "apply_wse_sanity_filter": True,
         "wse_sanity_tolerance_m": 0.0,
         "fast_mode": False,
-        "permanent_water_mask": None,
         "one_based_vdt_rc": False,
     }
     if mapper_options:
@@ -1762,8 +1427,7 @@ def multi_point_interpolation(
             )
 
     if point_data is None:
-        # Last resort: use the centerline hydraulics already present inside
-        # Curve2Flood instead of an externally rebuilt FHS scenario table.
+        # Last resort: one point per stream cell from the rasters
         point_data = build_fhs_points_from_curve2flood_inputs(
             RR=RR,
             CC=CC,
@@ -1780,8 +1444,6 @@ def multi_point_interpolation(
             dy=dy,
         )
 
-    # Once the point cloud is ready, the remaining work is the lower-level FHS
-    # raster engine: buffer, interpolate WSE, then derive flood/depth/slope.
     result = create_fhs_flood_map_from_points(
         dem=E[1:-1, 1:-1],
         point_rows=point_data["rows"],
@@ -1814,7 +1476,6 @@ def multi_point_interpolation(
         smooth_sigma_pixels=float(options["smooth_sigma_pixels"]),
         apply_wse_sanity_filter=bool(options["apply_wse_sanity_filter"]),
         wse_sanity_tolerance_m=float(options["wse_sanity_tolerance_m"]),
-        permanent_water_mask=options["permanent_water_mask"],
         fast_mode=bool(options["fast_mode"]),
     )
     stats_message = result["stats_message"]
@@ -1824,8 +1485,7 @@ def multi_point_interpolation(
     slope = result["slope"]
 
     if flood_vdt_cells:
-        # Keep the original centerline cells wet even if interpolation or
-        # buffering would otherwise omit some of them.
+        # Keep the stream cells wet even where the interpolation left them dry
         valid_rows = point_data["rows"] >= 0
         valid_cols = point_data["cols"] >= 0
         valid_centerline = valid_rows & valid_cols

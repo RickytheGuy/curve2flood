@@ -23,7 +23,7 @@ classifiers = [
 dependencies = [
     "numpy",
     "pandas",
-    "pyarrow",
+    "pyarrow>=18",
     # "gdal", # Let user install GDAL separately to avoid version conflicts
     "geopandas",
     "pyyaml",
@@ -33,11 +33,15 @@ dependencies = [
     "tqdm",
     "polars",
     "pyproj",
+    "networkx",
 ]
 
 [project.optional-dependencies]
 all = [
     "intel-cmplr-lib-rt"
+]
+test = [
+    "pytest"
 ]
 
 [project.scripts]
@@ -45,3 +49,7 @@ curve2flood = "curve2flood.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["curve2flood*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

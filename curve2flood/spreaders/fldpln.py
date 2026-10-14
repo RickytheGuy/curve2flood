@@ -1,55 +1,32 @@
-"""FLDPLN floodplain-library construction.
+"""FLDPLN: build a floodplain library, and map floods with it.
 
-Implements the FLDPLN model of Kastens (2008), *Some New Developments on Two
-Separate Topics: Statistical Cross Validation and Floodplain Mapping*, chapter 3
-("A New Method for Floodplain Modeling"), and descends from the MATLAB reference
-``fldpln_model_v5ram.m``.
+FLDPLN (Kastens 2008, *Some New Developments on Two Separate Topics:
+Statistical Cross Validation and Floodplain Mapping*, chapter 3) asks, for
+every stream pixel, which floodplain pixels its water can reach and how deep
+the water must be at the stream pixel to get there: the depth to flood (DTF).
+Water fills the filled DEM upstream (backfill) and spills over low divides
+into neighbouring valleys (spillover).  The library holds one row per
+(flood source pixel ``FSP``, floodplain pixel ``FPP``, ``DTF``, ``fill``),
+where ``fill`` is how far the filled DEM sits above the DEM at ``FPP``;
+mapping an event then needs only each stream pixel's water depth.
 
-Two conventions differ deliberately from that reference; keep them in mind when
-diffing against it:
-
-* **Flow-direction encoding.**  The reference uses MATLAB/ESRI-like D8 codes
-  ``INFLOW = [2, 4, 8, 1, 16, 128, 64, 32]``.  This module uses WhiteboxTools
-  codes (see ``INFLOW`` / ``OUTFLOW`` below).  The neighbour ordering itself is
-  unchanged.
-* **Stream-table columns.**  The reference indexes ``seg_info`` by row number and
-  reads segment length from column 4.  Here ``stream_info`` is looked up by
-  stream id and the columns are ``start pixel (0), end pixel (1), length (2),
-  stream id (3)``.
-
-Two solvers are available.
+Two solvers build the library:
 
 ``solver="exact"`` (default)
-    A single monotone priority-queue sweep.  Chapter 3 fixes the cost of every
-    move FLDPLN can make:
-
-    * BFA step 2 (p.113) assigns ``DTF(p) = E(p) - E(x)`` over the backfill
-      watershed ``B(x,h)``.  Exit paths on a filled DEM are non-increasing in
-      elevation (p.111), so that difference is exactly the sum of the positive
-      rises along the D8 path from ``x`` to ``p``.
-    * Spillover step 5 (p.120) assigns ``DTF(y) = DTF(w) + max(0, E(y) - E(w))``
-      for any 8-neighbour ``w`` of ``y`` -- the same positive-rise cost.
-    * Trajectory descent (step 6a) runs downhill and so costs nothing.
-
-    ``DTF(p)`` is therefore the minimum, over 8-connected paths from the stream
-    set to ``p``, of the summed positive rises: a shortest-path problem with
-    non-negative edge weights.  Theorem 3.1's observation that "backfill and
-    spillover flooding processes can never assign to a floodplain pixel a DTF
-    value lower than the DTF value from the input pixel acting as the floodwater
-    source" is exactly the non-negativity that makes Dijkstra's algorithm
-    correct, and ``_forward_path``'s ``spill_dtf >= flddat[nxt]`` stop is its
-    settled-node test.  The ``dh`` loop is thus a bucket queue over that metric,
-    and one sweep computes the ``dh -> 0`` limit directly.  ``dh`` is unused here.
+    DTF is the smallest total climb along any 8-connected path from the stream
+    to the pixel (downhill steps are free), found in one Dijkstra sweep.  This
+    is the limit of the depth-stepped algorithm as ``dh`` goes to 0.
 
 ``solver="iterative"``
-    The depth-stepped loop of algorithm steps 1-8, honouring ``dh``.  Kept
-    because ``dh`` is a modelling choice and not only a discretisation: Kastens
-    notes (pp.123-124) that on coarse DEMs unrestricted spill can overestimate
-    extent, which a larger ``dh`` damps.
+    The depth-stepped algorithm, raising the water ``dh`` at a time.  A larger
+    ``dh`` damps spillover, which can over-flood on coarse DEMs.
 
-Both solvers run on a padded window around the segment rather than the whole
-raster.  The window grows and the segment is re-solved if the floodplain reaches
-its edge, so results never depend on the window size.
+Both solve each stream segment in a window around it that grows when the
+floodplain reaches its edge, so the result never depends on the window size.
+
+Flow directions use WhiteboxTools D8 codes, and the stream table has columns
+``start_pixel, end_pixel, length, stream_id``.  Pixels are flat row-major
+indices, ``row * ncols + col``.
 """
 
 from __future__ import annotations
@@ -75,17 +52,18 @@ from numba.extending import register_jitable
 
 from curve2flood import LOG
 
-FLOAT_COLS = ["DTF", "fill depth"]
-SCALE = 100
+# Columns stored as 2-decimal numbers.  A fill can be deep (a pit filled to its
+# rim), so it gets more digits than a DTF, which is at most the library's fldmx.
+DECIMAL_COLS = {"DTF": pa.decimal32(5, 2), "fill": pa.decimal32(7, 2)}
 
 _SHARED_MEMORYS = {}
 
-# Neighbor order used in the MATLAB code:
+# Neighbour order:
 # 1 2 3
 # 4 x 5
 # 6 7 8
 # INFLOW/OUTFLOW are indexed by this ordering, and the solvers' flat neighbour
-# offsets mirror it as ``dr * ncols + dc``.  test_fldpln_solvers.py pins that.
+# offsets mirror it as ``dr * ncols + dc``.
 NEIGHBOR_DELTAS = (
     (-1, -1),
     (-1, 0),
@@ -112,10 +90,6 @@ NEIGHBOR_DELTAS = (
 # carries when it drains into that neighbour.
 INFLOW = np.array([4, 8, 16, 2, 32, 1, 128, 64], dtype=np.int32)
 OUTFLOW = np.array([64, 128, 1, 32, 2, 16, 8, 4], dtype=np.int32)
-
-# MATLAB
-# INFLOW = np.array([2, 4, 8, 1, 16, 128, 64, 32], dtype=np.int32)
-# OUTFLOW = np.array([32, 64, 128, 16, 1, 8, 4, 2], dtype=np.int32)
 
 SOLVERS = ("exact", "iterative")
 
@@ -144,19 +118,8 @@ def _rc_to_pixel(row: int, col: int, ncols: int) -> int:
 
 @register_jitable(cache=True, nogil=True)
 def _next_downstream(pixel: int, fdr: np.ndarray, nrows: int, ncols: int) -> int:
-    # ESRI D8
-    # OUTFLOW = {
-    #     np.uint8(32): (-1, -1),
-    #     np.uint8(64): (-1, 0),
-    #     np.uint8(128): (-1, 1),
-    #     np.uint8(16): (0, -1),
-    #     np.uint8(1): (0, 1),
-    #     np.uint8(8): (1, -1),
-    #     np.uint8(4): (1, 0),
-    #     np.uint8(2): (1, 1),
-    # }
-
-    # Whitebox D8
+    """The pixel ``pixel`` drains into, or -1 at a sink or the raster edge."""
+    # Whitebox D8 code -> (row, col) step
     OUTFLOW = {
         np.uint8(64): (-1, -1),
         np.uint8(128): (-1, 0),
@@ -336,28 +299,21 @@ def _solve_exact(fil: np.ndarray, fdr: np.ndarray, ncols: int,
                  max_below: float = np.inf):
     """Dijkstra over ``w(u -> v) = max(0, E(v) - E(u))`` on the 8-neighbourhood.
 
-    Returns ``(cells, dtf, fsp, depth_limit)`` in window-local flat ids.  ``spill_decay`` is
-    charged on a move to the D8 successor, which is where the depth-stepped
-    solver charges it (``_forward_path``); backfill moves run strictly upstream
-    and so can never be that edge.
+    Returns ``(cells, dtf, fsp, depth_limit)`` in window-local flat ids.
+    ``spill_decay`` is added on each step to a pixel's D8 successor, as the
+    depth-stepped solver adds it on spillover paths.
 
     ``max_cells`` caps the floodplain at that many cells (0 is no cap).  Cells
-    settle in order of DTF, so once the cap is full the sweep stops at the depth
-    ``d`` of the next cell and keeps only the cells shallower than ``d`` -- a
-    partly settled depth would make the result depend on pixel order.  That is
-    exactly the floodplain ``fldmx`` just below ``d`` gives, and ``depth_limit``
-    returns ``d`` in metres (-1 when the cap was not reached).  The cells the
-    segment floods at no depth at all are always kept, so ``d`` is never 0: there
-    is no shallower floodplain to cut them back to.  Cells more than
-    ``max_below`` metres below the stream pixel that floods them do not count
-    toward the cap: the caller leaves them out of the table.
+    settle in order of DTF, so once the cap is full the sweep stops at the DTF
+    ``d`` of the next cell and keeps only the cells shallower than ``d``: the
+    floodplain an ``fldmx`` just below ``d`` would give.  ``depth_limit`` is
+    ``d`` in metres, or -1 when the cap was not reached.  Cells flooded at zero
+    depth are always kept, and cells more than ``max_below`` metres below their
+    source do not count toward the cap (the caller leaves them out).
 
-    ``TD(R)`` is not a wall.  The reference applies it per operation, and each
-    one maps onto an edge type here: ``_backfill_from_source`` never consults the
-    exclusion set, so backfill edges into ``TD(R)`` stay open; ``_spill_candidates``
-    refuses to select an excluded cell, so lateral spill edges into it are shut;
-    and ``_forward_path`` may end a trajectory on one excluded cell but not run
-    along ``TD(R)``, so a descent edge into it is open only from outside.
+    The pixels downstream of the segment (``excluded``) are not a wall.  As in
+    the depth-stepped algorithm, backfill may enter them, lateral spillover may
+    not, and a downhill path may step onto one but not continue along them.
     """
     n = fil.size
     unreached = np.int32(2147483647)
@@ -862,56 +818,49 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
                                solver: str = "exact",
                                max_drop_below_source: float | None = None,
                                max_cells: int = 0) -> pd.DataFrame:
-    """Build an FLDPLN floodplain table for a single stream segment.
+    """Floodplain table for one stream segment.
 
     Parameters
     ----------
     filled_dem : np.ndarray
-        Filled elevation raster.  The only surface the solvers see.
+        Filled (depression-free) DEM.
     flow_direction : np.ndarray
-        D8 flow-direction raster, assumes whitebox conventions.
+        D8 flow directions, WhiteboxTools codes.
     stream_id : int
-        Stream segment identifier.
+        The segment to solve.
     stream_info : np.ndarray
-        Segment metadata, as a 2D array with one row per segment and columns including start pixel (0), end pixel (1), length (2), and linkno (3).
+        One row per segment: start pixel, end pixel, length (pixels), stream id.
     dh : float
-        Flood increment step; must be positive. Ignored when ``solver="exact"``.
+        Depth step of the iterative solver (m); must be positive.  Ignored by
+        the exact solver.
     fldmn : float
-        Minimum flood depth.
+        Smallest DTF reported (m); smaller DTFs are raised to it.
     fldmx : float
-        Maximum flood depth to evaluate.
+        Largest depth to flood to (m).
     iterative_spill : bool
-        If True, continue spilling while shallow boundary conditions exist.
-        Ignored when ``solver="exact"``, which always reaches the steady state.
+        Iterative solver only: keep spilling until the floodplain stops growing.
     global_max_wse : float, optional
-        Upper bound on water-surface elevation. 0 means no bound.
+        Highest water-surface elevation allowed; 0 for no limit.
     bg : float, optional
-        Background/no-data value in DEM.
+        No-data value of the DEM; such cells never flood.
     spill_decay : float, optional
-        When spilling, the amount to increase the DTF for each downstream pixel. This throttles spilling.
+        DTF added per pixel along a spillover path, to shorten spills.
     solver : {"exact", "iterative"}, optional
-        ``"exact"`` solves the depth-to-flood field in one monotone sweep -- the
-        ``dh -> 0`` limit of the depth-stepped algorithm.  ``"iterative"`` runs
-        the depth-stepped loop and honours ``dh``.
+        See the module docstring.
     max_drop_below_source : float, optional
-        Leave out floodplain cells more than ``fldmx`` plus this many metres
-        below the stream pixel that floods them; None keeps them all.  The FLDPLN
-        mapper drops a cell more than ``DoF + FLDPLN_Max_Drop_Below_Source`` below
-        its source, and a stream pixel's ``DoF`` comes from the same VDT as
-        ``fldmx``, smoothed along the stream, so with this a few metres more than
-        the mapper's those cells are never mapped.  They are most of the table on
-        slopes, since a downhill step costs no depth.
+        Leave out cells more than ``fldmx`` plus this many metres below the
+        stream pixel that floods them.  Going downhill costs no depth, so on
+        slopes these are most of the table.  None keeps every cell.
     max_cells : int, optional
-        Most floodplain cells (table rows) the segment may have, 0 for no limit.
-        A segment that would flood more stops at the shallowest depth that
-        exceeds it, as if its ``fldmx`` were just below that depth, which is
-        recorded as ``attrs["depth_limit"]``.  Cells left out by
-        ``max_drop_below_source`` do not count.  Exact solver only.
+        Most rows the segment may have (0 for no limit).  A segment that would
+        flood more stops at the shallowest depth that exceeds it, recorded in
+        ``attrs["depth_limit"]``.  Exact solver only.
+
     Returns
     -------
     pandas.DataFrame
-        Table with FSP, FPP and DTF columns.  ``attrs["depth_limit"]`` is the
-        depth ``max_cells`` stopped the floodplain at, or None if it did not.
+        ``FSP``, ``FPP`` and ``DTF`` columns.  ``attrs["depth_limit"]`` is the
+        depth ``max_cells`` stopped at, or None.
     """
     if solver not in SOLVERS:
         raise ValueError(f"solver must be one of {SOLVERS}, got {solver!r}.")
@@ -928,8 +877,7 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
     filled_dem = np.ascontiguousarray(filled_dem, dtype=np.float32)
     flow_direction = np.ascontiguousarray(flow_direction, dtype=np.uint8)
 
-    # Carried over from the MATLAB reference, where mxht0 was a flood height
-    # rather than an absolute water-surface elevation.  Kept for fidelity.
+    # The 0.99999 is carried over from the MATLAB reference
     global_max_wse = np.finfo(np.float32).max if not global_max_wse else 0.99999 * global_max_wse
 
     max_below = np.inf if max_drop_below_source is None else fldmx + max_drop_below_source
@@ -1004,11 +952,7 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
 
 
 def _set_shared(name: str, shm: shared_memory.SharedMemory):
-    """
-    We need the shared memory objects to persist somewhere; otherwise, the memory is freed and the numpy arrays point to invalid memory.
-    These must last the lifetime of the program! Reason being, bathymetry is the last thing written, and we need the shared memory to persist until then.
-    """
-    global _SHARED_MEMORYS
+    """Keep a reference to a shared-memory block, so it is not freed while arrays still use it."""
     _SHARED_MEMORYS[name] = shm
 
 def _read_into(ds: gdal.Dataset, arr: np.ndarray):
@@ -1028,6 +972,7 @@ def _read_into(ds: gdal.Dataset, arr: np.ndarray):
 
 def read_array_and_set_shared(file: str, dtype: np.dtype, set_shared: bool,
                               name: str = None):
+    """Read band 1 of a raster as ``dtype``; with ``set_shared``, into shared memory called ``name``."""
     ds = gdal.Open(file)
     shape = (ds.RasterYSize, ds.RasterXSize)
 
@@ -1049,6 +994,7 @@ def read_array_and_set_shared(file: str, dtype: np.dtype, set_shared: bool,
     return arr
 
 def run_parallel(args):
+    """Worker: solve one segment on the shared rasters."""
     return fldpln_library_for_segment(
             globals()['filled_dem_array'],
             globals()['flow_direction_array'],
@@ -1056,14 +1002,7 @@ def run_parallel(args):
         )
 
 def close_shared_memory(names: list[str]):
-    """
-    Close and unlink shared memory segments.
-
-    Parameters
-    ----------
-    names : list[str]
-        Names of the shared memory segments to close.
-    """
+    """Close and unlink the named shared-memory blocks."""
     for name in names:
         shm = _SHARED_MEMORYS.get(name)
         if shm is not None:
@@ -1077,18 +1016,7 @@ def init_parallel(
     shapes: list[tuple],
     dtypes: list[np.dtype],
 ):
-    """
-    Worker initializer for multiprocessing.
-
-    Attaches shared memory segments into NumPy arrays and stores them into
-    module-level globals so the per-cell worker function can run without
-    pickling large arrays.
-
-    Parameters
-    ----------
-    names, shapes, dtypes
-        Metadata produced by :func:`get_init_parallel_args`.
-    """
+    """Worker initialiser: attach the shared rasters as module globals, so they are not pickled per task."""
     shms = [shared_memory.SharedMemory(name=name) for name in names]
 
     for shm, name, shape, dtype in zip(shms, names, shapes, dtypes):
@@ -1096,6 +1024,7 @@ def init_parallel(
         globals()[name] = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
 
 def build_fldpln_library(
+    dem: str,
     filled_dem: str,
     stream_info_file: str,
     flow_direction_file: str,
@@ -1117,72 +1046,72 @@ def build_fldpln_library(
     max_drop_below_source: float | None = None,
     max_cells_per_segment: int | None = None
 ):
-    """
-    Build floodplain library.
+    """Build the FLDPLN floodplain library for every stream segment and save it.
+
+    Each row is a stream pixel ``FSP``, a cell it floods ``FPP``, the depth
+    to flood ``DTF`` and the cell's ``fill``: the filled DEM minus ``dem``.
+    Cells where ``dem`` has no data never flood, and are left out.
 
     Parameters
     ----------
+    dem: str
+        The DEM floods are mapped on (with the bathymetry, if any).  Only the
+        ``fill`` column comes from it, so the mapper never reads it.
     filled_dem: str
-        Path to the filled DEM raster.  The only surface the solvers see, and the
-        one the mapper measures its stage against.
+        Filled (depression-free) DEM raster.  The mapper must use the same one.
     stream_info_file: str
-        Path to the stream info CSV file.
+        CSV or Parquet table of the segments, with columns ``start_pixel``,
+        ``end_pixel``, ``length`` (pixels) and ``stream_id``.
     flow_direction_file: str
-        Path to the flow direction raster.
+        D8 flow-direction raster with WhiteboxTools codes.
+    library_file: str
+        Where to save the library: Parquet (``.parquet``/``.pq``, compact) or CSV.
     dh: float
-        Depth increment (meters).
+        Depth step of the iterative solver (m).  Ignored by the exact solver.
     fldmn: float
-        Minimum depth for a cell to be considered flooded (meters).
+        Smallest DTF stored (m); smaller DTFs are raised to it.
     fldmx: float
-        Maximum floodplain depth to iterate up to (meters).
+        Largest depth to flood to (m).
     iterative_spill: bool
-        Whether to use iterative spill routing when generating outputs. Recommended if the DEM is high resolution (<= 10 m)
+        Iterative solver only: keep spilling until the floodplain stops growing.
+        Recommended for fine DEMs (10 m or less).
     vdt_file: str | None
-        Optional VDT file used to derive per-stream maximum depths.
+        A VDT database.  Each segment then floods only to the deepest water its
+        last ``wse_*`` column gives (at most ``fldmx``), and segments without
+        VDT cells are skipped.
     bg_mask: np.ndarray | None
-        Optional background mask to exclude certain pixels from flooding.
+        Cells that never flood, such as lakes; same shape as the DEM.
     stream_ids: list[int] | None
-        Optional subset of COMIDs to process.
+        Only build these segments.
     global_max_wse: float
-        Global maximum water-surface elevation override.
+        Highest water-surface elevation allowed; 0 for no limit.
     bg: float
-        Background/no-data value for output rasters.
+        No-data value of the filled DEM.
     parallel: bool
-        If True, process stream reaches using multiprocessing.
-    pbar
-        If True, display a progress bar.
-    processes
-        Number of worker processes to use when parallel is enabled.
+        Solve the segments in several processes.
+    pbar: bool
+        Show a progress bar.
+    processes: int | None
+        Number of processes when ``parallel``; defaults to the CPU count.
     spill_decay: float
-        DTF added per downstream pixel when a spillover path is routed. Throttles
-        how far a single spill travels.
+        DTF added per pixel along a spillover path, to shorten spills.
     solver: str
-        "exact" (default) solves each segment in a single monotone sweep -- the
-        dh -> 0 limit of the depth-stepped algorithm -- and ignores dh.
-        "iterative" runs the depth-stepped loop and honours dh.
+        ``"exact"`` (default) or ``"iterative"``; see the module docstring.
     max_drop_below_source: float | None
-        Leave out floodplain cells more than a segment's maximum depth plus this
-        many metres below the stream pixel that floods them.  The mapper drops a
-        cell more than its stage plus FLDPLN_Max_Drop_Below_Source below the
-        stream pixel, and that stage comes from the same VDT as the maximum depth,
-        smoothed along the stream; with this a few metres more than the mapper's
-        (4 m more kept the maps of a 213M-row desert tile identical, at 10M rows),
-        those cells are never used.  On slopes they are most of the library: a
-        downhill step costs no depth, so every stream pixel reaches the whole
-        slope beneath it.  None (default) keeps them all.
+        Leave out cells more than a segment's maximum depth plus this many
+        metres below the stream pixel that floods them.  Going downhill costs
+        no depth, so without this a stream pixel on a slope floods the whole
+        hillside below it; the mapper has no limit of its own.  On slopes such
+        cells are most of the library.  None (default) keeps every cell.
     max_cells_per_segment: int | None
-        Most floodplain cells (library rows) one stream segment may contribute.
-        On flat ground a segment can reach millions of cells well within its
-        maximum depth; one that would exceed this instead stops at the depth
-        where it fills up, so its maximum depth is found from the terrain rather
-        than the VDT.  Floods deeper than that depth are mapped only that far, so
-        this trades the largest floods on flat ground for memory.  Cells left out
-        by max_drop_below_source do not count.  None (default) for no limit.
-        Needs solver="exact".
+        Most rows one segment may contribute.  A segment that would flood more
+        stops at the depth where it fills up, so deeper floods there are mapped
+        only that far: this trades the largest floods on flat ground for memory.
+        None (default) for no limit.  Needs ``solver="exact"``.
     """
     try:
         _build_fldpln_library(
-            filled_dem, stream_info_file, flow_direction_file, library_file,
+            dem, filled_dem, stream_info_file, flow_direction_file, library_file,
             dh, fldmn, fldmx, iterative_spill, vdt_file, stream_ids,
             global_max_wse, bg, parallel, pbar, processes, bg_mask,
             spill_decay, solver, max_drop_below_source, max_cells_per_segment
@@ -1191,6 +1120,7 @@ def build_fldpln_library(
         close_shared_memory(['filled_dem_array', 'flow_direction_array'])
 
 def _build_fldpln_library(
+    dem: str,
     filled_dem: str,
     stream_info_file: str,
     flow_direction_file: str,
@@ -1212,52 +1142,7 @@ def _build_fldpln_library(
     max_drop_below_source: float | None = None,
     max_cells_per_segment: int | None = None
 ):
-    """
-    Build floodplain library.
-
-    Parameters
-    ----------
-    filled_dem: str
-        Path to the filled DEM raster.  The only surface the solvers see, and the
-        one the mapper measures its stage against.
-    stream_info_file: str
-        Path to the stream info CSV file.
-    flow_direction_file: str
-        Path to the flow direction raster.
-    dh: float
-        Depth increment (meters).
-    fldmn: float
-        Minimum depth for a cell to be considered flooded (meters).
-    fldmx: float
-        Maximum floodplain depth to iterate up to (meters).
-    iterative_spill: bool
-        Whether to use iterative spill routing when generating outputs. Recommended if the DEM is high resolution (<= 10 m)
-    vdt_file: str | None
-        Optional VDT file used to derive per-stream maximum depths.
-    stream_ids: list[int] | None
-        Optional subset of COMIDs to process.
-    global_max_wse: float
-        Global maximum water-surface elevation override.
-    bg: float
-        Background/no-data value for output rasters.
-    parallel: bool
-        If True, process stream reaches using multiprocessing.
-    pbar
-        If True, display a progress bar.
-    processes
-        Number of worker processes to use when parallel is enabled.
-    spill_decay: float
-        DTF added per downstream pixel when a spillover path is routed. Throttles
-        how far a single spill travels.
-    solver: str
-        "exact" (default) solves each segment in a single monotone sweep -- the
-        dh -> 0 limit of the depth-stepped algorithm -- and ignores dh.
-        "iterative" runs the depth-stepped loop and honours dh.
-    max_drop_below_source: float | None
-        How far below its maximum depth a cell may lie under its stream pixel; see build_fldpln_library.
-    max_cells_per_segment: int | None
-        Most floodplain cells one stream segment may contribute; see build_fldpln_library.
-    """
+    """``build_fldpln_library`` without the shared-memory cleanup."""
     if solver not in SOLVERS:
         raise ValueError(f"solver must be one of {SOLVERS}, got {solver!r}.")
     if max_drop_below_source is not None and not max_drop_below_source >= 0:
@@ -1280,6 +1165,9 @@ def _build_fldpln_library(
 
     filled_dem_array = read_array_and_set_shared(filled_dem, np.float32, set_shared=parallel, name='filled_dem_array')
     flow_direction_array = read_array_and_set_shared(flow_direction_file, np.uint8, set_shared=parallel, name='flow_direction_array')
+    dem_shape = _raster_shape(dem)
+    if dem_shape != filled_dem_array.shape:
+        raise ValueError(f"The DEM has shape {dem_shape}, but the filled DEM has {filled_dem_array.shape}.")
 
     if bg_mask is not None:
         # A 0/1 integer mask would index rows 0 and 1 instead of the masked cells
@@ -1372,6 +1260,7 @@ def _build_fldpln_library(
                 *args[i]
             ))
 
+    fill_depth = _fill_depth(dem, filled_dem_array, bg)
     close_shared_memory(['filled_dem_array', 'flow_direction_array'])
     # Not needed past the solves: free them before the library is assembled
     del filled_dem_array, flow_direction_array
@@ -1391,20 +1280,49 @@ def _build_fldpln_library(
     order = np.lexsort((df['FPP'].to_numpy(), df['FSP'].to_numpy()))
     df = pd.DataFrame({c: df[c].to_numpy()[order] for c in df.columns}, copy=False)
     del order
+
+    fill = fill_depth.ravel()[df['FPP'].to_numpy()]
+    del fill_depth
+    # Cells without a DEM value never flood
+    has_dem = np.isfinite(fill)
+    if not has_dem.all():
+        df = pd.DataFrame({c: df[c].to_numpy()[has_dem] for c in df.columns}, copy=False)
+        fill = fill[has_dem]
+    df['fill'] = fill
+
     if Path(library_file).suffix in {'.parquet', '.pq'}:
         save_library(df, library_file)
     else:
         df.to_csv(library_file, index=False)
 
+def _raster_shape(path: str) -> tuple[int, int]:
+    ds = gdal.Open(path)
+    return ds.RasterYSize, ds.RasterXSize
+
+def _fill_depth(dem: str, filled_dem: np.ndarray, bg: float) -> np.ndarray:
+    """``filled_dem - dem`` as float32, NaN where either has no data."""
+    ds = gdal.Open(dem)
+    nodata = ds.GetRasterBand(1).GetNoDataValue()
+    fill = np.empty(filled_dem.shape, dtype=np.float32)
+    _read_into(ds, fill)
+    no_data = ~np.isfinite(fill) | (fill <= -9998) | (filled_dem == np.float32(bg))
+    if nodata is not None:
+        no_data |= fill == np.float32(nodata)
+    np.subtract(filled_dem, fill, out=fill)
+    fill[no_data] = np.nan
+    return fill
+
 def save_library(df: pd.DataFrame, path: str):
-    """
-    We can make the parquet file 6x smaller than just brotli-compressed parquet by using the right encodings.
+    """Save a library as compact Parquet.
+
+    DTF and fill are stored as 2-decimal numbers, and each column gets the
+    encoding that compresses it best; the file is several times smaller than
+    plain Brotli-compressed Parquet.
     """
     cols, enc = {}, {"FPP": "DELTA_BINARY_PACKED"}
-    DEC = pa.decimal32(5, 2)
     for c in df.columns:
-        if c in FLOAT_COLS:
-            cols[c] = pc.cast(pa.array(df[c].to_numpy().astype(np.float32).round(2)), DEC)
+        if c in DECIMAL_COLS:
+            cols[c] = pc.cast(pa.array(df[c].to_numpy().astype(np.float32).round(2)), DECIMAL_COLS[c])
             enc[c] = "BYTE_STREAM_SPLIT"
         else:
             cols[c] = pa.array(df[c].to_numpy())
@@ -1412,83 +1330,35 @@ def save_library(df: pd.DataFrame, path: str):
     pq.write_table(pa.table(cols), path, use_dictionary=["FSP"],
                    column_encoding=enc, store_decimal_as_integer=True, compression="brotli")
 
-def make_dtf_map(filled_dem_file: str, fldpln_library_file: str, output_file: str):
-    filled_dem_array: np.ndarray = gdal.Open(filled_dem_file).ReadAsArray()
-    nrows, ncols = filled_dem_array.shape
-
-    if Path(fldpln_library_file).suffix in {'.parquet', '.pq'}:
-        df = pd.read_parquet(fldpln_library_file)
-    else:
-        df = pd.read_csv(fldpln_library_file)
-
-    df = df.groupby('FPP', as_index=False).agg({'DTF': 'min'})
-    df['Row'] = (df['FPP'] // ncols).astype(int)
-    df['Col'] = (df['FPP'] % ncols).astype(int)
-    df['DTF'] = df['DTF'].clip(lower=0)
-
-    dtf_array = np.full_like(filled_dem_array, np.nan, dtype=np.float32)
-    dtf_array[df['Row'], df['Col']] = df['DTF']
-
-    out_ds: gdal.Dataset = gdal.GetDriverByName('GTiff').Create(
-        output_file,
-        ncols,
-        nrows,
-        1,
-        gdal.GDT_Float32,
-        options=['COMPRESS=DEFLATE']
-    )
-    out_ds.SetGeoTransform(gdal.Open(filled_dem_file).GetGeoTransform())
-    out_ds.SetProjection(gdal.Open(filled_dem_file).GetProjection())
-    out_ds.WriteArray(dtf_array)
-    out_ds.GetRasterBand(1).SetNoDataValue(np.nan)
-    out_ds.FlushCache()
-    out_ds = None
-
 def limit_rise(arr, max_rise=0.5):
-    """
-    Limit upward rises in a 1D array.
+    """Cap how fast a profile may rise: ``out[i] = min(arr[i], out[i-1] + max_rise)``.
 
-    ``out[i] = min(arr[i], out[i-1] + max_rise)``, which is the same as
-    ``min_j<=i (arr[j] + max_rise * (i - j))``; subtracting the ramp turns that
-    into a running minimum, so the whole thing vectorises.
-
-    Parameters
-    ----------
-    arr : array-like
-        Elevation values, evenly spaced and free of NaN.
-    max_rise : float
-        Maximum allowed rise per step.
-
-    Returns
-    -------
-    np.ndarray
+    ``arr`` must be free of NaN.  On a water-surface profile ordered from
+    upstream to downstream, the water may then rise at most ``max_rise`` per
+    pixel going downstream.
     """
     out = np.asarray(arr, dtype=float)
     if out.size == 0:
         return out.copy()
+    # Subtracting a ramp turns the recursion into a running minimum
     ramp = max_rise * np.arange(out.size, dtype=float)
     return np.minimum.accumulate(out - ramp) + ramp
 
 def _fill_missing_profile(valid: np.ndarray, values: np.ndarray) -> np.ndarray:
-    """Carry a conditioned profile into the stream pixels the VDT does not cover.
+    """Spread a profile known at the ``valid`` pixels to the whole stream path.
 
-    ``valid`` marks the pixels that carried a VDT stage; ``values`` is the
-    conditioned profile over just those pixels.  Which rule is used barely
-    matters -- linear and nearest score within 0.0005 MCC of this one over 51
-    sites -- but filling the gaps at all does: leaving them empty costs 0.007.
+    ``values`` holds the profile at the valid pixels only.  A gap between two
+    valid pixels is interpolated linearly, pixel by pixel; before the first and
+    after the last valid pixel the profile holds its end value.
     """
-    out = np.full(len(valid), np.nan, dtype=float)
-    out[valid] = values
-    return pd.Series(out).ffill().bfill().to_numpy(dtype=float)
+    pixel = np.arange(len(valid))
+    return np.interp(pixel, pixel[valid], np.asarray(values, dtype=float))
 
 def longest_path_decomposition(G: nx.DiGraph, stream_wse_dict: dict[int, list[tuple[int, float]]]) -> list[list[int]]:
-    """
-    Decompose a DAG into disjoint longest headwater->outlet paths.
+    """Split a stream network into chains: the longest headwater-to-outlet path, then the longest of what is left, and so on.
 
-    Returns
-    -------
-    list[list]
-        Each element is a list of stream IDs ordered upstream->downstream.
+    Path length counts the stream pixels in ``stream_wse_dict``.  Returns lists
+    of stream ids ordered upstream to downstream.  Empties ``G``.
     """
     paths = []
     length = {sid: len(stream_wse_dict[sid]) for sid in G}
@@ -1525,7 +1395,6 @@ def longest_path_decomposition(G: nx.DiGraph, stream_wse_dict: dict[int, list[tu
     return paths
 
 def _make_fldpln_flood_map(
-        dem: np.ndarray,
         filled_dem: np.ndarray,
         vdt_df: pl.DataFrame,
         fdr: np.ndarray,
@@ -1535,38 +1404,34 @@ def _make_fldpln_flood_map(
         reach_id_field: str,
         downstream_reach_id_field: str,
         max_wse_rise: float = 0.5,
-        median_filter_size: int = 53,
-        max_drop_below_source: float = 2.0):
-    """Turn a VDT water surface into a flood map using a floodplain library.
+        median_filter_size: int = 53) -> np.ndarray:
+    """Flood depth raster for one event, from VDT stages and a floodplain library.
 
-    Each stream pixel's stage is conditioned along its longest-path chain, then
-    ``wse(p) = filled_dem[p] + DoF(s) - DTF(s, p)`` maximised over the stream
-    pixels ``s`` that reach ``p``.  That is the same as ``WSE(s) - L(s, p)``
-    where ``L = DTF - (fil[p] - fil[s])`` is the minimum total descent from
-    ``s`` to ``p``, so the stream pixel's own filled elevation cancels: the
-    water lies flat across a floodplain, loses exactly the lip height crossing
-    a levee, and fills a depression to the level of its rim.
+    1. Stream pixels are chained along the network's longest paths.  Along
+       each chain, the stage ``DoF(s)`` of stream pixel ``s`` (its water depth
+       over the filled DEM) is the smaller of two cleaned VDT profiles: the
+       water surface, smoothed by a running median of ``median_filter_size``
+       VDT cells and allowed to rise at most ``max_wse_rise`` from one VDT
+       cell to the next going downstream, minus the filled DEM; and the depth
+       itself, smoothed the same way.  Pixels without a VDT value are interpolated linearly
+       between the VDT cells on either side.
+    2. Each library row ``(s, p, DTF, fill)`` whose water reaches ``p``'s
+       filled surface (``DoF(s) - DTF(s, p) > 0``) gives ``p`` the depth
+       ``DoF(s) - DTF(s, p) + fill(p)``: the water above the filled DEM, plus
+       how far the filled DEM sits above the DEM there.  Water that doesn't
+       reach a filled pit's rim never spills into it, however deep the pit.
+       ``p`` keeps the deepest.  Cells far below their stream pixel are left out
+       when the library is built (``build_fldpln_library``'s
+       ``max_drop_below_source``), not here.
 
-    That cancellation is only meaningful while ``p`` lies near the level of
-    ``s``.  ``_solve_exact`` charges nothing for a downhill step, so the library
-    pairs every stream pixel with the whole slope beneath it, and the formula
-    then stands the source's own stage on top of whatever ground it finds there.
-    ``max_drop_below_source`` is how far below the source's filled elevation a
-    floodplain pixel may still lie once its stage is spent: a pixel is kept only
-    while ``fil[s] - fil[p] <= DoF(s) + max_drop_below_source``.  Without it a
-    steep reach paints its entire hillside wet -- on a 140 m/4 km reach, 58% of
-    the wet pixels sat more than 20 m below the stream pixel that wetted them
-    and 44% more than 100 m below, some of them 15 km away.
-
-    ``median_filter_size`` is the only conditioning knob left.  Measured over
-    51 benchmark sites and 809 flow events (MCC inside each site's boundary
-    raster), dropping the filter costs 0.017 while every window from 11 to 101
-    lands within 0.003 of the default 53.  The rise cap, the gap-filling rule
-    and the choice of DoF signal each moved the mean by less than 0.008 and won
-    on roughly half the sites, so they are fixed constants here; the remaining
-    error is a per-site stage bias of about +-1.5 m that none of them can
-    reach.
+    Returns the depth where it is above 0, NaN elsewhere.  Only the stream
+    pixels of ``filled_dem`` are used, and no DEM is needed.  ``vdt_df`` needs
+    ``COMID``, ``Row``, ``Col`` and ``WSE``; ``stream_gdf`` needs the two id
+    columns and ``topological_order``.
     """
+    if 'fill' not in fldpln_library.collect_schema().names():
+        raise ValueError("The FLDPLN library has no fill column. Rebuild it with build_fldpln_library, "
+                         "which now takes the DEM the floods are mapped on.")
     nrows, ncols = filled_dem.shape
     median_filter_size = int(median_filter_size)
     if median_filter_size < 1:
@@ -1592,10 +1457,8 @@ def _make_fldpln_flood_map(
     stream_rows: dict[list[tuple]] = defaultdict(list)
     stream_info_dict = stream_info_df.set_index('stream_id').to_dict(orient='index')
 
-    # We need to traverse each stream segment, and add missing FSPs to the vdt_df with interpolated DoF values.
+    # Walk each segment's stream pixels, with the VDT's WSE where it has one
     for stream_id in stream_ids:
-        # if stream_id not in  {770294095, 770275374}:
-        #     continue
         if stream_id not in stream_info_dict:
             raise ValueError(f"Stream ID {stream_id} not found in stream_info_df.")
 
@@ -1613,12 +1476,12 @@ def _make_fldpln_flood_map(
             if fsp == -1:
                 break
 
-    # C order whatever ``dem``'s layout: the library's flat pixel ids index it
-    wse_array = np.full(dem.shape, np.nan, dtype=np.float32)
+    # C order: the library's flat pixel ids index it
+    depth_array = np.full((nrows, ncols), np.nan, dtype=np.float32)
     if not stream_rows:
-        return wse_array
-    
-    # Let us combine stream ids that follow the main stems in the Graph
+        return depth_array
+
+    # Chain the segments along the main stems
     paths = longest_path_decomposition(G, stream_rows)
 
     row_chunks = []
@@ -1637,11 +1500,9 @@ def _make_fldpln_flood_map(
         filled_dem_profile = np.array([filled_dem[_pixel_to_rc(pixel, ncols)]
                                        for pixel, _ in path_rows])
 
-        # Two conditioned profiles, differing only in the space they are
-        # smoothed and gap-filled in: ``wse_dof`` works on the water surface and
-        # ``depths_interped`` on the stage above the filled DEM.  The rise cap
-        # only ever lowers, so ``wse_dof <= depths_interped`` at about two
-        # thirds of stream pixels, and the minimum is the conservative branch.
+        # Two cleaned profiles, smoothed as a water surface and as a depth over
+        # the filled DEM.  The rise cap only ever lowers, so the minimum is the
+        # conservative one.
         wse_smoothed = median_filter(Y[mask], size=median_filter_size)
         wse_interped = _fill_missing_profile(
             mask, limit_rise(wse_smoothed, max_rise=max_wse_rise))
@@ -1654,55 +1515,34 @@ def _make_fldpln_flood_map(
         dof_profile = np.minimum(wse_dof, depths_interped)
 
         row_chunks.extend([
-            (fsp, dof, src_fil)
-            for (fsp, _), dof, src_fil in zip(path_rows, dof_profile, filled_dem_profile)
+            (fsp, dof)
+            for (fsp, _), dof in zip(path_rows, dof_profile)
             if np.isfinite(dof)
         ])
 
     if not row_chunks:
-        return wse_array
+        return depth_array
 
-    df = pl.LazyFrame(
-        row_chunks,
-        schema={'FSP': pl.Int32, 'DoF': pl.Float32, 'SrcFil': pl.Float32},
-        orient='row',
-    )
+    df = pl.LazyFrame(row_chunks, schema={'FSP': pl.Int32, 'DoF': pl.Float32}, orient='row')
 
-    # Join the library a slice at a time and keep only each pixel's highest water
-    # surface so far, in ``wse_array`` itself: joined whole, the library and its
-    # join were several times the size of every raster in the run.
-    fil_flat = filled_dem.ravel()
-    best = wse_array.ravel()
+    # Join the library a slice at a time and keep only each pixel's deepest water
+    # so far, in ``depth_array`` itself: joined whole, the library and its join
+    # were several times the size of every raster in the run.
+    best = depth_array.ravel()
     best[:] = -np.inf
-    max_drop = np.float32(max_drop_below_source)
     n_library = fldpln_library.select(pl.len()).collect().item()
     for offset in range(0, n_library, _LIBRARY_SLICE_ROWS):
         part = (fldpln_library.slice(offset, _LIBRARY_SLICE_ROWS)
                 .join(df, on='FSP', how='inner')
-                .select('FPP', 'DTF', 'DoF', 'SrcFil')
+                .select('FPP', 'DTF', 'fill', 'DoF')
                 .collect())
-        fpp = part['FPP'].to_numpy()
-        dof = part['DoF'].to_numpy()
-        fpp_fil = fil_flat[fpp]
-        # Keep only the pairs whose source can still stand over the pixel once its
-        # stage is spent.  The library's downhill edges are free, so without this a
-        # stream pixel reaches every cell that drains past it, however far below.
-        # The drop is measured in float64 and the allowance summed in float32.
-        keep = part['SrcFil'].to_numpy().astype(np.float64) - fpp_fil <= dof + max_drop
-        # ``DoF - DTF`` is the head left over at the floodplain pixel, measured from
-        # the filled DEM, so it is allowed to be negative there -- the pixel is still
-        # wet whenever the filled surface sits above the mapping DEM by more.  Take
-        # the deepest of the sources that reach the pixel.
-        head = dof[keep] - part['DTF'].to_numpy()[keep]
-        # The water surface needs no DEM: a library built with a ``fill depth``
-        # column added ``dem + (DoF - DTF) + (filled_dem - dem)``, and ``dem``
-        # cancels.  Libraries that still carry that column simply go unused, so the
-        # two forms give identical maps.  Adding the filled elevation, in float64,
-        # before the maximum instead of after changes nothing: rounding to float32
-        # never reorders two values.
-        np.maximum.at(best, fpp[keep], (head + fpp_fil[keep]).astype(np.float32))
-    best[best == -np.inf] = np.nan
-    mask = (dem > -9998) & (wse_array > dem)
-    wse_array[~mask] = np.nan
+        # ``DoF - DTF`` is the water above the filled DEM.  Only where it is
+        # positive does the water reach the cell, and then the fill adds the
+        # depth below the filled surface, as in a filled pit or a burned channel.
+        head = part['DoF'].to_numpy() - part['DTF'].to_numpy()
+        reaches = head > 0
+        depth = head[reaches] + part['fill'].to_numpy()[reaches]
+        np.maximum.at(best, part['FPP'].to_numpy()[reaches], depth.astype(np.float32, copy=False))
+    depth_array[~(depth_array > 0)] = np.nan
 
-    return wse_array
+    return depth_array

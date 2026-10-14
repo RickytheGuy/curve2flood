@@ -1,0 +1,72 @@
+site_name: Curve2Flood
+site_description: Documentation for Curve2Flood, which turns ARC's rating curves into flood maps.
+repo_url: https://github.com/MikeFHS/curve2flood
+repo_name: MikeFHS/curve2flood
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - content.tabs.link
+    - navigation.sections
+    - navigation.footer
+
+docs_dir: docs
+site_dir: site
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.superfences
+  - pymdownx.details
+  - pymdownx.snippets:
+      base_path: .
+  - pymdownx.arithmatex:
+      generic: true
+
+extra_javascript:
+  - javascripts/katex.js
+  - https://unpkg.com/katex@0/dist/katex.min.js
+  - https://unpkg.com/katex@0/dist/contrib/auto-render.min.js
+
+extra_css:
+  - https://unpkg.com/katex@0/dist/katex.min.css
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Overview:
+    - Getting Started: getting_started.md
+    - Input File: input_file.md
+    - Outputs: outputs.md
+    - API: api.md
+  - Technical Details:
+    - Key Concepts: key_concepts.md
+    - Kernel-Weighted Mapper: kernel_weighted.md
+    - Multi-Point Interpolation Mapper: multi_point.md
+    - FLDPLN Mapper: fldpln.md
+    - Bathymetry: bathymetry.md
+    - Development: development.md
+  - License: license.md
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [.]
+          options:
+            filters:
+              - "!^_[^_]"
+            show_signature: true
+            show_signature_annotations: true
+            docstring_style: numpy
+            docstring_section_style: table
+            show_source: false
+            show_root_heading: true
+            show_root_full_path: false
+            merge_init_into_class: true
+            annotations_path: brief
+            show_if_no_docstring: true

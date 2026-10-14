@@ -1,7 +1,7 @@
 numba
 numpy
 pandas
-pyarrow
+pyarrow>=18
 gdal
 geopandas
 pyyaml
@@ -10,3 +10,4 @@ scipy
 tqdm
 polars
 pyproj
+networkx
