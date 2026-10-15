@@ -47,7 +47,6 @@ import pyarrow.parquet as pq
 import pyarrow.compute as pc
 from numba import njit
 from osgeo import gdal
-from scipy.ndimage import median_filter
 from numba.extending import register_jitable
 
 from curve2flood import LOG
@@ -848,8 +847,8 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
     solver : {"exact", "iterative"}, optional
         See the module docstring.
     max_drop_below_source : float, optional
-        Leave out cells more than ``fldmx`` plus this many metres below the
-        stream pixel that floods them.  Going downhill costs no depth, so on
+        Leave out cells more than this many metres below the stream pixel that
+        floods them, on the filled DEM.  Going downhill costs no depth, so on
         slopes these are most of the table.  None keeps every cell.
     max_cells : int, optional
         Most rows the segment may have (0 for no limit).  A segment that would
@@ -880,7 +879,7 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
     # The 0.99999 is carried over from the MATLAB reference
     global_max_wse = np.finfo(np.float32).max if not global_max_wse else 0.99999 * global_max_wse
 
-    max_below = np.inf if max_drop_below_source is None else fldmx + max_drop_below_source
+    max_below = np.inf if max_drop_below_source is None else float(max_drop_below_source)
 
     flat_fdr = flow_direction.ravel()
     stream_pixels = np.asarray(
@@ -1094,15 +1093,18 @@ def build_fldpln_library(
     processes: int | None
         Number of processes when ``parallel``; defaults to the CPU count.
     spill_decay: float
-        DTF added per pixel along a spillover path, to shorten spills.
+        DTF added per pixel along a spillover path, to shorten spills: only on
+        each pixel's D8 successor, so other downhill steps stay free and it
+        trims little (see the FLDPLN docs).  0 (default) for none.
     solver: str
         ``"exact"`` (default) or ``"iterative"``; see the module docstring.
     max_drop_below_source: float | None
-        Leave out cells more than a segment's maximum depth plus this many
-        metres below the stream pixel that floods them.  Going downhill costs
-        no depth, so without this a stream pixel on a slope floods the whole
-        hillside below it; the mapper has no limit of its own.  On slopes such
-        cells are most of the library.  None (default) keeps every cell.
+        Leave out cells more than this many metres below the stream pixel that
+        floods them, on the filled DEM, whatever the depth.  Going downhill
+        costs no depth, so without this a stream pixel on a slope floods the
+        whole hillside below it, as deep as the water at the stream; the mapper
+        has no limit of its own.  On slopes such cells are most of the library.
+        None (default) keeps every cell.
     max_cells_per_segment: int | None
         Most rows one segment may contribute.  A segment that would flood more
         stops at the depth where it fills up, so deeper floods there are mapped
@@ -1330,20 +1332,6 @@ def save_library(df: pd.DataFrame, path: str):
     pq.write_table(pa.table(cols), path, use_dictionary=["FSP"],
                    column_encoding=enc, store_decimal_as_integer=True, compression="brotli")
 
-def limit_rise(arr, max_rise=0.5):
-    """Cap how fast a profile may rise: ``out[i] = min(arr[i], out[i-1] + max_rise)``.
-
-    ``arr`` must be free of NaN.  On a water-surface profile ordered from
-    upstream to downstream, the water may then rise at most ``max_rise`` per
-    pixel going downstream.
-    """
-    out = np.asarray(arr, dtype=float)
-    if out.size == 0:
-        return out.copy()
-    # Subtracting a ramp turns the recursion into a running minimum
-    ramp = max_rise * np.arange(out.size, dtype=float)
-    return np.minimum.accumulate(out - ramp) + ramp
-
 def _fill_missing_profile(valid: np.ndarray, values: np.ndarray) -> np.ndarray:
     """Spread a profile known at the ``valid`` pixels to the whole stream path.
 
@@ -1402,27 +1390,20 @@ def _make_fldpln_flood_map(
         stream_info_df: pd.DataFrame,
         stream_gdf: gpd.GeoDataFrame,
         reach_id_field: str,
-        downstream_reach_id_field: str,
-        max_wse_rise: float = 0.5,
-        median_filter_size: int = 53) -> np.ndarray:
+        downstream_reach_id_field: str) -> np.ndarray:
     """Flood depth raster for one event, from VDT stages and a floodplain library.
 
     1. Stream pixels are chained along the network's longest paths.  Along
        each chain, the stage ``DoF(s)`` of stream pixel ``s`` (its water depth
-       over the filled DEM) is the smaller of two cleaned VDT profiles: the
-       water surface, smoothed by a running median of ``median_filter_size``
-       VDT cells and allowed to rise at most ``max_wse_rise`` from one VDT
-       cell to the next going downstream, minus the filled DEM; and the depth
-       itself, smoothed the same way.  Pixels without a VDT value are interpolated linearly
+       over the filled DEM) is the VDT's water surface minus the filled DEM.
+       Pixels without a VDT value take the water surface interpolated linearly
        between the VDT cells on either side.
     2. Each library row ``(s, p, DTF, fill)`` whose water reaches ``p``'s
        filled surface (``DoF(s) - DTF(s, p) > 0``) gives ``p`` the depth
        ``DoF(s) - DTF(s, p) + fill(p)``: the water above the filled DEM, plus
        how far the filled DEM sits above the DEM there.  Water that doesn't
        reach a filled pit's rim never spills into it, however deep the pit.
-       ``p`` keeps the deepest.  Cells far below their stream pixel are left out
-       when the library is built (``build_fldpln_library``'s
-       ``max_drop_below_source``), not here.
+       ``p`` keeps the deepest.
 
     Returns the depth where it is above 0, NaN elsewhere.  Only the stream
     pixels of ``filled_dem`` are used, and no DEM is needed.  ``vdt_df`` needs
@@ -1433,11 +1414,6 @@ def _make_fldpln_flood_map(
         raise ValueError("The FLDPLN library has no fill column. Rebuild it with build_fldpln_library, "
                          "which now takes the DEM the floods are mapped on.")
     nrows, ncols = filled_dem.shape
-    median_filter_size = int(median_filter_size)
-    if median_filter_size < 1:
-        median_filter_size = 1
-    if median_filter_size % 2 == 0:
-        median_filter_size += 1
 
     vdt_df = vdt_df.with_columns(FSP=(pl.col('Row') * ncols + pl.col('Col')).cast(pl.Int32))
     fsp_wse_dict = dict(zip(vdt_df['FSP'], vdt_df['WSE']))
@@ -1500,19 +1476,9 @@ def _make_fldpln_flood_map(
         filled_dem_profile = np.array([filled_dem[_pixel_to_rc(pixel, ncols)]
                                        for pixel, _ in path_rows])
 
-        # Two cleaned profiles, smoothed as a water surface and as a depth over
-        # the filled DEM.  The rise cap only ever lowers, so the minimum is the
-        # conservative one.
-        wse_smoothed = median_filter(Y[mask], size=median_filter_size)
-        wse_interped = _fill_missing_profile(
-            mask, limit_rise(wse_smoothed, max_rise=max_wse_rise))
-        wse_dof = wse_interped - filled_dem_profile
-
-        depths_smoothed = median_filter((Y - filled_dem_profile)[mask],
-                                        size=median_filter_size)
-        depths_interped = _fill_missing_profile(mask, depths_smoothed)
-
-        dof_profile = np.minimum(wse_dof, depths_interped)
+        # The water surface, interpolated across the pixels without a VDT
+        # value, over the filled DEM
+        dof_profile = _fill_missing_profile(mask, Y[mask]) - filled_dem_profile
 
         row_chunks.extend([
             (fsp, dof)

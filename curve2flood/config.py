@@ -1,0 +1,334 @@
+"""Curve2Flood's inputs: the input file, as YAML, as text, or as a dictionary."""
+import os
+import math
+import difflib
+from pathlib import Path
+from types import UnionType
+from typing import Literal, Union, get_args, get_origin, get_type_hints
+from dataclasses import dataclass, fields
+
+import yaml
+
+from curve2flood._log import LOG
+
+Mapper = Literal["Curve2Flood-Kernel Weighted", "Curve2Flood-Multi-Point Interpolation", "Curve2Flood-FLDPLNpy"]
+MAPPERS = get_args(Mapper)
+KERNEL_WEIGHTED, MULTI_POINT, FLDPLN = MAPPERS
+
+# Other names for some keys, from FloodSpreader and ARC (see Config._normalize_keys)
+_ALIASES = {'floodspreader_specifydepth', 'floodlocalonly', 'aroutbathy'}
+# ARC's keys (arc.config.Configs): one input file often drives both models, so they are allowed and ignored
+_ARC_KEYS = {'dem_file', 'stream_file', 'strmshp_file', 'flow_file', 'lu_raster_sameres', 'lu_manning_n',
+             'manual_cross_sections_file', 'bathywatermask', 'reach_id', 'downstream_reach_id', 'flow_file_id',
+             'flow_file_bf', 'flow_file_qmax', 'lc_water_value', 'drainage_area_field', 'coefficient_depth',
+             'exponent_depth', 'coefficient_width', 'exponent_width', 'x_section_dist', 'degree_manip',
+             'degree_interval', 'low_spot_range', 'gen_dir_dist', 'gen_slope_dist', 'stream_slope_method',
+             'slope_low_percentile', 'slope_high_percentile', 'slope_adjustment_factor', 'depth_varying_n', 'k_decay',
+             'shallow_factor', 'deep_factor', 'bathy_trap_h', 'bathy_use_banks', 'bathy_bed_cap', 'bathy_smooth_banks',
+             'bathy_smooth_bed', 'findbanksbasedonlandcover', 'vdt_database_numiterations', 'standard_step',
+             'print_vdt_database', 'print_ap_database', 'print_curve_file', 'xs_out_file', 'reach_average_curve_file',
+             'build_representative_cross_section', 'representative_cross_section_file', 'bathy_out_file', 'aroutflood',
+             'compression'}
+# Keys that input files often carry (nencarta writes OutSHP and FS_ADJUST_FLOW_BY_FRACTION) but neither model uses
+_IGNORED_KEYS = {'spatial_units', 'str_limit_val', 'print_vdt', 'outshp', 'fs_adjust_flow_by_fraction'}
+# Curve2Flood's retired keys, with why: ignored with a warning, so that older input files still run
+_REMOVED_KEYS = {
+    'max_wse_rise': "the FLDPLN mapper no longer caps how fast the water surface rises",
+    'fldpln_max_wse_rise': "the FLDPLN mapper no longer caps how fast the water surface rises",
+    'median_filter_size': "the FLDPLN mapper no longer smooths the stages with a running median",
+    'fldpln_median_filter_size': "the FLDPLN mapper no longer smooths the stages with a running median",
+    'max_drop_below_source': "it is set when the library is built, by build_fldpln_library's max_drop_below_source",
+    'fldpln_max_drop_below_source': "it is set when the library is built, by build_fldpln_library's "
+                                    "max_drop_below_source",
+}
+
+_TRUE = {'true', 'yes', 'y', 'on', '1'}
+_FALSE = {'false', 'no', 'n', 'off', '0'}
+
+
+def path_exists(path: str | os.PathLike | None) -> bool:
+    """Whether a path is given and exists."""
+    return bool(path) and Path(path).exists()
+
+
+@dataclass(kw_only=True, frozen=True)
+class Config:
+    """Curve2Flood's inputs, checked and typed.
+
+    Make one with from_file (YAML, or text with a key and its value on each line) or from_mapping (a dictionary).
+    Each field is its input-file key in lower case, and keys are case-insensitive, so DEM_File and dem_file are the
+    same. A key set to nothing (an empty value, or null in YAML) takes its default. ARC's keys are allowed and
+    ignored, so that one file can drive both models; any other unknown key raises ValueError, naming the closest
+    known key. See the Input File page of the documentation for what each key does.
+    """
+    # Input files
+    dem_file: str | None = None
+    print_vdt_database: str | None = None
+    print_curve_file: str | None = None
+    comid_flow_file: str | None = None
+    # Read only with set_depth; otherwise the stream cells are the VDT's or the curve file's
+    stream_file: str | None = None
+    lu_raster_sameres: str | None = None
+    lu_manning_n: str | None = None
+    strmshp_file: str | None = None
+    reach_id: str = "LINKNO"
+    downstream_reach_id: str = "DSLINKNO"
+
+    # Outputs
+    outfld: str | None = None
+    outdep: str | None = None
+    outwse: str | None = None
+    outvel: str | None = None
+    make_output_gpkg: bool = True
+    compression: str = "LZW"
+
+    # Mapping
+    mapper: Mapper = KERNEL_WEIGHTED
+    tw_multfact: float = 3.0
+    topwidthplausiblelimit: float = 1000.0
+    localfloodoption: bool = False
+    flood_waterlc_and_strm_cells: bool = False
+    flood_bathy_mask: bool = False
+    land_watervalue: int = 80
+    # Flood every stream cell of stream_file this deep instead of mapping the flows; off at 0 or less
+    set_depth: float = -1.1
+
+    # FLDPLN mapper
+    flow_direction_file: str | None = None
+    filled_dem_file: str | None = None
+    stream_info_file: str | None = None
+    fldpln_library: str | None = None
+
+    # Multi-point interpolation mapper (see multi_point_options)
+    mpi_topwidth_threshold_m: float = 200.0
+    mpi_xs_point_spacing_m: float = 100.0
+    mpi_remove_hwm_outliers: bool = True
+    mpi_hwm_outlier_method: Literal["mad", "iqr"] = "mad"
+    mpi_hwm_outlier_threshold: float = 3.5
+    mpi_hwm_outlier_group_by: Literal["comid", "global"] = "comid"
+    mpi_hwm_outlier_min_samples: int = 5
+    mpi_corridor_buffer_m: float = 500.0
+    mpi_anchor_buffer_m: float = 5.0
+    mpi_use_topwidth_buffers: bool = True
+    mpi_corridor_topwidth_factor: float = 1.0
+    mpi_anchor_topwidth_factor: float = 0.1
+    mpi_connectivity: Literal[4, 8] = 4
+    mpi_k: int = 12
+    mpi_power: float = 2.0
+    mpi_max_distance_m: float = 1000.0
+    mpi_use_topwidth_max_distance: bool = True
+    mpi_maxdist_topwidth_factor: float = 1.0
+    mpi_min_topwidth_m: float = 5.0
+    mpi_max_topwidth_m: float = 500.0
+    mpi_fallback_topwidth_m: float = 20.0
+    mpi_smooth_sigma_pixels: float = 0.25
+    mpi_apply_wse_sanity_filter: bool = True
+    mpi_wse_sanity_tolerance_m: float = 0.0
+    mpi_fast_mode: bool = False
+    mpi_one_based_vdt_rc: bool = False
+
+    # Bathymetry, written only when both bathy_out_file (ARC's) and fsoutbathy are given
+    bathy_out_file: str | None = None
+    fsoutbathy: str | None = None
+    # Where the water is (its cells above 0), on the DEM's grid. ARC reads it too.
+    bathywatermask: str | None = None
+    bathy_use_banks: bool = False
+
+    def __post_init__(self) -> None:
+        self._coerce_types()
+        self.validate_options()
+
+
+    @classmethod
+    def from_mapping(cls, params: dict):
+        """The inputs from a dictionary of the input file's keys and values. Paths may be strings or Path objects."""
+        return cls(**cls._normalize_keys(params))
+
+    @classmethod
+    def from_file(cls, file_path: str | os.PathLike):
+        """The inputs from an input file: YAML for a .yaml or .yml file, and otherwise text."""
+        if Path(file_path).suffix.lower() in ('.yaml', '.yml'):
+            return cls.from_yaml(file_path)
+        else:
+            return cls.from_text_file(file_path)
+
+    @classmethod
+    def from_yaml(cls, yaml_name: str | os.PathLike):
+        with open(yaml_name, 'r') as o_input_file:
+            params = yaml.load(o_input_file, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader))
+        return cls.from_mapping(params or {})
+
+    @classmethod
+    def from_text_file(cls, file_name: str | os.PathLike):
+        """The inputs from a text file with a key, spaces or a tab, and its value on each line. A value may contain
+        spaces. Blank lines and lines starting with # are skipped, and a key on its own takes its default."""
+        params = {}
+        with open(file_name, 'r') as o_input_file:
+            for line in o_input_file:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue  # Skip empty lines and comments
+                parts = line.split(maxsplit=1)
+                params[parts[0]] = parts[1] if len(parts) == 2 else ''
+
+        return cls.from_mapping(params)
+
+    @classmethod
+    def _normalize_keys(cls, params: dict) -> dict:
+        # Keys are case-insensitive, so DEM_File is dem_file
+        params = {str(k).lower(): v for k, v in params.items()}
+
+        own = {f.name for f in fields(cls) if f.init} | _ALIASES
+        unknown = sorted(set(params) - own - _ARC_KEYS - _IGNORED_KEYS - set(_REMOVED_KEYS))
+        if unknown:
+            described = []
+            for key in unknown:
+                close = difflib.get_close_matches(key, sorted(own), n=1)
+                described.append(f'{key!r}' + (f' (did you mean {close[0]!r}?)' if close else ''))
+            raise ValueError(f'Unrecognized config key(s): {", ".join(described)}')
+        for key in sorted(set(params) & set(_REMOVED_KEYS)):
+            LOG.warning(f'{key} is no longer used ({_REMOVED_KEYS[key]}); ignoring it.')
+
+        # A key set to nothing takes its default
+        params = {key: value for key, value in params.items() if value is not None and value != ''}
+
+        # FloodSpreader_SpecifyDepth is FloodSpreader's name for Set_Depth, which wins when both are given
+        specify_depth = params.pop('floodspreader_specifydepth', None)
+        if specify_depth is not None:
+            params.setdefault('set_depth', specify_depth)
+        # FloodLocalOnly is FloodSpreader's name for LocalFloodOption: either one turns it on
+        local_only = params.pop('floodlocalonly', None)
+        if local_only is not None:
+            params['localfloodoption'] = (_to_bool('floodlocalonly', local_only)
+                                          or _to_bool('localfloodoption', params.get('localfloodoption', False)))
+        # AROutBATHY is another name for BATHY_Out_File, and wins when both are given, as it does in ARC
+        aroutbathy = params.pop('aroutbathy', None)
+        if aroutbathy is not None:
+            params['bathy_out_file'] = aroutbathy
+
+        # ARC's keys and the ignored ones are allowed in the inputs, but aren't fields
+        known = {f.name for f in fields(cls) if f.init}
+        return {key: value for key, value in params.items() if key in known}
+
+    def _coerce_types(self) -> None:
+        # Text input files give every value as a string, so convert each one to its field's type
+        hints = get_type_hints(type(self))
+        for f in fields(self):
+            if f.init:
+                object.__setattr__(self, f.name, _coerce(f.name, getattr(self, f.name), hints[f.name]))
+
+    def validate_options(self) -> None:
+        """Check the run has every input it needs and that no two settings conflict. The messages name the
+        input-file keys."""
+        if not self.dem_file:
+            raise ValueError("Missing required parameters: DEM_File")
+        for key, value in (('TW_MultFact', self.tw_multfact), ('TopWidthPlausibleLimit', self.topwidthplausiblelimit)):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f'{key} must be finite and positive, not {value!r}.')
+        if not self.needs_flood_map:
+            return
+
+        fldpln = self.mapper == FLDPLN
+        if self.uses_set_depth and fldpln:
+            raise ValueError("Set_Depth (FloodSpreader_SpecifyDepth) is not supported by the FLDPLN mapper.")
+        if self.uses_set_depth and self.outvel:
+            raise ValueError("OutVEL needs the slopes in Print_VDT_Database or Print_Curve_File, "
+                             "so it cannot be used with Set_Depth (FloodSpreader_SpecifyDepth).")
+
+        required = {}  # input-file key -> its value
+        if self.uses_set_depth:
+            required['Stream_File'] = self.stream_file
+        else:
+            required['COMID_Flow_File'] = self.comid_flow_file
+            if fldpln:
+                required['Print_VDT_Database'] = self.print_vdt_database
+            else:
+                required['Print_VDT_Database or Print_Curve_File'] = self.print_vdt_database or self.print_curve_file
+        if fldpln:
+            required.update({
+                'Flow_Direction_File': self.flow_direction_file,
+                'Filled_DEM_File': self.filled_dem_file,
+                'Stream_Info_File': self.stream_info_file,
+                'FLDPLN_Library': self.fldpln_library,
+                'StrmShp_File': self.strmshp_file,
+            })
+        if self.outvel:
+            required['LU_Manning_n'] = self.lu_manning_n
+        if self.outvel or self.flood_waterlc_and_strm_cells:
+            required['LU_Raster_SameRes'] = self.lu_raster_sameres
+        if self.flood_bathy_mask:
+            required['BathyWaterMask'] = self.bathywatermask
+
+        missing = [key for key, value in required.items() if not value]
+        if missing:
+            raise ValueError(f"Missing required parameters: {', '.join(missing)}")
+        if self.flood_bathy_mask and not path_exists(self.bathywatermask):
+            raise ValueError(f"Flood_Bathy_Mask floods the cells of BathyWaterMask, and {self.bathywatermask} "
+                             f"doesn't exist.")
+
+    @property
+    def uses_set_depth(self) -> bool:
+        """Whether every stream cell floods to set_depth, instead of the flows being mapped."""
+        return self.set_depth > 0
+
+    @property
+    def makes_bathymetry(self) -> bool:
+        """Whether the run burns ARC's bathymetry (bathy_out_file) into the DEM and writes it to fsoutbathy."""
+        return bool(self.bathy_out_file and self.fsoutbathy)
+
+    @property
+    def needs_flood_map(self) -> bool:
+        """Whether a flood map is needed: for an output raster, or as the bathymetry's water mask when
+        bathywatermask doesn't exist."""
+        return bool(self.outfld or self.outdep or self.outwse or self.outvel
+                    or (self.makes_bathymetry and not path_exists(self.bathywatermask)))
+
+    @property
+    def multi_point_options(self) -> dict:
+        """The multi-point mapper's tuning options (the MPI_ keys), named as multi_point_interpolation names them."""
+        return {f.name.removeprefix('mpi_'): getattr(self, f.name) for f in fields(self) if f.name.startswith('mpi_')}
+
+
+def _to_bool(name: str, value) -> bool:
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE:
+            return True
+        if text in _FALSE:
+            return False
+        raise ValueError(f'{name} must be True or False, not {value!r}.')
+    return bool(value)
+
+
+def _choice(name: str, value, choices: tuple):
+    """The one of ``choices`` that ``value`` is: text matches whatever its case, and a number matches its text."""
+    for choice in choices:
+        if isinstance(choice, str) and str(value).strip().lower() == choice.lower():
+            return choice
+        if isinstance(choice, int) and str(value).strip() == str(choice):
+            return choice
+    close = difflib.get_close_matches(str(value), [str(choice) for choice in choices], n=1)
+    raise ValueError(f"{name} must be one of {', '.join(map(str, choices))}, not {value!r}"
+                     + (f" (did you mean {close[0]!r}?)." if close else "."))
+
+
+def _coerce(name: str, value, annotation):
+    """Convert a raw input value to the type given by its field annotation."""
+    if get_origin(annotation) is Literal:
+        return _choice(name, value, get_args(annotation))
+    members = get_args(annotation) if get_origin(annotation) in (Union, UnionType) else (annotation,)
+    if type(None) in members and (value is None or value == ''):
+        return None
+    if bool in members:
+        return _to_bool(name, value)
+    for kind, description in ((int, 'an integer'), (float, 'a number')):
+        if kind in members:
+            try:
+                if kind is int and isinstance(value, float) and not value.is_integer():
+                    raise ValueError
+                return kind(value)
+            except (TypeError, ValueError):
+                raise ValueError(f'{name} must be {description}, not {value!r}.') from None
+    if str in members and value is not None:
+        return os.fspath(value) if isinstance(value, os.PathLike) else str(value)
+    return value

@@ -10,7 +10,6 @@ import json
 from pathlib import Path
 
 # third-party imports
-import yaml
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -24,17 +23,12 @@ from shapely.geometry import shape
 from scipy.ndimage import label, generate_binary_structure, distance_transform_edt, uniform_filter
 
 from curve2flood import LOG
+from curve2flood.config import Config, FLDPLN, KERNEL_WEIGHTED, MULTI_POINT, MAPPERS, path_exists
 from curve2flood.spreaders import (
     _make_fldpln_flood_map, create_kernel_weighted_spread_map, filter_outliers, compute_tw_multfact_scale, multi_point_interpolation
 )
 
 gdal.UseExceptions()
-
-# Values of the ``mapper`` setting
-KERNEL_WEIGHTED = "Curve2Flood-Kernel Weighted"
-MULTI_POINT = "Curve2Flood-Multi-Point Interpolation"
-FLDPLN = "Curve2Flood-FLDPLNpy"
-MAPPERS = (KERNEL_WEIGHTED, MULTI_POINT, FLDPLN)
 
 def read_manning_table(s_manning_path: str, land_cover: np.ndarray):
     """Convert a land-cover raster to Manning's n.
@@ -51,7 +45,7 @@ def read_manning_table(s_manning_path: str, land_cover: np.ndarray):
     return lookup_array[land_cover.astype(int)]
 
 
-def create_velocity(params, OutVEL, Depth_Array, LC_array, Slope_array_list,
+def create_velocity(config: Config, OutVEL, Depth_Array, LC_array, Slope_array_list,
                            geotransform, projection, ncols, nrows,
                            Flood_Ensemble):
     """Write the velocity raster from Manning's equation, ``V = D^(2/3) S^(1/2) / n``.
@@ -63,7 +57,7 @@ def create_velocity(params, OutVEL, Depth_Array, LC_array, Slope_array_list,
     """
     Slope_Array = create_positive_max_array(Slope_array_list)
 
-    da_input_mannings = read_manning_table(params['LU_Manning_n'], LC_array).astype(np.float32)
+    da_input_mannings = read_manning_table(config.lu_manning_n, LC_array).astype(np.float32)
 
     VEL_Array = (1/(da_input_mannings))*((Depth_Array)**(2/3))*((Slope_Array)**(1/2))
 
@@ -75,7 +69,7 @@ def create_velocity(params, OutVEL, Depth_Array, LC_array, Slope_array_list,
     driver = gdal.GetDriverByName("GTiff")
     ds: gdal.Dataset = driver.Create(
         OutVEL, ncols, nrows, 1, gdal.GDT_Float32,
-        options=[f"COMPRESS={params['compression']}", "PREDICTOR=2", "TILED=YES"]
+        options=[f"COMPRESS={config.compression}", "PREDICTOR=2", "TILED=YES"]
     )
     if ds is None:
         raise RuntimeError(f"Failed to create output raster: {OutVEL}")
@@ -549,7 +543,7 @@ def create_weightbox(tw: int, dx: float, dy: float):
 
     return (WeightBox).astype(np.float32)
 
-def CreateSimpleKernelFloodMap(params: dict, RR, CC, T_Rast, W_Rast, S_Rast, E,
+def CreateSimpleKernelFloodMap(config: Config, RR, CC, T_Rast, W_Rast, S_Rast, E,
                          nrows, ncols, TW_m, dx, dy,
                          WeightBox, TW_for_WeightBox_ElipseMask, flood_vdt_cells,):
     """Kernel-weighted mapper: ``(flood, depth, slope)`` for one flow event.
@@ -571,11 +565,11 @@ def CreateSimpleKernelFloodMap(params: dict, RR, CC, T_Rast, W_Rast, S_Rast, E,
         TW_m,
         dx,
         dy,
-        params['LocalFloodOption'],
+        config.localfloodoption,
         WeightBox,
         TW_for_WeightBox_ElipseMask,
-        params['TopWidthPlausibleLimit'],
-        params['Set_Depth'],
+        config.topwidthplausiblelimit,
+        config.set_depth,
     )
 
     # Do not flood cells where WSE is below E and E/WSE are nan values
@@ -587,7 +581,7 @@ def CreateSimpleKernelFloodMap(params: dict, RR, CC, T_Rast, W_Rast, S_Rast, E,
         Flooded_array[RR, CC] = 1
 
     Depth_array = None
-    if params['OutDEP'] or params['OutWSE'] or S_Rast is not None:
+    if config.outdep or config.outwse or S_Rast is not None:
         Depth_array = np.where(mask, WSE_array - E, np.nan).astype(np.float32)[1:-1, 1:-1]
 
     Slope_array = None
@@ -710,7 +704,7 @@ def Create_Topobathy_Dataset(
     if not Bathy_Use_Banks:
         np.minimum(Bathy, E, out=Bathy)
 
-def Calculate_Depth_TopWidth_TWMax_Velocity(params: dict, COMID_Unique_Flow, COMID_Unique, T_Rast, W_Rast, S_Rast, quiet):
+def Calculate_Depth_TopWidth_TWMax_Velocity(config: Config, COMID_Unique_Flow, COMID_Unique, T_Rast, W_Rast, S_Rast, quiet):
     """Fill the per-cell rasters for one flow event and summarise each reach.
 
     Returns ``(COMID_Unique_TW, COMID_Unique_Depth, TopWidthMax, T_Rast,
@@ -719,20 +713,20 @@ def Calculate_Depth_TopWidth_TWMax_Velocity(params: dict, COMID_Unique_Flow, COM
     ``Set_Depth`` every reach gets that depth and the plausible-limit top
     width instead, and the rasters are left untouched.
     """
-    Set_Depth = params['Set_Depth']
-    TopWidthPlausibleLimit = params['TopWidthPlausibleLimit']
+    Set_Depth = config.set_depth
+    TopWidthPlausibleLimit = config.topwidthplausiblelimit
     if Set_Depth > 0.0:
         top_width = TopWidthPlausibleLimit if TopWidthPlausibleLimit > 0 else -9999.0
         COMID_Unique_TW = {comid: top_width for comid in COMID_Unique}
         COMID_Unique_Depth = {comid: Set_Depth for comid in COMID_Unique}
         TopWidthMax = TopWidthPlausibleLimit
-    elif params['VDTDatabaseFileName']:
+    elif config.print_vdt_database:
         # The VDT database is preferred over the curve file when both are given
         (COMID_Unique_TW, COMID_Unique_Depth, TopWidthMax, T_Rast, W_Rast, S_Rast) = Calculate_TW_D_V_ForEachCOMID_VDTDatabase(
-            params['VDTDatabaseFileName'], COMID_Unique_Flow, COMID_Unique, T_Rast, W_Rast, S_Rast, params['TW_MultFact'])
+            config.print_vdt_database, COMID_Unique_Flow, COMID_Unique, T_Rast, W_Rast, S_Rast, config.tw_multfact)
     else:
         (COMID_Unique_TW, COMID_Unique_Depth, TopWidthMax, T_Rast, W_Rast, S_Rast) = Calculate_TW_D_V_ForEachCOMID_CurveFile(
-            params['CurveParamFileName'], COMID_Unique_Flow, COMID_Unique, T_Rast, W_Rast, S_Rast, params['TW_MultFact'])
+            config.print_curve_file, COMID_Unique_Flow, COMID_Unique, T_Rast, W_Rast, S_Rast, config.tw_multfact)
 
     LOG.info('Maximum Top Width = ' + str(TopWidthMax))
 
@@ -748,7 +742,7 @@ def Calculate_Depth_TopWidth_TWMax_Velocity(params: dict, COMID_Unique_Flow, COM
     return COMID_Unique_TW, COMID_Unique_Depth, TopWidthMax, T_Rast, W_Rast, S_Rast
 
 def make_fldpln_flood_map(
-        params: dict,
+        config: Config,
         COMID_Unique_Flow,
         S_Rast,
         filled_dem,
@@ -766,9 +760,9 @@ def make_fldpln_flood_map(
     into it.
     """
     vdt_df = calculate_interpolated_vdt(
-        params['VDTDatabaseFileName'],
+        config.print_vdt_database,
         COMID_Unique_Flow,
-        params['TW_MultFact']
+        config.tw_multfact
     )
     if S_Rast is not None:
         S_Rast[vdt_df['Row'].to_numpy(), vdt_df['Col'].to_numpy()] = vdt_df['Slope'].to_numpy()
@@ -780,19 +774,17 @@ def make_fldpln_flood_map(
         fldpln_library,
         stream_info,
         streams_gdf,
-        params['reach_id_field'],
-        params['downstream_reach_id_field'],
-        max_wse_rise=params['FLDPLN_Max_WSE_Rise'],
-        median_filter_size=params['FLDPLN_Median_Filter_Size'],
+        config.reach_id,
+        config.downstream_reach_id,
     )
 
     Flood_array = (depth > 0).astype(np.uint8)
     # Depths are only used to write depth, WSE or velocity rasters
-    Depth_array = depth if params['OutDEP'] or params['OutWSE'] or params['OutVEL'] else None
+    Depth_array = depth if config.outdep or config.outwse or config.outvel else None
 
     return Flood_array, Depth_array, None  # Slopes are spread after all events are mapped
 
-def Curve2Flood(params: dict, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
+def Curve2Flood(config: Config, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
                 COMID_Unique_Flow, WeightBox,
                 TW_for_WeightBox_ElipseMask,
                 quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast,
@@ -808,9 +800,9 @@ def Curve2Flood(params: dict, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
     are padded by one cell, and ``RR``/``CC`` index their stream cells.  The
     FLDPLN mapper reads neither.
     """
-    if params['mapper'] == FLDPLN:
+    if config.mapper == FLDPLN:
         return make_fldpln_flood_map(
-            params,
+            config,
             COMID_Unique_Flow,
             S_Rast,
             filled_dem,
@@ -822,13 +814,13 @@ def Curve2Flood(params: dict, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
 
     (COMID_Unique_TW, COMID_Unique_Depth, TopWidthMax,
      T_Rast, W_Rast, S_Rast) = Calculate_Depth_TopWidth_TWMax_Velocity(
-         params, COMID_Unique_Flow, COMID_Unique,
+         config, COMID_Unique_Flow, COMID_Unique,
          T_Rast, W_Rast, S_Rast, quiet)
 
     LOG.info('Creating Rough Flood Map Data...')
 
-    if params['mapper'] == KERNEL_WEIGHTED:
-        return CreateSimpleKernelFloodMap(params, RR, CC, T_Rast, W_Rast, S_Rast,
+    if config.mapper == KERNEL_WEIGHTED:
+        return CreateSimpleKernelFloodMap(config, RR, CC, T_Rast, W_Rast, S_Rast,
                                           E, nrows, ncols,
                                           TopWidthMax, dx, dy,
                                           WeightBox,
@@ -846,15 +838,15 @@ def Curve2Flood(params: dict, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
         COMID_Unique_TW=COMID_Unique_TW,
         COMID_Unique_Depth=COMID_Unique_Depth,
         COMID_Unique_Flow=COMID_Unique_Flow,
-        CurveParamFileName=params['CurveParamFileName'],
-        VDTDatabaseFileName=params['VDTDatabaseFileName'],
-        TW_MultFact=params['TW_MultFact'],
+        CurveParamFileName=config.print_curve_file,
+        VDTDatabaseFileName=config.print_vdt_database,
+        TW_MultFact=config.tw_multfact,
         dx=dx,
         dy=dy,
-        TopWidthPlausibleLimit=params['TopWidthPlausibleLimit'],
-        Set_Depth=params['Set_Depth'],
+        TopWidthPlausibleLimit=config.topwidthplausiblelimit,
+        Set_Depth=config.set_depth,
         flood_vdt_cells=flood_vdt_cells,
-        mapper_options=params,
+        mapper_options=config.multi_point_options,
     )
     LOG.info(stats_message)
 
@@ -953,7 +945,7 @@ def create_depth(
     return Flood_Flooded_Cells_in_Map(max_vals, Flood_Ensemble, eps=0.01)
 
 
-def create_bathymetry(params: dict, E: np.ndarray, nrows: int, ncols: int, dem_geotransform: tuple, dem_projection: str,
+def create_bathymetry(config: Config, E: np.ndarray, nrows: int, ncols: int, dem_geotransform: tuple, dem_projection: str,
                       Flood_Ensemble: np.ndarray, WeightBox: np.ndarray, TW_for_WeightBox_ElipseMask: int, bathymetry_creation_options: list[str] = None):
     """Write the topobathymetric DEM (``FSOutBATHY``).
 
@@ -962,14 +954,14 @@ def create_bathymetry(params: dict, E: np.ndarray, nrows: int, ncols: int, dem_g
     exist.  See ``Create_Topobathy_Dataset``.
     """
     LOG.info('Working on Bathymetry')
-    ds: gdal.Dataset = gdal.Open(params['BathyFromARFileName'])
+    ds: gdal.Dataset = gdal.Open(config.bathy_out_file)
     ARBathy = np.full((nrows+2, ncols+2), -9999.0, dtype=np.float32)
     ARBathy[1:-1, 1:-1] = ds.ReadAsArray().astype(np.float32)
     ds = None
 
     ARBathyMask = np.zeros((nrows+2,ncols+2), dtype=np.bool_)
-    if os.path.exists(params['BathyWaterMaskFileName']):
-        ds = gdal.Open(params['BathyWaterMaskFileName'])
+    if path_exists(config.bathywatermask):
+        ds = gdal.Open(config.bathywatermask)
         ARBathyMask[1:-1, 1:-1] = ds.ReadAsArray() > 0
         ds = None
     else:
@@ -978,180 +970,9 @@ def create_bathymetry(params: dict, E: np.ndarray, nrows: int, ncols: int, dem_g
     ARBathy[np.isnan(ARBathy)] = -99.000  #This converts all nan values to a -99
     ARBathy = ARBathy * ARBathyMask
     ARBathy[ARBathyMask != 1] = -9999.000
-    Create_Topobathy_Dataset(E, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, ARBathy, ARBathyMask, params['Bathy_Use_Banks'])
+    Create_Topobathy_Dataset(E, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, ARBathy, ARBathyMask, config.bathy_use_banks)
 
-    Write_Output_Raster(params['BathyOutputFileName'], ARBathy[1:-1, 1:-1], ncols, nrows, dem_geotransform, dem_projection, "GTiff", gdal.GDT_Float32, params['compression'], bathymetry_creation_options)
-
-def to_bool(value):
-    """``'False'`` (any case) is False; other strings, and other values by truthiness, as usual."""
-    if isinstance(value, str):
-        return not value.lower() == 'false'
-    return bool(value)
-
-def _first(data: dict, *keys, default=None):
-    """Value of the first of ``keys`` present in ``data``."""
-    for key in keys:
-        if key in data:
-            return data[key]
-    return default
-
-def _path(data: dict, *keys) -> str:
-    """A file path setting as a string; '' when it is missing or empty."""
-    value = _first(data, *keys, default='')
-    return '' if value is None else str(value)
-
-def get_params(input_file: str = None, args: dict = None):
-    """Read the settings from an input file or a dict.
-
-    The input file is YAML (``.yaml``/``.yml``) or plain text with one
-    ``key value`` pair per line; lines starting with ``#`` are comments.
-    Missing keys take their defaults and unknown keys are ignored.  Returns a
-    dict keyed by the internal setting names.
-    """
-    if input_file:
-        with open(input_file,'r') as infile:
-            if str(input_file).lower().endswith(('.yaml', '.yml')):
-                data = yaml.load(infile, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader))
-            else:
-                data = {}
-                for line in infile.readlines():
-                    line = line.strip()
-                    if line and not line.startswith('#'):
-                        key_value = line.split(None, 1)
-                        if len(key_value) == 2:
-                            key, value = key_value
-                            data[key] = value
-                        elif len(key_value) == 1:
-                            data[key_value[0]] = ''
-    elif args:
-        data = args
-    else:
-        raise ValueError("Provide an input file or a dict of settings.")
-
-    params = {
-        'DEM_File': _path(data, 'DEM_File'),
-        'STRM_File': _path(data, 'Stream_File'),
-        'LAND_File': _path(data, 'LU_Raster_SameRes'),
-        'StrmShp_File': _path(data, 'StrmShp_File'),
-        'reach_id_field': _first(data, 'reach_id', 'Reach_ID', default='LINKNO'),
-        'downstream_reach_id_field': _first(data, 'downstream_reach_id', 'Downstream_Reach_ID', default='DSLINKNO'),
-        'Make_Output_GPKG': to_bool(data.get('Make_Output_GPKG', True)),
-        'Flood_File': _path(data, 'OutFLD'),
-        'OutDEP': _path(data, 'OutDEP'),
-        'OutWSE': _path(data, 'OutWSE'),
-        'OutVEL': _path(data, 'OutVEL'),
-        'LU_Manning_n': _path(data, 'LU_Manning_n'),
-        'FlowFileName': _path(data, 'COMID_Flow_File', 'Comid_Flow_File'),
-        'VDTDatabaseFileName': _path(data, 'Print_VDT_Database'),
-        'CurveParamFileName': _path(data, 'Print_Curve_File'),
-        'mapper': data.get('mapper', KERNEL_WEIGHTED),
-        'TopWidthPlausibleLimit': float(data.get('TopWidthPlausibleLimit', 1000.0)),
-        'TW_MultFact': float(data.get('TW_MultFact', 3.0)),
-        'Set_Depth': float(_first(data, 'Set_Depth', 'FloodSpreader_SpecifyDepth', default=-1.1)),
-        'LocalFloodOption': to_bool(data.get('LocalFloodOption', False)) or to_bool(data.get('FloodLocalOnly', False)),
-        'BathyWaterMaskFileName': _path(data, 'BathyWaterMask'),
-        'BathyFromARFileName': _path(data, 'BATHY_Out_File'),
-        'BathyOutputFileName': _path(data, 'FSOutBATHY'),
-        'Flood_WaterLC_and_STRM_Cells': to_bool(data.get('Flood_WaterLC_and_STRM_Cells', False)),
-        'Flood_Bathy_Mask': to_bool(data.get('Flood_Bathy_Mask', False)),
-        'LAND_WaterValue': int(data.get('LAND_WaterValue', 80)),
-        'Bathy_Use_Banks': to_bool(data.get('Bathy_Use_Banks', False)),
-
-        # FLDPLN inputs
-        'Flow_Direction_File': _path(data, 'Flow_Direction_File'),
-        'Filled_DEM_File': _path(data, 'Filled_DEM_File'),
-        'Stream_Info_File': _path(data, 'Stream_Info_File'),
-        'FLDPLN_Library': _path(data, 'FLDPLN_Library'),
-        'FLDPLN_Max_WSE_Rise': float(_first(data, 'max_wse_rise', 'FLDPLN_Max_WSE_Rise', default=0.01)),
-        'FLDPLN_Median_Filter_Size': int(_first(data, 'FLDPLN_Median_Filter_Size', 'median_filter_size', default=53)),
-
-        # Multipoint options
-        'topwidth_threshold_m': float(data.get('MPI_TopWidth_Threshold_m', 200.0)),
-        'xs_point_spacing_m': float(data.get('MPI_XS_Point_Spacing_m', 100.0)),
-        'remove_hwm_outliers': to_bool(data.get('MPI_Remove_HWM_Outliers', True)),
-        'hwm_outlier_method': data.get('MPI_HWM_Outlier_Method', 'mad'),
-        'hwm_outlier_threshold': float(data.get('MPI_HWM_Outlier_Threshold', 3.5)),
-        'hwm_outlier_group_by': data.get('MPI_HWM_Outlier_Group_By', 'comid'),
-        'hwm_outlier_min_samples': int(data.get('MPI_HWM_Outlier_Min_Samples', 5)),
-        'corridor_buffer_m': float(data.get('MPI_Corridor_Buffer_m', 500.0)),
-        'anchor_buffer_m': float(data.get('MPI_Anchor_Buffer_m', 5.0)),
-        'use_topwidth_buffers': to_bool(data.get('MPI_Use_TopWidth_Buffers', True)),
-        'corridor_topwidth_factor': float(data.get('MPI_Corridor_TopWidth_Factor', 1.0)),
-        'anchor_topwidth_factor': float(data.get('MPI_Anchor_TopWidth_Factor', 0.1)),
-        'connectivity': int(data.get('MPI_Connectivity', 4)),
-        'k': int(data.get('MPI_K', 12)),
-        'power': float(data.get('MPI_Power', 2.0)),
-        'max_distance_m': float(data.get('MPI_Max_Distance_m', 1000.0)),
-        'use_topwidth_max_distance': to_bool(data.get('MPI_Use_TopWidth_Max_Distance', True)),
-        'maxdist_topwidth_factor': float(data.get('MPI_MaxDist_TopWidth_Factor', 1.0)),
-        'min_topwidth_m': float(data.get('MPI_Min_TopWidth_m', 5.0)),
-        'max_topwidth_m': float(data.get('MPI_Max_TopWidth_m', 500.0)),
-        'fallback_topwidth_m': float(data.get('MPI_Fallback_TopWidth_m', 20.0)),
-        'smooth_sigma_pixels': float(data.get('MPI_Smooth_Sigma_Pixels', 0.25)),
-        'apply_wse_sanity_filter': to_bool(data.get('MPI_Apply_WSE_Sanity_Filter', True)),
-        'wse_sanity_tolerance_m': float(data.get('MPI_WSE_Sanity_Tolerance_m', 0.0)),
-        'fast_mode': to_bool(data.get('MPI_Fast_Mode', False)),
-        'one_based_vdt_rc': to_bool(data.get('MPI_One_Based_VDT_RC', False)),
-
-        # Miscellaneous
-        "compression": data.get("compression", "LZW"),
-    }
-
-    return params
-
-def _needs_flood_map(params: dict) -> bool:
-    """Whether a flood map is needed: for an output raster, or as the bathymetry water mask."""
-    return bool(params['Flood_File'] or params['OutDEP'] or params['OutWSE'] or params['OutVEL'] or
-                (params['BathyOutputFileName'] and params['BathyFromARFileName'] and not path_exists(params['BathyWaterMaskFileName'])))
-
-def validate_params(params: dict):
-    """Raise a ValueError if a setting the run needs is missing or two settings conflict.
-
-    Messages use the input-file key names.
-    """
-    if params['mapper'] not in MAPPERS:
-        raise ValueError(f"Unknown mapper {params['mapper']!r}; use one of: {', '.join(MAPPERS)}.")
-    if not _needs_flood_map(params):
-        return
-
-    set_depth = params['Set_Depth'] > 0
-    fldpln = params['mapper'] == FLDPLN
-    if set_depth and fldpln:
-        raise ValueError("Set_Depth (FloodSpreader_SpecifyDepth) is not supported by the FLDPLN mapper.")
-    if set_depth and params['OutVEL']:
-        raise ValueError("OutVEL needs the slopes in Print_VDT_Database or Print_Curve_File, "
-                         "so it cannot be used with Set_Depth (FloodSpreader_SpecifyDepth).")
-
-    required = {}  # input-file key -> its value
-    if set_depth:
-        required['Stream_File'] = params['STRM_File']
-    else:
-        required['COMID_Flow_File'] = params['FlowFileName']
-        if fldpln:
-            required['Print_VDT_Database'] = params['VDTDatabaseFileName']
-        else:
-            required['Print_VDT_Database or Print_Curve_File'] = params['VDTDatabaseFileName'] or params['CurveParamFileName']
-    if fldpln:
-        required.update({
-            'Flow_Direction_File': params['Flow_Direction_File'],
-            'Filled_DEM_File': params['Filled_DEM_File'],
-            'Stream_Info_File': params['Stream_Info_File'],
-            'FLDPLN_Library': params['FLDPLN_Library'],
-            'StrmShp_File': params['StrmShp_File'],
-        })
-    if params['OutVEL']:
-        required['LU_Manning_n'] = params['LU_Manning_n']
-    if params['OutVEL'] or params['Flood_WaterLC_and_STRM_Cells']:
-        required['LU_Raster_SameRes'] = params['LAND_File']
-    if params['Flood_Bathy_Mask']:
-        required['BathyWaterMask'] = params['BathyWaterMaskFileName']
-
-    missing = [key for key, value in required.items() if not value]
-    if missing:
-        raise ValueError(f"Missing required parameters: {', '.join(missing)}")
-    if params['Flood_Bathy_Mask'] and not path_exists(params['BathyWaterMaskFileName']):
-        raise ValueError(f"Flood_Bathy_Mask floods the cells of BathyWaterMask, and {params['BathyWaterMaskFileName']} "
-                         f"doesn't exist.")
+    Write_Output_Raster(config.fsoutbathy, ARBathy[1:-1, 1:-1], ncols, nrows, dem_geotransform, dem_projection, "GTiff", gdal.GDT_Float32, config.compression, bathymetry_creation_options)
 
 def _check_dem_units(dem_projection: str):
     """Raise a ValueError unless the DEM's coordinate system is in metres or degrees."""
@@ -1175,7 +996,7 @@ def _check_shape(array: np.ndarray, shape: tuple, name: str):
         raise ValueError(f"{name} dimensions ({array.shape[1]}x{array.shape[0]}) do not match the DEM ({shape[1]}x{shape[0]}).")
 
 def main_flood_ouputs(
-        params: dict,
+        config: Config,
         E: np.ndarray | None,
         nrows: int,
         ncols: int,
@@ -1193,33 +1014,33 @@ def main_flood_ouputs(
     that flooded the cell (100 with a single event).  ``E`` is the DEM padded
     by one cell; the FLDPLN mapper needs it only for ``OutWSE``.
     """
-    set_depth = params['Set_Depth'] > 0
+    set_depth = config.uses_set_depth
     _check_dem_units(dem_projection)
 
-    if params['mapper'] == FLDPLN:
-        FlowDir = gdal.Open(params['Flow_Direction_File']).ReadAsArray().astype(np.uint8, copy=False)
+    if config.mapper == FLDPLN:
+        FlowDir = gdal.Open(config.flow_direction_file).ReadAsArray().astype(np.uint8, copy=False)
         _check_shape(FlowDir, (nrows, ncols), "Flow direction raster")
 
-        filled_dem: np.ndarray = gdal.Open(params['Filled_DEM_File']).ReadAsArray()
+        filled_dem: np.ndarray = gdal.Open(config.filled_dem_file).ReadAsArray()
         _check_shape(filled_dem, (nrows, ncols), "Filled DEM raster")
 
-        if Path(params['Stream_Info_File']).suffix == '.parquet':
-            stream_info: pd.DataFrame = pd.read_parquet(params['Stream_Info_File'])
+        if Path(config.stream_info_file).suffix == '.parquet':
+            stream_info: pd.DataFrame = pd.read_parquet(config.stream_info_file)
         else:
-            stream_info: pd.DataFrame = pd.read_csv(params['Stream_Info_File'])
-        if Path(params['StrmShp_File']).suffix == '.parquet':
-            streams_gdf = gpd.read_parquet(params['StrmShp_File'])
+            stream_info: pd.DataFrame = pd.read_csv(config.stream_info_file)
+        if Path(config.strmshp_file).suffix == '.parquet':
+            streams_gdf = gpd.read_parquet(config.strmshp_file)
         else:
-            streams_gdf = gpd.read_file(params['StrmShp_File'], use_arrow=True, ignore_geometry=True)
+            streams_gdf = gpd.read_file(config.strmshp_file, use_arrow=True, ignore_geometry=True)
 
-        if Path(params['FLDPLN_Library']).suffix == '.parquet':
-            fldpln_library = pl.scan_parquet(params['FLDPLN_Library'])
+        if Path(config.fldpln_library).suffix == '.parquet':
+            fldpln_library = pl.scan_parquet(config.fldpln_library)
             fldpln_library = fldpln_library.with_columns(
                 [pl.col(c).cast(pl.Float32)
                 for c, d in fldpln_library.collect_schema().items() if d == pl.Decimal]
             )
         else:
-            fldpln_library = pl.scan_csv(params['FLDPLN_Library'])
+            fldpln_library = pl.scan_csv(config.fldpln_library)
     else:
         FlowDir = None
         filled_dem = None
@@ -1231,12 +1052,12 @@ def main_flood_ouputs(
 
     # Stream cells come from the stream raster with Set_Depth, otherwise from the VDT or curve file
     if set_depth:
-        S, _, _ = Read_Raster_GDAL(params['STRM_File'])
+        S, _, _ = Read_Raster_GDAL(config.stream_file)
         _check_shape(S, (nrows, ncols), "Stream raster")
-    elif params['VDTDatabaseFileName']:
-        S = Set_Stream_Locations(nrows, ncols, params['VDTDatabaseFileName'])
+    elif config.print_vdt_database:
+        S = Set_Stream_Locations(nrows, ncols, config.print_vdt_database)
     else:
-        S = Set_Stream_Locations(nrows, ncols, params['CurveParamFileName'])
+        S = Set_Stream_Locations(nrows, ncols, config.print_curve_file)
 
     # Stream ids padded by one cell, and where the stream cells are
     B = np.zeros((nrows+2,ncols+2), dtype=np.int32)
@@ -1246,7 +1067,7 @@ def main_flood_ouputs(
 
     COMID_Unique = np.unique(B[RR, CC]) # Always sorted
     COMID_Unique = COMID_Unique.astype(int)
-    if params['mapper'] == FLDPLN:
+    if config.mapper == FLDPLN:
         B = None  # Only the curve-based mappers read it
 
     if set_depth:
@@ -1254,12 +1075,12 @@ def main_flood_ouputs(
         num_flows = 1
         COMID_Unique_Flow = {}
     else:
-        LOG.info('Opening and Reading ' + params['FlowFileName'])
-        num_flows = _count_flow_events(params['FlowFileName'])
+        LOG.info('Opening and Reading ' + config.comid_flow_file)
+        num_flows = _count_flow_events(config.comid_flow_file)
     LOG.info('Evaluating ' + str(num_flows) + ' Flow Events')
 
     # Create initial rasters once, outside the loop
-    if params['mapper'] == FLDPLN:
+    if config.mapper == FLDPLN:
         T_Rast = None
         W_Rast = None
     else:
@@ -1267,7 +1088,7 @@ def main_flood_ouputs(
         W_Rast = np.empty((nrows,ncols), np.float32)
 
     # Stream-cell slopes, only needed for velocity
-    S_Rast = np.full((nrows,ncols), np.nan, np.float32) if params['OutVEL'] else None
+    S_Rast = np.full((nrows,ncols), np.nan, np.float32) if config.outvel else None
 
     Flood_Ensemble = np.zeros((nrows, ncols), dtype=np.float16 if num_flows > 1 else np.uint8)  # use uint8 if only one flow, otherwise float16 for percentage calculation
     Depth_array_list = []
@@ -1281,9 +1102,9 @@ def main_flood_ouputs(
             W_Rast[:] = np.nan
 
         if not set_depth:
-            COMID_Unique_Flow = FindFlowRateForEachCOMID_Ensemble(params['FlowFileName'], flow_event_num)
+            COMID_Unique_Flow = FindFlowRateForEachCOMID_Ensemble(config.comid_flow_file, flow_event_num)
         Flood_array_this_flow, Depth_array, Slope_array = Curve2Flood(
-            params, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
+            config, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
             COMID_Unique_Flow, WeightBox, TW_for_WeightBox_ElipseMask,
             quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast, FlowDir,
             filled_dem, stream_info, fldpln_library, streams_gdf
@@ -1303,23 +1124,23 @@ def main_flood_ouputs(
         Flood_Ensemble /= num_flows
         Flood_Ensemble = Flood_Ensemble.astype(np.uint8)
 
-    OutVEL = params['OutVEL']
-    Flood_WaterLC_and_STRM_Cells = params['Flood_WaterLC_and_STRM_Cells']
-    OutDEP = params['OutDEP']
-    OutWSE = params['OutWSE']
-    Flood_File = params['Flood_File']
+    OutVEL = config.outvel
+    Flood_WaterLC_and_STRM_Cells = config.flood_waterlc_and_strm_cells
+    OutDEP = config.outdep
+    OutWSE = config.outwse
+    Flood_File = config.outfld
 
     if Flood_WaterLC_and_STRM_Cells or OutVEL:
-        LC_array, _, _ = Read_Raster_GDAL(params['LAND_File'])
+        LC_array, _, _ = Read_Raster_GDAL(config.lu_raster_sameres)
         _check_shape(LC_array, (nrows, ncols), "Land cover raster")
 
     if Flood_WaterLC_and_STRM_Cells:
         LOG.info('Flooding the Water-Related Land Cover and STRM cells')
-        Flood_Ensemble = Flood_WaterLC_and_STRM_Cells_in_Flood_Map(Flood_Ensemble, S, LC_array, params['LAND_WaterValue'])
+        Flood_Ensemble = Flood_WaterLC_and_STRM_Cells_in_Flood_Map(Flood_Ensemble, S, LC_array, config.land_watervalue)
 
-    if params['Flood_Bathy_Mask']:
+    if config.flood_bathy_mask:
         LOG.info('Flooding the bathymetry water mask cells')
-        mask, _, _ = Read_Raster_GDAL(params['BathyWaterMaskFileName'])
+        mask, _, _ = Read_Raster_GDAL(config.bathywatermask)
         _check_shape(mask, (nrows, ncols), "Bathymetry water mask")
         Flood_Ensemble = Flood_Bathy_Mask_in_Flood_Map(Flood_Ensemble, mask)
         del mask
@@ -1329,7 +1150,7 @@ def main_flood_ouputs(
 
     if Flood_File:
         LOG.info('Creating Ensemble Flood Map...' + str(Flood_File))
-        out_ds: gdal.Dataset = gdal.GetDriverByName("GTiff").Create(Flood_File, ncols, nrows, 1, gdal.GDT_Byte, options=[f"COMPRESS={params['compression']}", "PREDICTOR=2"])
+        out_ds: gdal.Dataset = gdal.GetDriverByName("GTiff").Create(Flood_File, ncols, nrows, 1, gdal.GDT_Byte, options=[f"COMPRESS={config.compression}", "PREDICTOR=2"])
         out_ds.SetGeoTransform(dem_geotransform)
         out_ds.SetProjection(dem_projection)
         out_ds.WriteArray(Flood_Ensemble)
@@ -1345,7 +1166,7 @@ def main_flood_ouputs(
 
             ds: gdal.Dataset = gdal.GetDriverByName("GTiff").Create(
                 OutDEP, ncols, nrows, 1, gdal.GDT_Float32,
-                options=[f"COMPRESS={params['compression']}", "PREDICTOR=2", "TILED=YES"]
+                options=[f"COMPRESS={config.compression}", "PREDICTOR=2", "TILED=YES"]
             )
             if ds is None:
                 raise RuntimeError(f"Failed to create output raster: {OutDEP}")
@@ -1368,7 +1189,7 @@ def main_flood_ouputs(
         driver = gdal.GetDriverByName("GTiff")
         ds: gdal.Dataset = driver.Create(
             OutWSE, ncols, nrows, 1, gdal.GDT_Float32,
-            options=[f"COMPRESS={params['compression']}", "PREDICTOR=2", "TILED=YES"]
+            options=[f"COMPRESS={config.compression}", "PREDICTOR=2", "TILED=YES"]
         )
         if ds is None:
             raise RuntimeError(f"Failed to create output raster: {OutWSE}")
@@ -1387,7 +1208,7 @@ def main_flood_ouputs(
 
     # The FLDPLN mapper gives no slopes: each flooded cell takes its nearest
     # stream cell's slope, averaged over its 3x3 neighbourhood
-    if params['mapper'] == FLDPLN and S_Rast is not None:
+    if config.mapper == FLDPLN and S_Rast is not None:
         Slope_array = Flood_Flooded_Cells_in_Map(S_Rast, Flood_Ensemble.astype(np.uint8), eps=0.0002)
         valid = Slope_array > 0
         Slope_array[~valid] = np.nan
@@ -1395,9 +1216,9 @@ def main_flood_ouputs(
         Slope_array_list = [Slope_array]
 
     if OutVEL:
-        create_velocity(params, OutVEL, Depth_Array, LC_array, Slope_array_list, dem_geotransform, dem_projection, ncols, nrows, Flood_Ensemble)
+        create_velocity(config, OutVEL, Depth_Array, LC_array, Slope_array_list, dem_geotransform, dem_projection, ncols, nrows, Flood_Ensemble)
 
-    if params['StrmShp_File'] and params['Make_Output_GPKG'] and Flood_File:
+    if config.strmshp_file and config.make_output_gpkg and Flood_File:
         flood_gdf = Write_Output_Raster_As_GeoDataFrame(Flood_Ensemble, ncols, nrows, dem_geotransform, dem_projection, gdal.GDT_Byte)
 
         # The driver is inferred from the file extension
@@ -1406,11 +1227,7 @@ def main_flood_ouputs(
 
     return Flood_Ensemble
 
-def path_exists(path: str | os.PathLike) -> bool:
-    """Check if a given path exists."""
-    return path and Path(path).exists()
-
-def Curve2Flood_MainFunction(input_file: str = None,
+def Curve2Flood_MainFunction(input_file: str | os.PathLike | Config = None,
                              args: dict = None,
                              quiet: bool = False,
                              flood_vdt_cells: bool = True,
@@ -1420,9 +1237,9 @@ def Curve2Flood_MainFunction(input_file: str = None,
 
     Parameters
     ----------
-    input_file : str, optional
-        Path to a YAML or ``key value`` text input file.  Used instead of
-        ``args`` when given.
+    input_file : str, os.PathLike or Config, optional
+        Path to a YAML or ``key value`` text input file, or the settings
+        already read into a `Config`.  Used instead of ``args`` when given.
     args : dict, optional
         The same settings as a dict.  Paths may be strings or ``Path`` objects.
     quiet : bool
@@ -1436,11 +1253,17 @@ def Curve2Flood_MainFunction(input_file: str = None,
     **kwargs
         Ignored; kept so older calls keep working.
     """
-    params = get_params(input_file, args)
-    validate_params(params)
+    if isinstance(input_file, Config):
+        config = input_file
+    elif input_file:
+        config = Config.from_file(input_file)
+    elif args:
+        config = Config.from_mapping(args)
+    else:
+        raise ValueError("Provide an input file, a dict of settings or a Config.")
 
-    LOG.info('Opening ' + params['DEM_File'])
-    ds: gdal.Dataset = gdal.Open(params['DEM_File'])
+    LOG.info('Opening ' + config.dem_file)
+    ds: gdal.Dataset = gdal.Open(config.dem_file)
     dem_geotransform = ds.GetGeoTransform()
     dem_projection = ds.GetProjection()
     nrows = ds.RasterYSize
@@ -1449,9 +1272,9 @@ def Curve2Flood_MainFunction(input_file: str = None,
     yur = dem_geotransform[3]
 
     # The FLDPLN mapper needs the DEM's values only for a WSE raster or the bathymetry
-    bathymetry = bool(params['BathyFromARFileName'] and params['BathyOutputFileName'])
+    bathymetry = config.makes_bathymetry
     E = None
-    if params['mapper'] != FLDPLN or params['OutWSE'] or bathymetry:
+    if config.mapper != FLDPLN or config.outwse or bathymetry:
         # The DEM padded by one cell of -9999, so neighbour lookups need no bounds checks
         E = np.full((nrows+2, ncols+2), -9999.0, dtype=np.float32)
         E[1:-1, 1:-1] = ds.ReadAsArray()
@@ -1465,19 +1288,19 @@ def Curve2Flood_MainFunction(input_file: str = None,
     LOG.info('Cellsize Y = ' + str(dy))
 
     LOG.info('Creating the Weight Box')
-    TW_for_WeightBox_ElipseMask = int( max( np.round(params['TopWidthPlausibleLimit']/dx,0), np.round(params['TopWidthPlausibleLimit']/dy,0) ) )  # Half width of the weight box, in cells
-    if params['mapper'] == FLDPLN and not bathymetry:
+    TW_for_WeightBox_ElipseMask = int( max( np.round(config.topwidthplausiblelimit/dx,0), np.round(config.topwidthplausiblelimit/dy,0) ) )  # Half width of the weight box, in cells
+    if config.mapper == FLDPLN and not bathymetry:
         WeightBox = None
     else:
         WeightBox = create_weightbox(TW_for_WeightBox_ElipseMask, dx, dy)
 
     Flood_Ensemble = None
-    if _needs_flood_map(params):
-        Flood_Ensemble = main_flood_ouputs(params, E, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, dx, dy,
+    if config.needs_flood_map:
+        Flood_Ensemble = main_flood_ouputs(config, E, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, dx, dy,
                                            dem_projection, dem_geotransform, quiet=quiet, flood_vdt_cells=flood_vdt_cells)
 
     if bathymetry:
-        create_bathymetry(params, E, nrows, ncols, dem_geotransform, dem_projection,
+        create_bathymetry(config, E, nrows, ncols, dem_geotransform, dem_projection,
                            Flood_Ensemble, WeightBox, TW_for_WeightBox_ElipseMask,
                           bathymetry_creation_options)
 
