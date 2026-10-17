@@ -7,8 +7,10 @@ the water must be at the stream pixel to get there: the depth to flood (DTF).
 Water fills the filled DEM upstream (backfill) and spills over low divides
 into neighbouring valleys (spillover).  The library holds one row per
 (flood source pixel ``FSP``, floodplain pixel ``FPP``, ``DTF``, ``fill``),
-where ``fill`` is how far the filled DEM sits above the DEM at ``FPP``;
-mapping an event then needs only each stream pixel's water depth.
+where ``fill`` is how far the filled DEM sits above the DEM at ``FPP``,
+and ``segment``, the stretch of stream the ``FSP`` belongs to.  Every pixel
+of a segment starts at the same depth, so the library is exact for one water
+depth per segment, which is all mapping an event then needs.
 
 Two solvers build the library:
 
@@ -31,6 +33,7 @@ indices, ``row * ncols + col``.
 
 from __future__ import annotations
 
+import math
 import geopandas as gpd
 import multiprocessing as mp
 from collections import defaultdict
@@ -992,13 +995,157 @@ def read_array_and_set_shared(file: str, dtype: np.dtype, set_shared: bool,
     _set_shared(name, shm)
     return arr
 
+# ---------------------------------------------------------------------------
+# Reaches into segments
+#
+# A library is exact only for one depth per segment (every source starts at
+# the same depth), and a single depth fits a long reach badly, so reaches over
+# a length are cut into shorter segments, solved and mapped on their own.
+# ---------------------------------------------------------------------------
+
+def _cell_size_metres(raster: str) -> tuple[float, float]:
+    """The raster's cell size ``(dx, dy)`` in metres, as Curve2Flood measures the DEM's."""
+    from curve2flood.core import convert_cell_size  # core imports this module
+
+    ds = gdal.Open(raster)
+    gt = ds.GetGeoTransform()
+    projection = ds.GetProjection()
+    yur = gt[3]
+    yll = yur - ds.RasterYSize * abs(gt[5])
+    size_x, size_y = np.hypot(gt[1], gt[2]), np.hypot(gt[4], gt[5])
+    if not projection:
+        # No coordinate system: take the geotransform's units as metres
+        return float(size_x), float(size_y)
+    dx, dy = convert_cell_size(size_x, size_y, yll, yur, projection)
+    return float(dx), float(dy)
+
+def _step_lengths(pixels: np.ndarray, flat_fdr: np.ndarray, dx: float, dy: float) -> np.ndarray:
+    """Length (m) of the D8 step each pixel takes downstream; about one cell where it has none."""
+    codes = flat_fdr[pixels]
+    steps = np.full(len(pixels), (dx + dy) / 2)
+    steps[np.isin(codes, (2, 32))] = dx                     # east, west
+    steps[np.isin(codes, (8, 128))] = dy                    # south, north
+    steps[np.isin(codes, (1, 4, 16, 64))] = np.hypot(dx, dy)
+    return steps
+
+def _profile_cuts(distance: np.ndarray, elevation: np.ndarray, max_deviation: float) -> np.ndarray:
+    """Where to cut a reach so that the filled DEM under it is about straight along each piece.
+
+    ``distance`` is each stream pixel's distance along the river and ``elevation`` its filled DEM, from upstream
+    down. The profile is simplified top-down (Douglas-Peucker): a chord is split at its point farthest above or below
+    it, until no point departs from its chord by more than ``max_deviation`` (m). Each pixel then belongs to the chord
+    it lies inside; a vertex lies on two chords and joins the gentler one, so the top and the foot of a step stay with
+    their pools and a step from one pixel to the next is a cut between the two. Returns the index of the first pixel
+    of every piece but the first.
+    """
+    n = len(elevation)
+    if n < 3:
+        return np.zeros(0, dtype=np.int64)
+    keep = np.zeros(n, dtype=bool)
+    keep[[0, n - 1]] = True
+    chords = [(0, n - 1)]
+    while chords:
+        a, b = chords.pop()
+        if b - a < 2:
+            continue
+        along = (distance[a + 1:b] - distance[a]) / (distance[b] - distance[a])
+        off = np.abs(elevation[a + 1:b] - elevation[a] - (elevation[b] - elevation[a]) * along)
+        k = int(np.argmax(off))
+        if off[k] > max_deviation:
+            k += a + 1
+            keep[k] = True
+            chords += [(a, k), (k, b)]
+    vertices = np.flatnonzero(keep)
+    if len(vertices) <= 2:
+        return np.zeros(0, dtype=np.int64)
+    slope = np.abs(np.diff(elevation[vertices]) / np.diff(distance[vertices]))
+    chord_of = np.r_[np.repeat(np.arange(len(vertices) - 1), np.diff(vertices)), len(vertices) - 2]
+    inner = np.arange(1, len(vertices) - 1)
+    chord_of[vertices[inner]] = np.where(slope[inner - 1] <= slope[inner], inner - 1, inner)
+    return np.flatnonzero(np.diff(chord_of)) + 1
+
+def _equal_lengths(pixels: np.ndarray, steps: np.ndarray, max_length: float | None) -> list[np.ndarray]:
+    """Cut a run of stream pixels longer than ``max_length`` into ``ceil(length / max_length)`` of about equal
+    length along the river."""
+    total = float(steps.sum())
+    if max_length is None or total <= max_length or len(pixels) < 2:
+        return [pixels]
+    n = min(math.ceil(total / max_length), len(pixels))
+    upstream = np.cumsum(steps) - steps  # river distance from the run's start to each pixel
+    piece = np.minimum((upstream / (total / n)).astype(np.int64), n - 1)
+    return [pixels[piece == k] for k in range(n) if (piece == k).any()]
+
+def _split_reach(row: np.ndarray, pixels: np.ndarray, steps: np.ndarray, max_length: float | None,
+                 elevation: np.ndarray | None = None,
+                 max_deviation: float | None = None) -> list[tuple[int, int, int, np.ndarray]]:
+    """Cut a reach into segments along the river.
+
+    ``row`` is the reach's stream table row, ``pixels`` its stream pixels from upstream down, ``steps`` their step
+    lengths and ``elevation`` their filled DEM. With ``max_deviation``, the reach is first cut where its profile bends
+    or steps (see ``_profile_cuts``); then every piece longer than ``max_length`` is cut into
+    ``ceil(length / max_length)`` of about equal length. Returns ``(start_pixel, end_pixel, length, pixels)`` for
+    each segment, from upstream down. A reach left whole keeps its own row; the last segment of a split reach keeps
+    the reach's ``end_pixel``, and every other one ends at its own last pixel.
+    """
+    start, end, length = int(row[0]), int(row[1]), int(row[2])
+    cuts = []
+    if max_deviation is not None:
+        cuts = _profile_cuts(np.cumsum(steps) - steps, elevation, max_deviation).tolist()
+    bounds = [0, *cuts, len(pixels)]
+    parts = [p for a, b in zip(bounds[:-1], bounds[1:]) for p in _equal_lengths(pixels[a:b], steps[a:b], max_length)]
+    if len(parts) == 1:
+        return [(start, end, length, pixels)]
+    return [(int(p[0]), end if i == len(parts) - 1 else int(p[-1]), len(p), p) for i, p in enumerate(parts)]
+
+def _segments(stream_info: np.ndarray, stream_ids: np.ndarray, max_depths, flat_fdr: np.ndarray,
+              nrows: int, ncols: int, max_length: float | None, cell_size: tuple[float, float] | None,
+              vdt_depth: dict[int, float], fldmx: float, flat_fil: np.ndarray | None = None,
+              max_deviation: float | None = None, bg: float = -9999) -> tuple[np.ndarray, list[float], int]:
+    """The segments to solve: ``(start_pixel, end_pixel, length, segment)`` rows numbered from 0, each one's depth
+    cap, and how many reaches were split.
+
+    A segment cut from a reach floods as deep as the deepest VDT water among its own pixels (at most ``fldmx``), or
+    as deep as its reach when it has no VDT cell, so that every stream pixel stays a source. ``flat_fil`` is the
+    filled DEM, for ``max_deviation``; stream pixels without a value there are left out of the profile.
+    """
+    rows, caps = [], []
+    n_split = 0
+    by_id = {int(r[3]): r for r in stream_info}
+    for stream_id, cap in zip(stream_ids, max_depths):
+        row = by_id[int(stream_id)]
+        if max_length is None and max_deviation is None:
+            pieces = [(int(row[0]), int(row[1]), int(row[2]), None)]
+        else:
+            pixels = np.asarray(_segment_pixels(int(stream_id), stream_info, flat_fdr, nrows, ncols), dtype=np.int64)
+            steps = _step_lengths(pixels, flat_fdr, *cell_size)
+            elevation = None
+            if max_deviation is not None:
+                elevation = flat_fil[pixels].astype(np.float64)
+                has_value = elevation != bg
+                if not has_value.all():
+                    distance = np.cumsum(steps) - steps
+                    elevation = (np.interp(distance, distance[has_value], elevation[has_value])
+                                 if has_value.sum() > 1 else np.zeros(len(pixels)))
+            pieces = _split_reach(row, pixels, steps, max_length, elevation, max_deviation)
+        n_split += len(pieces) > 1
+        for start, end, length, pixels in pieces:
+            piece_cap = cap
+            if len(pieces) > 1:
+                depths = [vdt_depth[p] for p in pixels.tolist() if p in vdt_depth]
+                piece_cap = min(max(depths), fldmx) if depths else cap
+            rows.append((start, end, length, len(rows)))
+            caps.append(piece_cap)
+    return np.array(rows, dtype=np.int64).reshape(-1, 4), caps, n_split
+
+def _solve_segment(filled_dem: np.ndarray, flow_direction: np.ndarray, args) -> pd.DataFrame:
+    """One segment's rows, with its ``segment`` number (``args`` as fldpln_library_for_segment takes them)."""
+    table = fldpln_library_for_segment(filled_dem, flow_direction, *args)
+    table["segment"] = np.int32(args[0])
+    return table
+
 def run_parallel(args):
     """Worker: solve one segment on the shared rasters."""
-    return fldpln_library_for_segment(
-            globals()['filled_dem_array'],
-            globals()['flow_direction_array'],
-            *args
-        )
+    return _solve_segment(globals()['filled_dem_array'], globals()['flow_direction_array'], args)
 
 def close_shared_memory(names: list[str]):
     """Close and unlink the named shared-memory blocks."""
@@ -1043,13 +1190,23 @@ def build_fldpln_library(
     spill_decay: float = 0.0,
     solver: str = "exact",
     max_drop_below_source: float | None = None,
-    max_cells_per_segment: int | None = None
+    max_cells_per_segment: int | None = None,
+    max_reach_length: float | None = 5000.0,
+    max_profile_deviation: float | None = 1.0
 ):
     """Build the FLDPLN floodplain library for every stream segment and save it.
 
     Each row is a stream pixel ``FSP``, a cell it floods ``FPP``, the depth
-    to flood ``DTF`` and the cell's ``fill``: the filled DEM minus ``dem``.
-    Cells where ``dem`` has no data never flood, and are left out.
+    to flood ``DTF``, the ``segment`` the stream pixel belongs to and the
+    cell's ``fill``: the filled DEM minus ``dem``.  Cells where ``dem`` has no
+    data never flood, and are left out.
+
+    Every source of a segment starts at the same depth, so each cell keeps the
+    one stream pixel that reaches it at the smallest depth: the library is
+    exact for one depth per segment, which is how the mapper floods it.
+    Reaches are first cut where the filled DEM under them bends or steps (with
+    ``max_profile_deviation``) and into pieces no longer than
+    ``max_reach_length``, each solved and flooded on its own.
 
     Parameters
     ----------
@@ -1110,13 +1267,29 @@ def build_fldpln_library(
         stops at the depth where it fills up, so deeper floods there are mapped
         only that far: this trades the largest floods on flat ground for memory.
         None (default) for no limit.  Needs ``solver="exact"``.
+    max_reach_length: float | None
+        Longest segment (m), measured along the flow directions with the
+        filled DEM's cell size.  A longer reach is cut into
+        ``ceil(length / max_reach_length)`` segments of about equal length.
+        5000 (default), as the University of Kansas FLDPLN keeps them; None
+        keeps each reach whole.
+    max_profile_deviation: float | None
+        Also cut each reach where the filled DEM under the stream bends or
+        steps, so that the bed is about straight along every segment: its
+        profile along the river is simplified top-down (Douglas-Peucker)
+        until no stream pixel is more than this many metres above or below
+        its piece's straight line.  The pieces are then cut by
+        ``max_reach_length``.  One depth per segment fits a straight bed
+        best: the stage jumps at a step and where a filled flat begins.
+        1 m (default) did best on 68 US test sites; None makes no such cuts.
     """
     try:
         _build_fldpln_library(
             dem, filled_dem, stream_info_file, flow_direction_file, library_file,
             dh, fldmn, fldmx, iterative_spill, vdt_file, stream_ids,
             global_max_wse, bg, parallel, pbar, processes, bg_mask,
-            spill_decay, solver, max_drop_below_source, max_cells_per_segment
+            spill_decay, solver, max_drop_below_source, max_cells_per_segment, max_reach_length,
+            max_profile_deviation
         )
     finally:
         close_shared_memory(['filled_dem_array', 'flow_direction_array'])
@@ -1142,7 +1315,9 @@ def _build_fldpln_library(
     spill_decay: float = 0.0,
     solver: str = "exact",
     max_drop_below_source: float | None = None,
-    max_cells_per_segment: int | None = None
+    max_cells_per_segment: int | None = None,
+    max_reach_length: float | None = 5000.0,
+    max_profile_deviation: float | None = 1.0
 ):
     """``build_fldpln_library`` without the shared-memory cleanup."""
     if solver not in SOLVERS:
@@ -1153,6 +1328,11 @@ def _build_fldpln_library(
         raise ValueError(f"max_cells_per_segment must be a positive whole number or None, got {max_cells_per_segment!r}.")
     if max_cells_per_segment is not None and solver != "exact":
         raise ValueError("max_cells_per_segment needs solver='exact'.")
+    if max_reach_length is not None and not max_reach_length > 0:
+        raise ValueError(f"max_reach_length must be positive or None, got {max_reach_length!r}.")
+    if max_profile_deviation is not None and not max_profile_deviation > 0:
+        raise ValueError(f"max_profile_deviation must be positive or None, got {max_profile_deviation!r}.")
+    split = max_reach_length is not None or max_profile_deviation is not None
     max_cells = int(max_cells_per_segment or 0)
 
     if Path(stream_info_file).suffix in {'.parquet', '.pq'}:
@@ -1176,9 +1356,9 @@ def _build_fldpln_library(
         bg_mask = np.asarray(bg_mask, dtype=bool)
         if bg_mask.shape != filled_dem_array.shape:
             raise ValueError(f"bg_mask has shape {bg_mask.shape}, but the filled DEM has {filled_dem_array.shape}.")
-        filled_dem_array[bg_mask] = bg
 
     stream_ids = stream_info.iloc[:, 3].unique()
+    vdt_depth: dict[int, float] = {}
     if vdt_file is None:
         max_depths = [fldmx] * len(stream_ids)
     else:
@@ -1204,10 +1384,17 @@ def _build_fldpln_library(
         elevation = filled_dem_array[vdt_df['Row'], vdt_df['Col']]
         vdt_df['depth'] = vdt_df[max_wse_col] - elevation
         # Background cells, like masked lakes, are never flooded from, and their depth would be measured from bg
-        vdt_df = vdt_df[elevation != bg]
+        background = elevation == bg
+        if bg_mask is not None:
+            background |= bg_mask[vdt_df['Row'], vdt_df['Col']]
+        vdt_df = vdt_df[~background]
         ids_max_depths = vdt_df.groupby('COMID', sort=False, as_index=False)['depth'].max().values
         stream_ids = ids_max_depths[:, 0].astype(np.int32)
         max_depths = np.minimum(ids_max_depths[:, 1], fldmx)
+        if split:
+            # Each VDT cell's deepest water, for the segments of split reaches
+            vdt_pixel = vdt_df['Row'].to_numpy(np.int64) * filled_dem_array.shape[1] + vdt_df['Col'].to_numpy(np.int64)
+            vdt_depth = pd.Series(vdt_df['depth'].to_numpy(), index=vdt_pixel).groupby(level=0).max().to_dict()
 
     if len(stream_ids) == 0:
         LOG.warning("No stream segments found to process. Exiting.")
@@ -1218,21 +1405,31 @@ def _build_fldpln_library(
     else:
         pbar = lambda x, **kwargs: x
 
-    if processes is None:
-        processes = max(min(mp.cpu_count(), len(stream_ids)), 1)
-        if processes == 1:
-            parallel = False
-
-    # Materialise the stream table once: building it inside the comprehension
+    nrows, ncols = filled_dem_array.shape
+    cell_size = _cell_size_metres(filled_dem) if split else None
+    # The profiles are read before bg_mask is applied: a lake on the stream is a flat, not a gap
+    segments, segment_depths, n_split = _segments(
+        stream_info.values.astype(np.int64), stream_ids, max_depths, flow_direction_array.ravel(), nrows, ncols,
+        max_reach_length, cell_size, vdt_depth, fldmx, filled_dem_array.ravel(), max_profile_deviation, bg)
+    if n_split:
+        why = []
+        if max_profile_deviation is not None:
+            why.append(f"where the filled DEM under them departs from a straight line by more than "
+                       f"{max_profile_deviation:g} m")
+        if max_reach_length is not None:
+            why.append(f"into pieces of at most {max_reach_length / 1000:g} km")
+        LOG.info(f"Cut {n_split} of {len(stream_ids)} reaches {' and '.join(why)}: {len(segments)} segments in all.")
+    if bg_mask is not None:
+        filled_dem_array[bg_mask] = bg
+    # One segment table for every task: building it inside the comprehension
     # made a fresh copy per segment, and every copy was pickled to a worker.
-    stream_info_values = stream_info.values
     args = [
         (
-            stream_id,
-            stream_info_values,
+            int(segment),
+            segments,
             dh,
             fldmn,
-            max_depths[i],
+            segment_depths[i],
             iterative_spill,
             global_max_wse,
             bg,
@@ -1241,10 +1438,15 @@ def _build_fldpln_library(
             max_drop_below_source,
             max_cells
         )
-        for i, stream_id in enumerate(stream_ids)
+        for i, segment in enumerate(segments[:, 3])
     ]
     # Sort args from largest max depth to smallest, (longest time to shortest)
     args.sort(key=lambda x: x[4], reverse=True)
+
+    if processes is None:
+        processes = max(min(mp.cpu_count(), len(args)), 1)
+        if processes == 1:
+            parallel = False
 
     dfs: list[pd.DataFrame] = []
     if parallel:
@@ -1255,12 +1457,8 @@ def _build_fldpln_library(
             for df in pbar(pool.imap_unordered(run_parallel, args), total=len(args), desc="Processing streams in parallel"):
                 dfs.append(df)
     else:
-        for i, _ in enumerate(pbar(stream_ids, desc="Processing streams")):
-            dfs.append(fldpln_library_for_segment(
-                filled_dem_array,
-                flow_direction_array,
-                *args[i]
-            ))
+        for task in pbar(args, desc="Processing streams"):
+            dfs.append(_solve_segment(filled_dem_array, flow_direction_array, task))
 
     fill_depth = _fill_depth(dem, filled_dem_array, bg)
     close_shared_memory(['filled_dem_array', 'flow_direction_array'])
@@ -1329,7 +1527,7 @@ def save_library(df: pd.DataFrame, path: str):
         else:
             cols[c] = pa.array(df[c].to_numpy())
 
-    pq.write_table(pa.table(cols), path, use_dictionary=["FSP"],
+    pq.write_table(pa.table(cols), path, use_dictionary=[c for c in ("FSP", "segment") if c in df.columns],
                    column_encoding=enc, store_decimal_as_integer=True, compression="brotli")
 
 def _fill_missing_profile(valid: np.ndarray, values: np.ndarray) -> np.ndarray:
@@ -1382,6 +1580,21 @@ def longest_path_decomposition(G: nx.DiGraph, stream_wse_dict: dict[int, list[tu
 
     return paths
 
+def _weighted_median_by_group(group: np.ndarray, value: np.ndarray, weight: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Each group's weighted median: the smallest value whose cumulative weight reaches half the group's total.
+
+    Returns the groups, sorted, and their medians.
+    """
+    order = np.lexsort((value, group))
+    group, value, weight = group[order], value[order], weight[order].astype(np.float64)
+    starts = np.flatnonzero(np.r_[True, group[1:] != group[:-1]])
+    sizes = np.diff(np.r_[starts, len(group)])
+    cumulative = np.cumsum(weight)
+    within = cumulative - np.repeat(cumulative[starts] - weight[starts], sizes)
+    half = np.repeat(np.add.reduceat(weight, starts) / 2, sizes)
+    first = np.minimum.reduceat(np.where(within >= half, np.arange(len(group)), len(group)), starts)
+    return group[starts], value[first]
+
 def _make_fldpln_flood_map(
         filled_dem: np.ndarray,
         vdt_df: pl.DataFrame,
@@ -1394,23 +1607,31 @@ def _make_fldpln_flood_map(
     """Flood depth raster for one event, from VDT stages and a floodplain library.
 
     1. Stream pixels are chained along the network's longest paths.  Along
-       each chain, the stage ``DoF(s)`` of stream pixel ``s`` (its water depth
-       over the filled DEM) is the VDT's water surface minus the filled DEM.
-       Pixels without a VDT value take the water surface interpolated linearly
+       each chain, the stage of stream pixel ``s`` (its water depth over the
+       filled DEM) is the VDT's water surface minus the filled DEM.  Pixels
+       without a VDT value take the water surface interpolated linearly
        between the VDT cells on either side.
-    2. Each library row ``(s, p, DTF, fill)`` whose water reaches ``p``'s
-       filled surface (``DoF(s) - DTF(s, p) > 0``) gives ``p`` the depth
-       ``DoF(s) - DTF(s, p) + fill(p)``: the water above the filled DEM, plus
-       how far the filled DEM sits above the DEM there.  Water that doesn't
-       reach a filled pit's rim never spills into it, however deep the pit.
-       ``p`` keeps the deepest.
+    2. Each segment ``R`` floods at one depth ``DoF(R)``, as the library
+       assumes: the median of its stream pixels' stages, each pixel weighted
+       by the library rows it is the source of, so by the floodplain cells it
+       floods.  That is the single depth closest, summed over those cells, to
+       the stage at each cell's own source.  A library without a ``segment``
+       column (built before reaches were split) floods each reach at one
+       depth.
+    3. Each library row ``(s, p, DTF, fill)`` whose water reaches ``p``'s
+       filled surface (``DoF(R) - DTF(s, p) > 0``, ``R`` being ``s``'s
+       segment) gives ``p`` the depth ``DoF(R) - DTF(s, p) + fill(p)``: the
+       water above the filled DEM, plus how far the filled DEM sits above the
+       DEM there.  Water that doesn't reach a filled pit's rim never spills
+       into it, however deep the pit.  ``p`` keeps the deepest.
 
     Returns the depth where it is above 0, NaN elsewhere.  Only the stream
     pixels of ``filled_dem`` are used, and no DEM is needed.  ``vdt_df`` needs
     ``COMID``, ``Row``, ``Col`` and ``WSE``; ``stream_gdf`` needs the two id
     columns and ``topological_order``.
     """
-    if 'fill' not in fldpln_library.collect_schema().names():
+    columns = fldpln_library.collect_schema().names()
+    if 'fill' not in columns:
         raise ValueError("The FLDPLN library has no fill column. Rebuild it with build_fldpln_library, "
                          "which now takes the DEM the floods are mapped on.")
     nrows, ncols = filled_dem.shape
@@ -1489,17 +1710,45 @@ def _make_fldpln_flood_map(
     if not row_chunks:
         return depth_array
 
-    df = pl.LazyFrame(row_chunks, schema={'FSP': pl.Int32, 'DoF': pl.Float32}, orient='row')
+    # A pixel on two chains keeps its deeper stage
+    stage = (pl.DataFrame(row_chunks, schema={'FSP': pl.Int32, 'DoF': pl.Float32}, orient='row')
+             .group_by('FSP').agg(pl.col('DoF').max()))
+
+    # Each segment's stream pixels, with the library rows each is the source of,
+    # counted a slice at a time like the join below
+    n_library = fldpln_library.select(pl.len()).collect().item()
+    if n_library == 0:
+        return depth_array
+    key = 'segment' if 'segment' in columns else 'FSP'
+    group = ['segment', 'FSP'] if key == 'segment' else ['FSP']
+    votes = pl.concat([
+        fldpln_library.slice(offset, _LIBRARY_SLICE_ROWS).group_by(group).agg(pl.len().alias('rows')).collect()
+        for offset in range(0, n_library, _LIBRARY_SLICE_ROWS)
+    ]).group_by(group).agg(pl.col('rows').sum())
+    if key == 'FSP':
+        # A library built before reaches were split into segments: each reach is one
+        reach_of = pl.DataFrame([(fsp, stream_id) for stream_id, rows in stream_rows.items() for fsp, _ in rows],
+                                schema={'FSP': pl.Int32, 'segment': pl.Int64}, orient='row').unique('FSP')
+        votes = votes.join(reach_of, on='FSP', how='inner')
+    votes = votes.join(stage, on='FSP', how='inner')
+    if votes.is_empty():
+        return depth_array
+    segments, depths = _weighted_median_by_group(votes['segment'].to_numpy(), votes['DoF'].to_numpy(),
+                                                 votes['rows'].to_numpy())
+    df = pl.DataFrame({'segment': segments, 'DoF': depths.astype(np.float32)},
+                      schema_overrides={'segment': votes.schema['segment']})
+    if key == 'FSP':
+        df = reach_of.join(df, on='segment', how='inner').select('FSP', 'DoF')
+    df = df.lazy()
 
     # Join the library a slice at a time and keep only each pixel's deepest water
     # so far, in ``depth_array`` itself: joined whole, the library and its join
     # were several times the size of every raster in the run.
     best = depth_array.ravel()
     best[:] = -np.inf
-    n_library = fldpln_library.select(pl.len()).collect().item()
     for offset in range(0, n_library, _LIBRARY_SLICE_ROWS):
         part = (fldpln_library.slice(offset, _LIBRARY_SLICE_ROWS)
-                .join(df, on='FSP', how='inner')
+                .join(df, on=key, how='inner')
                 .select('FPP', 'DTF', 'fill', 'DoF')
                 .collect())
         # ``DoF - DTF`` is the water above the filled DEM.  Only where it is

@@ -16,14 +16,14 @@ import polars as pl
 import geopandas as gpd
 import polars.selectors as cs
 from pyproj import CRS, Geod
-from numba import njit, prange
+from numba import njit
 from osgeo import gdal, osr, ogr
 
 from shapely.geometry import shape
 from scipy.ndimage import label, generate_binary_structure, distance_transform_edt, uniform_filter
 
 from curve2flood import LOG
-from curve2flood.config import Config, FLDPLN, KERNEL_WEIGHTED, MULTI_POINT, MAPPERS, path_exists
+from curve2flood.config import Config, FLDPLN, KERNEL_WEIGHTED, MULTI_POINT, MAPPERS
 from curve2flood.spreaders import (
     _make_fldpln_flood_map, create_kernel_weighted_spread_map, filter_outliers, compute_tw_multfact_scale, multi_point_interpolation
 )
@@ -329,7 +329,9 @@ def calculate_interpolated_vdt(
     Returns one row per stream cell with ``TopWidth``, ``Depth``, ``WSE`` and
     ``Velocity`` (see ``vdt_interpolate``), measured from the VDT's ``Elev``,
     the channel bed under the cell.  Within each reach, cells outside the
-    1st-99th percentile of top width, WSE or velocity are dropped.
+    1st-99th percentile of top width or velocity are dropped.  WSE isn't
+    filtered: it falls along a reach, so its extremes are the reach's two
+    ends, and dropping them left gaps at every junction.
     """
     LOG.debug('\nOpening and Reading ' + VDTDatabaseFileName)
 
@@ -383,8 +385,8 @@ def calculate_interpolated_vdt(
         pl.col('Velocity').round(2),
     )
 
-    # Drop each reach's outliers
-    cols = ['TopWidth', 'WSE', 'Velocity']
+    # Drop each reach's outliers (not by WSE: see above)
+    cols = ['TopWidth', 'Velocity']
     for col in cols:
         vdt_df = vdt_df.with_columns(
             pl.col(col).quantile(0.01).over("COMID").alias("q01"),
@@ -594,60 +596,6 @@ def CreateSimpleKernelFloodMap(config: Config, RR, CC, T_Rast, W_Rast, S_Rast, E
 
     return Flooded_array[1:-1, 1:-1], Depth_array, Slope_array
 
-@njit(cache=True, parallel=True)
-def spread_Bathy(
-    nrows: int,
-    ncols: int,
-    WeightBox: np.ndarray,
-    TW_for_WeightBox_ElipseMask: int,
-    Bathy: np.ndarray,
-    ARBathyMask: np.ndarray
-):
-    """Weighted sums of the valid bathymetry around each cell of the water mask.
-
-    Returns ``(bathy_times_weight, total_weight)``; their ratio is the
-    inverse-distance-weighted bed elevation.  All arrays are padded by one cell.
-    """
-    bathy_times_weight = np.zeros_like(Bathy, dtype=np.float32)
-    total_weight       = np.zeros_like(Bathy, dtype=np.float32)
-
-    tw = TW_for_WeightBox_ElipseMask
-    valid_donor = (Bathy > -98.99) & (ARBathyMask == 1)
-
-    for r in prange(1, nrows + 1):
-        for c in range(1, ncols + 1):
-            if ARBathyMask[r, c] != 1:
-                continue
-
-            # window in Bathy space (same as the kernel-weighted mapper's)
-            r_min = max(r - tw, 1)
-            r_max = min(r + tw + 1, nrows + 1)
-            c_min = max(c - tw, 1)
-            c_max = min(c + tw + 1, ncols + 1)
-
-            # corresponding window in WeightBox (centered on [tw, tw])
-            w_r_min = tw - (r - r_min)
-            w_c_min = tw - (c - c_min)
-
-            acc_val = 0.0
-            acc_w = 0.0
-
-            for rr in range(r_min, r_max):
-                wr = w_r_min + (rr - r_min)
-                for cc in range(c_min, c_max):
-                    if not valid_donor[rr, cc]:
-                        continue
-                    wc = w_c_min + (cc - c_min)
-                    w = WeightBox[wr, wc]
-
-                    acc_val += Bathy[rr, cc] * w
-                    acc_w += w
-
-            bathy_times_weight[r, c] = acc_val
-            total_weight[r, c] = acc_w
-
-    return bathy_times_weight, total_weight
-
 def uniform_smoothing(mask: np.ndarray, values: np.ndarray):
     """Replace ``values``, in place, by their 3x3 mean over the cells where ``mask`` is True.
 
@@ -660,49 +608,21 @@ def uniform_smoothing(mask: np.ndarray, values: np.ndarray):
     np.divide(value_sum, count, out=values, where=count > 0)
 
 
-def Create_Topobathy_Dataset(
-    E: np.ndarray,
-    nrows: int,
-    ncols: int,
-    WeightBox: np.ndarray,
-    TW_for_WeightBox_ElipseMask: int,
-    Bathy: np.ndarray,
-    ARBathyMask: np.ndarray,
-    Bathy_Use_Banks: bool
-):
-    """Blend ARC's bathymetry into the DEM, in place in ``Bathy``.
+def Create_Topobathy_Dataset(E: np.ndarray, Bathy: np.ndarray, Bathy_Use_Banks: bool) -> np.ndarray:
+    """The DEM ``E`` with ARC's bathymetry ``Bathy`` burned in: ARC's bed
+    elevation wherever it has one (finite), and the DEM elsewhere.  Unless
+    ``Bathy_Use_Banks`` is set, the result is never above the DEM.
 
-    Inside the water mask, cells without a bed elevation get the
-    inverse-distance-weighted bed elevation of their neighbours (or the DEM if
-    none is in reach).  Outside it the DEM is used.  Unless
-    ``Bathy_Use_Banks`` is set, the result is never above the DEM.  ``E``,
-    ``Bathy`` and ``ARBathyMask`` are padded by one cell.
+    ARC has already decided where its channel goes and filled the small gaps
+    between its cross sections, so its raster is taken as it is: each rating
+    curve's cell keeps the bed its curve was worked out on (the VDT's
+    ``Elev``), and the channel keeps the banks its cross sections were carved
+    with.
     """
-    # Outside the mask, missing bathymetry is the DEM before anything is spread
-    mask = (Bathy < -98.99) & (ARBathyMask == 0)
-    Bathy[mask] = E[mask]
-
-    bathy_times_weight, total_weight = spread_Bathy(nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, Bathy, ARBathyMask)
-
-    # Fill only the cells without bathymetry
-    invalid = (Bathy <= -98.99) | np.isnan(Bathy)
-
-    use_weight = invalid & (total_weight > 1e-10)
-    use_dem    = invalid & ~use_weight
-
-    Bathy[use_weight] = bathy_times_weight[use_weight] / total_weight[use_weight]
-    Bathy[use_dem] = E[use_dem]
-
-    # Outside the AR bathy mask, always use DEM
-    mask = ARBathyMask != 1
-    Bathy[mask] = E[mask]
-
-    # Final safety net: any remaining bad values from DEM
-    mask = (Bathy <= -98.99) | np.isnan(Bathy)
-    Bathy[mask] = E[mask]
-
+    burned = np.where(np.isfinite(Bathy), Bathy, E).astype(np.float32)
     if not Bathy_Use_Banks:
-        np.minimum(Bathy, E, out=Bathy)
+        np.minimum(burned, E, out=burned)
+    return burned
 
 def Calculate_Depth_TopWidth_TWMax_Velocity(config: Config, COMID_Unique_Flow, COMID_Unique, T_Rast, W_Rast, S_Rast, quiet):
     """Fill the per-cell rasters for one flow event and summarise each reach.
@@ -946,33 +866,25 @@ def create_depth(
 
 
 def create_bathymetry(config: Config, E: np.ndarray, nrows: int, ncols: int, dem_geotransform: tuple, dem_projection: str,
-                      Flood_Ensemble: np.ndarray, WeightBox: np.ndarray, TW_for_WeightBox_ElipseMask: int, bathymetry_creation_options: list[str] = None):
-    """Write the topobathymetric DEM (``FSOutBATHY``).
-
-    ARC's bed elevations (``BATHY_Out_File``) are used inside the water mask:
-    the ``BathyWaterMask`` raster, or the flood map when that file does not
-    exist.  See ``Create_Topobathy_Dataset``.
+                      bathymetry_creation_options: list[str] = None):
+    """Write the topobathymetric DEM (``FSOutBATHY``): the DEM with ARC's
+    bathymetry (``BATHY_Out_File``) burned in (see ``Create_Topobathy_Dataset``).
+    ``E`` is the DEM padded by one cell.
     """
     LOG.info('Working on Bathymetry')
     ds: gdal.Dataset = gdal.Open(config.bathy_out_file)
-    ARBathy = np.full((nrows+2, ncols+2), -9999.0, dtype=np.float32)
-    ARBathy[1:-1, 1:-1] = ds.ReadAsArray().astype(np.float32)
+    band = ds.GetRasterBand(1)
+    bathy = band.ReadAsArray().astype(np.float32)
+    nodata = band.GetNoDataValue()
     ds = None
+    if bathy.shape != (nrows, ncols):
+        raise ValueError(f"The bathymetry raster {config.bathy_out_file} is {bathy.shape[0]} by {bathy.shape[1]} "
+                         f"cells, and the DEM {nrows} by {ncols}.")
+    if nodata is not None:
+        bathy[bathy == nodata] = np.nan
 
-    ARBathyMask = np.zeros((nrows+2,ncols+2), dtype=np.bool_)
-    if path_exists(config.bathywatermask):
-        ds = gdal.Open(config.bathywatermask)
-        ARBathyMask[1:-1, 1:-1] = ds.ReadAsArray() > 0
-        ds = None
-    else:
-        ARBathyMask[1:-1, 1:-1] = Flood_Ensemble > 0
-
-    ARBathy[np.isnan(ARBathy)] = -99.000  #This converts all nan values to a -99
-    ARBathy = ARBathy * ARBathyMask
-    ARBathy[ARBathyMask != 1] = -9999.000
-    Create_Topobathy_Dataset(E, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, ARBathy, ARBathyMask, config.bathy_use_banks)
-
-    Write_Output_Raster(config.fsoutbathy, ARBathy[1:-1, 1:-1], ncols, nrows, dem_geotransform, dem_projection, "GTiff", gdal.GDT_Float32, config.compression, bathymetry_creation_options)
+    burned = Create_Topobathy_Dataset(E[1:-1, 1:-1], bathy, config.bathy_use_banks)
+    Write_Output_Raster(config.fsoutbathy, burned, ncols, nrows, dem_geotransform, dem_projection, "GTiff", gdal.GDT_Float32, config.compression, bathymetry_creation_options)
 
 def _check_dem_units(dem_projection: str):
     """Raise a ValueError unless the DEM's coordinate system is in metres or degrees."""
@@ -1289,19 +1201,16 @@ def Curve2Flood_MainFunction(input_file: str | os.PathLike | Config = None,
 
     LOG.info('Creating the Weight Box')
     TW_for_WeightBox_ElipseMask = int( max( np.round(config.topwidthplausiblelimit/dx,0), np.round(config.topwidthplausiblelimit/dy,0) ) )  # Half width of the weight box, in cells
-    if config.mapper == FLDPLN and not bathymetry:
-        WeightBox = None
-    else:
+    # Only the kernel-weighted and multi-point mappers spread with it
+    WeightBox = None
+    if config.needs_flood_map and config.mapper != FLDPLN:
         WeightBox = create_weightbox(TW_for_WeightBox_ElipseMask, dx, dy)
 
-    Flood_Ensemble = None
     if config.needs_flood_map:
-        Flood_Ensemble = main_flood_ouputs(config, E, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, dx, dy,
-                                           dem_projection, dem_geotransform, quiet=quiet, flood_vdt_cells=flood_vdt_cells)
+        main_flood_ouputs(config, E, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, dx, dy,
+                          dem_projection, dem_geotransform, quiet=quiet, flood_vdt_cells=flood_vdt_cells)
 
     if bathymetry:
-        create_bathymetry(config, E, nrows, ncols, dem_geotransform, dem_projection,
-                           Flood_Ensemble, WeightBox, TW_for_WeightBox_ElipseMask,
-                          bathymetry_creation_options)
+        create_bathymetry(config, E, nrows, ncols, dem_geotransform, dem_projection, bathymetry_creation_options)
 
     LOG.info("Flood mapping completed.")

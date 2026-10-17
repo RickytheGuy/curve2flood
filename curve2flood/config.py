@@ -130,7 +130,8 @@ class Config:
     # Bathymetry, written only when both bathy_out_file (ARC's) and fsoutbathy are given
     bathy_out_file: str | None = None
     fsoutbathy: str | None = None
-    # Where the water is (its cells above 0), on the DEM's grid. ARC reads it too.
+    # Where the water is (its cells above 0), on the DEM's grid: flooded with flood_bathy_mask. ARC puts its banks
+    # where its water ends; the bathymetry isn't clipped to it.
     bathywatermask: str | None = None
     bathy_use_banks: bool = False
 
@@ -278,10 +279,8 @@ class Config:
 
     @property
     def needs_flood_map(self) -> bool:
-        """Whether a flood map is needed: for an output raster, or as the bathymetry's water mask when
-        bathywatermask doesn't exist."""
-        return bool(self.outfld or self.outdep or self.outwse or self.outvel
-                    or (self.makes_bathymetry and not path_exists(self.bathywatermask)))
+        """Whether a flood map is needed, for an output raster."""
+        return bool(self.outfld or self.outdep or self.outwse or self.outvel)
 
     @property
     def multi_point_options(self) -> dict:
