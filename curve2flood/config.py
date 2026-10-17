@@ -37,9 +37,8 @@ _REMOVED_KEYS = {
     'fldpln_max_wse_rise': "the FLDPLN mapper no longer caps how fast the water surface rises",
     'median_filter_size': "the FLDPLN mapper no longer smooths the stages with a running median",
     'fldpln_median_filter_size': "the FLDPLN mapper no longer smooths the stages with a running median",
-    'max_drop_below_source': "it is set when the library is built, by build_fldpln_library's max_drop_below_source",
-    'fldpln_max_drop_below_source': "it is set when the library is built, by build_fldpln_library's "
-                                    "max_drop_below_source",
+    'max_drop_below_source': "FLDPLN no longer limits how far below its stream pixel a cell may lie",
+    'fldpln_max_drop_below_source': "FLDPLN no longer limits how far below its stream pixel a cell may lie",
 }
 
 _TRUE = {'true', 'yes', 'y', 'on', '1'}

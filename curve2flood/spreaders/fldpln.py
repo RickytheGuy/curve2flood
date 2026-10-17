@@ -192,6 +192,101 @@ def _downstream_exclusion(stream_id: int, stream_info: np.ndarray, fdr: np.ndarr
 
 
 # ---------------------------------------------------------------------------
+# The channel beside TD(R)
+#
+# TD(R) is a one-pixel line, but a river is wider: water that may not enter the
+# stream line below its segment's end runs down the channel beside it, past the
+# end, as far as the channel goes (descending is free).  Below the Karnali's
+# Chisapani gorge that flooded a 1,000 km2 fan from one gorge segment.  Given a
+# water mask, TD(R) also takes the water cells whose D8 path first meets the
+# stream network inside it: the channel downstream of R, not its tributaries'.
+# ---------------------------------------------------------------------------
+
+@njit(cache=True, nogil=True)
+def _network_pixels(stream_info: np.ndarray, fdr: np.ndarray, nrows: int, ncols: int) -> np.ndarray:
+    """Which pixels are on the stream network: each reach's, walked ``length`` pixels down the FDR from its start
+    as ``_segment_pixels`` walks them."""
+    on_network = np.zeros(nrows * ncols, dtype=np.bool_)
+    for i in range(stream_info.shape[0]):
+        current = stream_info[i, 0]
+        length = stream_info[i, 2]
+        for step in range(length):
+            if step > 0:
+                current = _next_downstream(current, fdr, nrows, ncols)
+                if current == -1:
+                    break
+            on_network[current] = True
+    return on_network
+
+
+@njit(cache=True, nogil=True)
+def _first_network_pixel(starts: np.ndarray, fdr: np.ndarray, on_network: np.ndarray, nrows: int,
+                         ncols: int) -> np.ndarray:
+    """The first network pixel on the D8 path from each of ``starts`` (itself if it is one), or -1 for a path that
+    ends at a sink, the raster's edge or a loop first.  Each path is walked once: the cells on it remember where it
+    led."""
+    unknown, walking = -2, -3
+    found = np.full(nrows * ncols, unknown, dtype=np.int64)
+    path = np.empty(nrows * ncols, dtype=np.int64)
+    result = np.empty(starts.size, dtype=np.int64)
+    for i in range(starts.size):
+        current = starts[i]
+        n = 0
+        while True:
+            if found[current] == walking:   # a loop in the FDR
+                hit = -1
+                break
+            if found[current] != unknown:
+                hit = found[current]
+                break
+            if on_network[current]:
+                hit = current
+                break
+            found[current] = walking
+            path[n] = current
+            n += 1
+            nxt = _next_downstream(current, fdr, nrows, ncols)
+            if nxt == -1:
+                hit = -1
+                break
+            current = nxt
+        for k in range(n):
+            found[path[k]] = hit
+        result[i] = hit
+    return result
+
+
+def _channel_cells(flow_direction: np.ndarray, stream_info: np.ndarray, water: np.ndarray
+                   ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The water cells off the stream network, grouped by the network pixel their D8 path first meets: the
+    group of pixel ``keys[i]`` is ``cells[starts[i]:starts[i + 1]]``, ``keys`` sorted.  Cells whose path meets no
+    network pixel are left out."""
+    nrows, ncols = flow_direction.shape
+    flat_fdr = np.ascontiguousarray(flow_direction, dtype=np.uint8).ravel()
+    on_network = _network_pixels(np.ascontiguousarray(stream_info, dtype=np.int64), flat_fdr, nrows, ncols)
+    candidates = np.flatnonzero(np.asarray(water, dtype=bool).ravel() & ~on_network)
+    hits = _first_network_pixel(candidates, flat_fdr, on_network, nrows, ncols)
+    meets = hits >= 0
+    hits, candidates = hits[meets], candidates[meets]
+    order = np.argsort(hits, kind="stable")
+    hits, cells = hits[order], candidates[order]
+    first = np.flatnonzero(np.r_[True, hits[1:] != hits[:-1]]) if hits.size else np.empty(0, np.int64)
+    return hits[first], np.r_[first, hits.size].astype(np.int64), cells
+
+
+def _widen_downstream(downstream: np.ndarray, channel: tuple[np.ndarray, np.ndarray, np.ndarray]) -> np.ndarray:
+    """TD(R) (``downstream``, its stream pixels) with the channel cells that drain first into them."""
+    keys, starts, cells = channel
+    if downstream.size == 0 or keys.size == 0:
+        return downstream
+    at = np.minimum(np.searchsorted(keys, downstream), keys.size - 1)
+    groups = at[keys[at] == downstream]
+    if groups.size == 0:
+        return downstream
+    return np.concatenate([downstream] + [cells[starts[g]:starts[g + 1]] for g in groups])
+
+
+# ---------------------------------------------------------------------------
 # Windowing
 #
 # Every solver works on a crop of the rasters surrounded by a one-cell halo of
@@ -297,8 +392,7 @@ def _heap_pop(heap: np.ndarray, n: int) -> tuple[int, int]:
 def _solve_exact(fil: np.ndarray, fdr: np.ndarray, ncols: int,
                  sources: np.ndarray, excluded: np.ndarray,
                  fldmn: float, fldmx: float, global_max_wse: float,
-                 bg: float, spill_decay: float, max_cells: int = 0,
-                 max_below: float = np.inf):
+                 bg: float, spill_decay: float, max_cells: int = 0):
     """Dijkstra over ``w(u -> v) = max(0, E(v) - E(u))`` on the 8-neighbourhood.
 
     Returns ``(cells, dtf, fsp, depth_limit)`` in window-local flat ids.
@@ -310,8 +404,7 @@ def _solve_exact(fil: np.ndarray, fdr: np.ndarray, ncols: int,
     ``d`` of the next cell and keeps only the cells shallower than ``d``: the
     floodplain an ``fldmx`` just below ``d`` would give.  ``depth_limit`` is
     ``d`` in metres, or -1 when the cap was not reached.  Cells flooded at zero
-    depth are always kept, and cells more than ``max_below`` metres below their
-    source do not count toward the cap (the caller leaves them out).
+    depth are always kept.
 
     The pixels downstream of the segment (``excluded``) are not a wall.  As in
     the depth-stepped algorithm, backfill may enter them, lateral spillover may
@@ -352,22 +445,19 @@ def _solve_exact(fil: np.ndarray, fdr: np.ndarray, ncols: int,
 
     stop = np.int64(-1)
     n_settled = 0
-    n_kept = 0
     while heap_n > 0:
         key, heap_n = _heap_pop(heap, heap_n)
         pixel = np.int32(key & np.int64(0xFFFFFFFF))
         depth = np.int64(key >> 32)
         if settled[pixel] or depth != dist[pixel]:
             continue
-        if max_cells > 0 and n_kept >= max_cells and depth > 0:
+        if max_cells > 0 and n_settled >= max_cells and depth > 0:
             stop = depth
             break
         settled[pixel] = True
         n_settled += 1
 
         elevation = fil[pixel]
-        if fil[fsp[pixel]] - elevation <= max_below:
-            n_kept += 1
         from_excluded = excluded[pixel]
         code = fdr[pixel]
 
@@ -818,8 +908,8 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
                                bg: float = -9999,
                                spill_decay: float = 0.0,
                                solver: str = "exact",
-                               max_drop_below_source: float | None = None,
-                               max_cells: int = 0) -> pd.DataFrame:
+                               max_cells: int = 0,
+                               channel: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None) -> pd.DataFrame:
     """Floodplain table for one stream segment.
 
     Parameters
@@ -849,14 +939,14 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
         DTF added per pixel along a spillover path, to shorten spills.
     solver : {"exact", "iterative"}, optional
         See the module docstring.
-    max_drop_below_source : float, optional
-        Leave out cells more than this many metres below the stream pixel that
-        floods them, on the filled DEM.  Going downhill costs no depth, so on
-        slopes these are most of the table.  None keeps every cell.
     max_cells : int, optional
         Most rows the segment may have (0 for no limit).  A segment that would
         flood more stops at the shallowest depth that exceeds it, recorded in
         ``attrs["depth_limit"]``.  Exact solver only.
+    channel : tuple, optional
+        The water cells grouped by the network pixel they first drain to
+        (``_channel_cells``).  TD(R) then also takes the groups of its pixels:
+        the channel below the segment, not only its stream line.
 
     Returns
     -------
@@ -882,13 +972,13 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
     # The 0.99999 is carried over from the MATLAB reference
     global_max_wse = np.finfo(np.float32).max if not global_max_wse else 0.99999 * global_max_wse
 
-    max_below = np.inf if max_drop_below_source is None else float(max_drop_below_source)
-
     flat_fdr = flow_direction.ravel()
     stream_pixels = np.asarray(
         _segment_pixels(stream_id, stream_info, flat_fdr, nrows, ncols), dtype=np.int64)
     downstream = _downstream_exclusion(stream_id, stream_info, flat_fdr, nrows, ncols)
     downstream = np.fromiter(downstream, dtype=np.int64, count=len(downstream))
+    if channel is not None:
+        downstream = _widen_downstream(downstream, channel)
 
     header = ["FSP", "FPP", "DTF"]
     if stream_pixels.size == 0:
@@ -926,7 +1016,7 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
         if solver == "exact":
             cells, values, source_of, depth_limit = _solve_exact(
                 win_fil, win_fdr, wc, sources, win_excluded,
-                fldmn, fldmx, global_max_wse, bg, spill_decay, max_cells, max_below)
+                fldmn, fldmx, global_max_wse, bg, spill_decay, max_cells)
         else:
             cells, values, source_of = _solve_iterative(
                 win_fil, win_fdr, wc, sources, win_excluded,
@@ -940,11 +1030,6 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
         level = [min(i + t, len(margins) - 1) for i, t in zip(level, touched)]
         # Free this window before cropping the next one
         del win_fil, win_fdr, win_excluded, cells, values, source_of
-
-    # Left out only now, so that cells reached through them still grow the window
-    if max_drop_below_source is not None:
-        kept = win_fil[source_of] - win_fil[cells] <= max_below
-        cells, values, source_of = cells[kept], values[kept], source_of[kept]
 
     fpp = _to_global(cells, ncols, r0, c0, wc)
     fsp = _to_global(source_of, ncols, r0, c0, wc)
@@ -1137,15 +1222,19 @@ def _segments(stream_info: np.ndarray, stream_ids: np.ndarray, max_depths, flat_
             caps.append(piece_cap)
     return np.array(rows, dtype=np.int64).reshape(-1, 4), caps, n_split
 
-def _solve_segment(filled_dem: np.ndarray, flow_direction: np.ndarray, args) -> pd.DataFrame:
-    """One segment's rows, with its ``segment`` number (``args`` as fldpln_library_for_segment takes them)."""
-    table = fldpln_library_for_segment(filled_dem, flow_direction, *args)
+def _solve_segment(filled_dem: np.ndarray, flow_direction: np.ndarray, args, channel=None) -> pd.DataFrame:
+    """One segment's rows, with its ``segment`` number (``args`` as fldpln_library_for_segment takes them, and the
+    channel cells, if any)."""
+    table = fldpln_library_for_segment(filled_dem, flow_direction, *args, channel=channel)
     table["segment"] = np.int32(args[0])
     return table
 
+# A worker's channel cells, set once by init_parallel rather than pickled with every task
+_WORKER_CHANNEL = None
+
 def run_parallel(args):
     """Worker: solve one segment on the shared rasters."""
-    return _solve_segment(globals()['filled_dem_array'], globals()['flow_direction_array'], args)
+    return _solve_segment(globals()['filled_dem_array'], globals()['flow_direction_array'], args, _WORKER_CHANNEL)
 
 def close_shared_memory(names: list[str]):
     """Close and unlink the named shared-memory blocks."""
@@ -1161,8 +1250,12 @@ def init_parallel(
     names: list[str],
     shapes: list[tuple],
     dtypes: list[np.dtype],
+    channel: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ):
-    """Worker initialiser: attach the shared rasters as module globals, so they are not pickled per task."""
+    """Worker initialiser: attach the shared rasters as module globals, and keep the channel cells, so they are not
+    pickled per task."""
+    global _WORKER_CHANNEL
+    _WORKER_CHANNEL = channel
     shms = [shared_memory.SharedMemory(name=name) for name in names]
 
     for shm, name, shape, dtype in zip(shms, names, shapes, dtypes):
@@ -1189,10 +1282,10 @@ def build_fldpln_library(
     processes: int | None = None,
     spill_decay: float = 0.0,
     solver: str = "exact",
-    max_drop_below_source: float | None = None,
     max_cells_per_segment: int | None = None,
     max_reach_length: float | None = 5000.0,
-    max_profile_deviation: float | None = 1.0
+    max_profile_deviation: float | None = 1.0,
+    water_mask: np.ndarray | None = None
 ):
     """Build the FLDPLN floodplain library for every stream segment and save it.
 
@@ -1255,13 +1348,6 @@ def build_fldpln_library(
         trims little (see the FLDPLN docs).  0 (default) for none.
     solver: str
         ``"exact"`` (default) or ``"iterative"``; see the module docstring.
-    max_drop_below_source: float | None
-        Leave out cells more than this many metres below the stream pixel that
-        floods them, on the filled DEM, whatever the depth.  Going downhill
-        costs no depth, so without this a stream pixel on a slope floods the
-        whole hillside below it, as deep as the water at the stream; the mapper
-        has no limit of its own.  On slopes such cells are most of the library.
-        None (default) keeps every cell.
     max_cells_per_segment: int | None
         Most rows one segment may contribute.  A segment that would flood more
         stops at the depth where it fills up, so deeper floods there are mapped
@@ -1282,14 +1368,25 @@ def build_fldpln_library(
         ``max_reach_length``.  One depth per segment fits a straight bed
         best: the stage jumps at a step and where a filled flat begins.
         1 m (default) did best on 68 US test sites; None makes no such cuts.
+    water_mask: np.ndarray | None
+        The river's water, such as the bathymetry water mask; same shape as
+        the DEM, positive for water.  Each segment's ``TD(R)``, the cells below
+        its end that its water may not spill into, is then the channel below
+        it and not only the stream line: every water cell whose D8 path first
+        meets the stream network inside ``TD(R)`` joins it.  With the line
+        alone, water runs down the channel beside it, past the segment's end:
+        below the Karnali's Chisapani gorge, one gorge segment flooded 920 km2
+        of its fan at the 2-year flow (80 km2 of the whole site with the
+        channel); the 68 US test sites score the same either way (mean MCC
+        0.5629 against 0.5639).  None (default) keeps the line alone.
     """
     try:
         _build_fldpln_library(
             dem, filled_dem, stream_info_file, flow_direction_file, library_file,
             dh, fldmn, fldmx, iterative_spill, vdt_file, stream_ids,
             global_max_wse, bg, parallel, pbar, processes, bg_mask,
-            spill_decay, solver, max_drop_below_source, max_cells_per_segment, max_reach_length,
-            max_profile_deviation
+            spill_decay, solver, max_cells_per_segment, max_reach_length,
+            max_profile_deviation, water_mask
         )
     finally:
         close_shared_memory(['filled_dem_array', 'flow_direction_array'])
@@ -1314,16 +1411,14 @@ def _build_fldpln_library(
     bg_mask: np.ndarray | None = None,
     spill_decay: float = 0.0,
     solver: str = "exact",
-    max_drop_below_source: float | None = None,
     max_cells_per_segment: int | None = None,
     max_reach_length: float | None = 5000.0,
-    max_profile_deviation: float | None = 1.0
+    max_profile_deviation: float | None = 1.0,
+    water_mask: np.ndarray | None = None
 ):
     """``build_fldpln_library`` without the shared-memory cleanup."""
     if solver not in SOLVERS:
         raise ValueError(f"solver must be one of {SOLVERS}, got {solver!r}.")
-    if max_drop_below_source is not None and not max_drop_below_source >= 0:
-        raise ValueError(f"max_drop_below_source must be at least 0 or None, got {max_drop_below_source!r}.")
     if max_cells_per_segment is not None and (int(max_cells_per_segment) != max_cells_per_segment or max_cells_per_segment < 1):
         raise ValueError(f"max_cells_per_segment must be a positive whole number or None, got {max_cells_per_segment!r}.")
     if max_cells_per_segment is not None and solver != "exact":
@@ -1341,6 +1436,8 @@ def _build_fldpln_library(
         stream_info = pd.read_csv(stream_info_file)
     assert stream_info.ndim == 2, "Stream info file must be a 2D table"
     assert stream_info.shape[1] == 4, "Stream info file must have 4 columns: start pixel (0), end pixel (1), length (2), and stream ID (3)"
+    # The whole network, for the channel cells: water draining to a reach left out below is still that reach's
+    network = stream_info.values.astype(np.int64)
 
     if stream_ids is not None:
         stream_info = stream_info[stream_info.iloc[:, 3].isin(stream_ids)]
@@ -1356,6 +1453,16 @@ def _build_fldpln_library(
         bg_mask = np.asarray(bg_mask, dtype=bool)
         if bg_mask.shape != filled_dem_array.shape:
             raise ValueError(f"bg_mask has shape {bg_mask.shape}, but the filled DEM has {filled_dem_array.shape}.")
+
+    channel = None
+    if water_mask is not None:
+        water_mask = np.asarray(water_mask)
+        if water_mask.shape != filled_dem_array.shape:
+            raise ValueError(f"water_mask has shape {water_mask.shape}, but the filled DEM has "
+                             f"{filled_dem_array.shape}.")
+        channel = _channel_cells(flow_direction_array, network, water_mask > 0)  # NaN and no-data aren't water
+        LOG.info(f"TD(R) takes in the channel: {channel[2].size:,} water cells drain first to "
+                 f"{channel[0].size:,} stream pixels.")
 
     stream_ids = stream_info.iloc[:, 3].unique()
     vdt_depth: dict[int, float] = {}
@@ -1435,7 +1542,6 @@ def _build_fldpln_library(
             bg,
             spill_decay,
             solver,
-            max_drop_below_source,
             max_cells
         )
         for i, segment in enumerate(segments[:, 3])
@@ -1453,12 +1559,12 @@ def _build_fldpln_library(
         names = ['filled_dem_array', 'flow_direction_array']
         shapes = [filled_dem_array.shape, flow_direction_array.shape]
         dtypes = [filled_dem_array.dtype, flow_direction_array.dtype]
-        with mp.Pool(processes, init_parallel, (names, shapes, dtypes)) as pool:
+        with mp.Pool(processes, init_parallel, (names, shapes, dtypes, channel)) as pool:
             for df in pbar(pool.imap_unordered(run_parallel, args), total=len(args), desc="Processing streams in parallel"):
                 dfs.append(df)
     else:
         for task in pbar(args, desc="Processing streams"):
-            dfs.append(_solve_segment(filled_dem_array, flow_direction_array, task))
+            dfs.append(_solve_segment(filled_dem_array, flow_direction_array, task, channel))
 
     fill_depth = _fill_depth(dem, filled_dem_array, bg)
     close_shared_memory(['filled_dem_array', 'flow_direction_array'])
@@ -1620,10 +1726,15 @@ def _make_fldpln_flood_map(
        depth.
     3. Each library row ``(s, p, DTF, fill)`` whose water reaches ``p``'s
        filled surface (``DoF(R) - DTF(s, p) > 0``, ``R`` being ``s``'s
-       segment) gives ``p`` the depth ``DoF(R) - DTF(s, p) + fill(p)``: the
-       water above the filled DEM, plus how far the filled DEM sits above the
-       DEM there.  Water that doesn't reach a filled pit's rim never spills
-       into it, however deep the pit.  ``p`` keeps the deepest.
+       segment) gives ``p`` the depth ``DoF(R) - DTF(s, p) + max(fill(p), 0)``:
+       the water above the filled DEM, plus how far the filled DEM sits above
+       the DEM there.  Water that doesn't reach a filled pit's rim never spills
+       into it, however deep the pit.  ``p`` keeps the deepest.  Where the DEM
+       sits above the filled DEM (bathymetry raised above the ground the
+       library was routed on), the fill is 0: the water was routed across
+       the filled surface, so it covers the cell wherever it reaches that
+       surface, and the depth is measured from it.  Otherwise a raised cell
+       inside the channel, routed through, read as a dry hole.
 
     Returns the depth where it is above 0, NaN elsewhere.  Only the stream
     pixels of ``filled_dem`` are used, and no DEM is needed.  ``vdt_df`` needs
@@ -1754,9 +1865,10 @@ def _make_fldpln_flood_map(
         # ``DoF - DTF`` is the water above the filled DEM.  Only where it is
         # positive does the water reach the cell, and then the fill adds the
         # depth below the filled surface, as in a filled pit or a burned channel.
+        # A negative fill, raised bathymetry, takes nothing away (see above).
         head = part['DoF'].to_numpy() - part['DTF'].to_numpy()
         reaches = head > 0
-        depth = head[reaches] + part['fill'].to_numpy()[reaches]
+        depth = head[reaches] + np.maximum(part['fill'].to_numpy()[reaches], 0.0)
         np.maximum.at(best, part['FPP'].to_numpy()[reaches], depth.astype(np.float32, copy=False))
     depth_array[~(depth_array > 0)] = np.nan
 

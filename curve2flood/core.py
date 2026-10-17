@@ -865,6 +865,18 @@ def create_depth(
     return Flood_Flooded_Cells_in_Map(max_vals, Flood_Ensemble, eps=0.01)
 
 
+def water_surface(depth: np.ndarray, dem: np.ndarray, filled_dem: np.ndarray | None = None) -> np.ndarray:
+    """The water surface elevation where the depth is above 0 and the DEM has a value, NaN elsewhere.
+
+    The depth is measured from the DEM, except with the FLDPLN mapper (``filled_dem`` given), which measures it from
+    the lower of the DEM and the filled DEM: where bathymetry raises the DEM above the filled DEM, the water was
+    routed across the filled surface and its depth taken from there (see ``_make_fldpln_flood_map``), and the water
+    surface must be too, or it would stand above its neighbours by the raise.
+    """
+    ground = dem if filled_dem is None else np.where(filled_dem > -9998.0, np.minimum(dem, filled_dem), dem)
+    return np.where((depth > 0) & (dem > -9998.0), depth + ground, np.nan).astype(np.float32)
+
+
 def create_bathymetry(config: Config, E: np.ndarray, nrows: int, ncols: int, dem_geotransform: tuple, dem_projection: str,
                       bathymetry_creation_options: list[str] = None):
     """Write the topobathymetric DEM (``FSOutBATHY``): the DEM with ARC's
@@ -1096,7 +1108,7 @@ def main_flood_ouputs(
             ds = None
 
     if OutWSE:
-        WSE_Array = np.where((Depth_Array > 0) & (E[1:-1, 1:-1] > -9998.0), Depth_Array+E[1:-1, 1:-1], np.nan).astype(np.float32)
+        WSE_Array = water_surface(Depth_Array, E[1:-1, 1:-1], filled_dem if config.mapper == FLDPLN else None)
 
         driver = gdal.GetDriverByName("GTiff")
         ds: gdal.Dataset = driver.Create(
