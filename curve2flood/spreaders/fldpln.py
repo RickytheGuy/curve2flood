@@ -40,19 +40,16 @@ indices, ``row * ncols + col``.
 
 from __future__ import annotations
 
+import os
 import math
-import geopandas as gpd
-import multiprocessing as mp
-from collections import defaultdict
 from pathlib import Path
-from multiprocessing import shared_memory
+from concurrent.futures import ThreadPoolExecutor
 
 import tqdm
 import numpy as np
 import polars as pl
 import pandas as pd
 import pyarrow as pa
-import networkx as nx
 import pyarrow.parquet as pq
 import pyarrow.compute as pc
 from numba import njit
@@ -64,8 +61,6 @@ from curve2flood import LOG
 # Columns stored as 2-decimal numbers.  A fill can be deep (a pit filled to its
 # rim), so it gets more digits than a DTF, which is at most the library's fldmx.
 DECIMAL_COLS = {"DTF": pa.decimal32(5, 2), "fill": pa.decimal32(7, 2)}
-
-_SHARED_MEMORYS = {}
 
 # Neighbour order:
 # 1 2 3
@@ -112,7 +107,7 @@ _WINDOW_MARGINS = (128, 384, 1152)
 # leaving an int32 range worth hundreds of kilometres of depth.
 _DTF_UNITS_PER_METRE = 10000.0
 
-# Library rows the mapper joins at a time: one row group of a library written by
+# Library rows written and read at a time: one row group of a library written by
 # save_library.
 _LIBRARY_SLICE_ROWS = 1 << 20
 
@@ -128,34 +123,43 @@ def _rc_to_pixel(row: int, col: int, ncols: int) -> int:
 @register_jitable(cache=True, nogil=True)
 def _next_downstream(pixel: int, fdr: np.ndarray, nrows: int, ncols: int) -> int:
     """The pixel ``pixel`` drains into, or -1 at a sink or the raster edge."""
-    # Whitebox D8 code -> (row, col) step
-    OUTFLOW = {
-        np.uint8(64): (-1, -1),
-        np.uint8(128): (-1, 0),
-        np.uint8(1): (-1, 1),
-        np.uint8(32): (0, -1),
-        np.uint8(2): (0, 1),
-        np.uint8(16): (1, -1),
-        np.uint8(8): (1, 0),
-        np.uint8(4): (1, 1),
-    }
-
     fd = fdr[pixel]
     if fd == 0:
         return -1
 
+    # Whitebox D8 code -> (row, col) step.  Branches, not a lookup table: a
+    # table built on every call was most of the cost of walking the network.
     row, col = _pixel_to_rc(pixel, ncols)
-    dr, dc = OUTFLOW[fd]
-    rr = row + dr
-    cc = col + dc
-    if rr < 0 or rr >= nrows or cc < 0 or cc >= ncols:
+    if fd == 1:
+        row -= 1
+        col += 1
+    elif fd == 2:
+        col += 1
+    elif fd == 4:
+        row += 1
+        col += 1
+    elif fd == 8:
+        row += 1
+    elif fd == 16:
+        row += 1
+        col -= 1
+    elif fd == 32:
+        col -= 1
+    elif fd == 64:
+        row -= 1
+        col -= 1
+    elif fd == 128:
+        row -= 1
+    else:
+        raise ValueError("Not a WhiteboxTools D8 flow direction code.")
+    if row < 0 or row >= nrows or col < 0 or col >= ncols:
         return -1
-    return _rc_to_pixel(rr, cc, ncols)
+    return _rc_to_pixel(row, col, ncols)
 
 
 @njit(cache=True, nogil=True)
 def _segment_pixels(stream_id: int, stream_info: np.ndarray, fdr: np.ndarray,
-                    nrows: int, ncols: int) -> list[int]:
+                    nrows: int, ncols: int) -> np.ndarray:
     """Return stream pixels for a segment id, walking the FDR downstream."""
     mask = stream_info[:, 3] == stream_id
     if not np.any(mask):
@@ -164,38 +168,59 @@ def _segment_pixels(stream_id: int, stream_info: np.ndarray, fdr: np.ndarray,
     start = stream_info[mask, 0][0]
     length = stream_info[mask, 2][0]
 
-    pixels = []
+    pixels = np.empty(max(length, 0), dtype=np.int64)
     if length <= 0:
         return pixels
 
-    pixels.append(start)
+    pixels[0] = start
+    n = 1
     current = start
     for _ in range(1, length):
         nxt = _next_downstream(current, fdr, nrows, ncols)
         if nxt == -1:
             break
-        pixels.append(nxt)
+        pixels[n] = nxt
+        n += 1
         current = nxt
-    return pixels
+    return pixels[:n]
 
 @njit(cache=True, nogil=True)
 def _downstream_exclusion(stream_id: int, stream_info: np.ndarray, fdr: np.ndarray,
-                          nrows: int, ncols: int) -> set[int]:
-    """Pixels downstream of the segment end -- ``TD(R)``, excluded from spillover."""
+                          nrows: int, ncols: int) -> np.ndarray:
+    """Pixels downstream of the segment end -- ``TD(R)``, excluded from spillover.
+
+    The walk stops at a sink, the raster edge, or where the FDR loops back on
+    itself.  A loop is found by Brent's method, comparing each pixel with one
+    remembered at doubling intervals, so that no set of the walked pixels is
+    kept.
+    """
     end_pixel = stream_info[stream_info[:, 3] == stream_id, 1][0]
 
-    excluded: set[int] = set()
+    excluded = np.empty(256, dtype=np.int64)
+    n = 0
     current = end_pixel
-    seen = {current}
+    remembered = end_pixel
+    interval = 1
+    steps = 0
     while True:
         nxt = _next_downstream(current, fdr, nrows, ncols)
-        if nxt == -1 or nxt in seen:
-            break
-        excluded.add(nxt)
-        seen.add(nxt)
+        if nxt == -1 or nxt == end_pixel:
+            return excluded[:n]
+        if n == excluded.size:
+            bigger = np.empty(2 * n, dtype=np.int64)
+            bigger[:n] = excluded
+            excluded = bigger
+        excluded[n] = nxt
+        n += 1
+        if nxt == remembered:
+            # Round a loop: every pixel on it has been walked once
+            return np.unique(excluded[:n])
+        steps += 1
+        if steps == interval:
+            remembered = nxt
+            interval *= 2
+            steps = 0
         current = nxt
-
-    return excluded
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +315,11 @@ def _widen_downstream(downstream: np.ndarray, channel: tuple[np.ndarray, np.ndar
     groups = at[keys[at] == downstream]
     if groups.size == 0:
         return downstream
-    return np.concatenate([downstream] + [cells[starts[g]:starts[g + 1]] for g in groups])
+    # The groups' cells, gathered in one index rather than a slice per group
+    sizes = starts[groups + 1] - starts[groups]
+    offsets = np.cumsum(sizes) - sizes
+    index = np.repeat(starts[groups] - offsets, sizes) + np.arange(sizes.sum())
+    return np.concatenate([downstream, cells[index]])
 
 
 # ---------------------------------------------------------------------------
@@ -961,6 +990,21 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
         ``FSP``, ``FPP`` and ``DTF`` columns.  ``attrs["depth_limit"]`` is the
         depth ``max_cells`` stopped at, or None.
     """
+    fsp, fpp, dtf, depth_limit = _segment_rows(
+        filled_dem, flow_direction, stream_id, stream_info, dh, fldmn, fldmx, iterative_spill, global_max_wse, bg,
+        spill_decay, solver, max_cells, channel)
+    table = pd.DataFrame({"FSP": fsp, "FPP": fpp, "DTF": dtf}, columns=["FSP", "FPP", "DTF"])
+    table.attrs["depth_limit"] = depth_limit
+    return table
+
+
+def _segment_rows(filled_dem: np.ndarray, flow_direction: np.ndarray, stream_id: int, stream_info: np.ndarray,
+                  dh: float, fldmn: float, fldmx: float, iterative_spill: bool, global_max_wse: float = 0.0,
+                  bg: float = -9999, spill_decay: float = 0.0, solver: str = "iterative", max_cells: int = 0,
+                  channel: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+                  ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float | None]:
+    """``fldpln_library_for_segment`` as arrays: ``(FSP, FPP, DTF, depth_limit)``.  The library build takes these
+    rather than a table per segment, whose construction cost more than solving most segments."""
     if solver not in SOLVERS:
         raise ValueError(f"solver must be one of {SOLVERS}, got {solver!r}.")
     if solver == "iterative" and dh <= 0:
@@ -980,19 +1024,13 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
     global_max_wse = np.finfo(np.float32).max if not global_max_wse else 0.99999 * global_max_wse
 
     flat_fdr = flow_direction.ravel()
-    stream_pixels = np.asarray(
-        _segment_pixels(stream_id, stream_info, flat_fdr, nrows, ncols), dtype=np.int64)
+    stream_pixels = _segment_pixels(stream_id, stream_info, flat_fdr, nrows, ncols)
     downstream = _downstream_exclusion(stream_id, stream_info, flat_fdr, nrows, ncols)
-    downstream = np.fromiter(downstream, dtype=np.int64, count=len(downstream))
     if channel is not None:
         downstream = _widen_downstream(downstream, channel)
 
-    header = ["FSP", "FPP", "DTF"]
     if stream_pixels.size == 0:
-        return pd.DataFrame(
-            {"FSP": np.empty(0, np.int32), "FPP": np.empty(0, np.int32),
-             "DTF": np.empty(0, np.float32)},
-            columns=header)
+        return np.empty(0, np.int32), np.empty(0, np.int32), np.empty(0, np.float32), None
 
     # Each side of the window has its own margin and grows only when the
     # floodplain reaches it: a floodplain usually runs off one way, and growing
@@ -1040,14 +1078,8 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
 
     fpp = _to_global(cells, ncols, r0, c0, wc)
     fsp = _to_global(source_of, ncols, r0, c0, wc)
-    table = pd.DataFrame({"FSP": fsp, "FPP": fpp, "DTF": values}, columns=header)
-    table.attrs["depth_limit"] = float(depth_limit) if depth_limit >= 0 else None
-    return table
+    return fsp, fpp, values, (float(depth_limit) if depth_limit >= 0 else None)
 
-
-def _set_shared(name: str, shm: shared_memory.SharedMemory):
-    """Keep a reference to a shared-memory block, so it is not freed while arrays still use it."""
-    _SHARED_MEMORYS[name] = shm
 
 def _read_into(ds: gdal.Dataset, arr: np.ndarray):
     """``arr[:] = ds.ReadAsArray()``, a strip of rows at a time.
@@ -1064,27 +1096,11 @@ def _read_into(ds: gdal.Dataset, arr: np.ndarray):
         arr[r:r + n] = band.ReadAsArray(0, r, arr.shape[1], n)
         band.FlushCache()
 
-def read_array_and_set_shared(file: str, dtype: np.dtype, set_shared: bool,
-                              name: str = None):
-    """Read band 1 of a raster as ``dtype``; with ``set_shared``, into shared memory called ``name``."""
+def _read_array(file: str, dtype: np.dtype) -> np.ndarray:
+    """Band 1 of a raster as ``dtype``."""
     ds = gdal.Open(file)
-    shape = (ds.RasterYSize, ds.RasterXSize)
-
-    dtype = np.dtype(dtype)
-    if not set_shared:
-        arr = np.empty(
-            shape, 
-            dtype=dtype
-        )
-        _read_into(ds, arr)
-        return arr
-    
-    size = int(dtype.itemsize * np.prod(shape))
-    shm = shared_memory.SharedMemory(name=name, create=True, size=size)
-    arr = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+    arr = np.empty((ds.RasterYSize, ds.RasterXSize), dtype=dtype)
     _read_into(ds, arr)
-    globals()[name] = arr
-    _set_shared(name, shm)
     return arr
 
 # ---------------------------------------------------------------------------
@@ -1229,46 +1245,6 @@ def _segments(stream_info: np.ndarray, stream_ids: np.ndarray, max_depths, flat_
             caps.append(piece_cap)
     return np.array(rows, dtype=np.int64).reshape(-1, 4), caps, n_split
 
-def _solve_segment(filled_dem: np.ndarray, flow_direction: np.ndarray, args, channel=None) -> pd.DataFrame:
-    """One segment's rows, with its ``segment`` number (``args`` as fldpln_library_for_segment takes them, and the
-    channel cells, if any)."""
-    table = fldpln_library_for_segment(filled_dem, flow_direction, *args, channel=channel)
-    table["segment"] = np.int32(args[0])
-    return table
-
-# A worker's channel cells, set once by init_parallel rather than pickled with every task
-_WORKER_CHANNEL = None
-
-def run_parallel(args):
-    """Worker: solve one segment on the shared rasters."""
-    return _solve_segment(globals()['filled_dem_array'], globals()['flow_direction_array'], args, _WORKER_CHANNEL)
-
-def close_shared_memory(names: list[str]):
-    """Close and unlink the named shared-memory blocks."""
-    for name in names:
-        shm = _SHARED_MEMORYS.get(name)
-        if shm is not None:
-            shm.close()
-            shm.unlink()
-            del globals()[name]
-            del _SHARED_MEMORYS[name]
-
-def init_parallel(
-    names: list[str],
-    shapes: list[tuple],
-    dtypes: list[np.dtype],
-    channel: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
-):
-    """Worker initialiser: attach the shared rasters as module globals, and keep the channel cells, so they are not
-    pickled per task."""
-    global _WORKER_CHANNEL
-    _WORKER_CHANNEL = channel
-    shms = [shared_memory.SharedMemory(name=name) for name in names]
-
-    for shm, name, shape, dtype in zip(shms, names, shapes, dtypes):
-        _set_shared(name, shm)
-        globals()[name] = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
-
 def build_fldpln_library(
     dem: str,
     filled_dem: str,
@@ -1345,11 +1321,13 @@ def build_fldpln_library(
     bg: float
         No-data value of the filled DEM.
     parallel: bool
-        Solve the segments in several processes.
+        Solve several segments at once, in threads: the solvers release
+        Python's lock, and the threads share the rasters.  Each thread holds
+        its own window, so memory grows with the number of threads.
     pbar: bool
         Show a progress bar.
     processes: int | None
-        Number of processes when ``parallel``; defaults to the CPU count.
+        Number of threads when ``parallel``; defaults to the CPU count.
     spill_decay: float
         DTF added per pixel along a spillover path, to shorten spills: only on
         each pixel's D8 successor, so other downhill steps stay free and it
@@ -1388,43 +1366,6 @@ def build_fldpln_library(
         channel); the 68 US test sites score the same either way (mean MCC
         0.5629 against 0.5639).  None (default) keeps the line alone.
     """
-    try:
-        _build_fldpln_library(
-            dem, filled_dem, stream_info_file, flow_direction_file, library_file,
-            dh, fldmn, fldmx, iterative_spill, vdt_file, stream_ids,
-            global_max_wse, bg, parallel, pbar, processes, bg_mask,
-            spill_decay, solver, max_cells_per_segment, max_reach_length,
-            max_profile_deviation, water_mask
-        )
-    finally:
-        close_shared_memory(['filled_dem_array', 'flow_direction_array'])
-
-def _build_fldpln_library(
-    dem: str,
-    filled_dem: str,
-    stream_info_file: str,
-    flow_direction_file: str,
-    library_file: str,
-    dh: float = 0.5,
-    fldmn: float = 0.1,
-    fldmx: float = 25.0,
-    iterative_spill: bool = False,
-    vdt_file: str = None,
-    stream_ids: list[int] | None = None,
-    global_max_wse: float = 0.0,
-    bg: float = -9999,
-    parallel: bool = False,
-    pbar: bool = True,
-    processes: int | None = None,
-    bg_mask: np.ndarray | None = None,
-    spill_decay: float = 0.0,
-    solver: str = "iterative",
-    max_cells_per_segment: int | None = None,
-    max_reach_length: float | None = 5000.0,
-    max_profile_deviation: float | None = 1.0,
-    water_mask: np.ndarray | None = None
-):
-    """``build_fldpln_library`` without the shared-memory cleanup."""
     if solver not in SOLVERS:
         raise ValueError(f"solver must be one of {SOLVERS}, got {solver!r}.")
     if max_cells_per_segment is not None and (int(max_cells_per_segment) != max_cells_per_segment or max_cells_per_segment < 1):
@@ -1450,8 +1391,8 @@ def _build_fldpln_library(
     if stream_ids is not None:
         stream_info = stream_info[stream_info.iloc[:, 3].isin(stream_ids)]
 
-    filled_dem_array = read_array_and_set_shared(filled_dem, np.float32, set_shared=parallel, name='filled_dem_array')
-    flow_direction_array = read_array_and_set_shared(flow_direction_file, np.uint8, set_shared=parallel, name='flow_direction_array')
+    filled_dem_array = _read_array(filled_dem, np.float32)
+    flow_direction_array = _read_array(flow_direction_file, np.uint8)
     dem_shape = _raster_shape(dem)
     if dem_shape != filled_dem_array.shape:
         raise ValueError(f"The DEM has shape {dem_shape}, but the filled DEM has {filled_dem_array.shape}.")
@@ -1536,8 +1477,7 @@ def _build_fldpln_library(
         LOG.info(f"Cut {n_split} of {len(stream_ids)} reaches {' and '.join(why)}: {len(segments)} segments in all.")
     if bg_mask is not None:
         filled_dem_array[bg_mask] = bg
-    # One segment table for every task: building it inside the comprehension
-    # made a fresh copy per segment, and every copy was pickled to a worker.
+    # One segment table for every task, not a copy per segment
     args = [
         (
             int(segment),
@@ -1558,56 +1498,61 @@ def _build_fldpln_library(
     args.sort(key=lambda x: x[4], reverse=True)
 
     if processes is None:
-        processes = max(min(mp.cpu_count(), len(args)), 1)
+        processes = max(min(os.cpu_count() or 1, len(args)), 1)
         if processes == 1:
             parallel = False
 
-    dfs: list[pd.DataFrame] = []
+    def solve(task):
+        return _segment_rows(filled_dem_array, flow_direction_array, *task, channel=channel)
+
     if parallel:
-        names = ['filled_dem_array', 'flow_direction_array']
-        shapes = [filled_dem_array.shape, flow_direction_array.shape]
-        dtypes = [filled_dem_array.dtype, flow_direction_array.dtype]
-        with mp.Pool(processes, init_parallel, (names, shapes, dtypes, channel)) as pool:
-            for df in pbar(pool.imap_unordered(run_parallel, args), total=len(args), desc="Processing streams in parallel"):
-                dfs.append(df)
+        with ThreadPoolExecutor(processes) as pool:
+            results = list(pbar(pool.map(solve, args), total=len(args), desc="Processing streams in parallel"))
     else:
-        for task in pbar(args, desc="Processing streams"):
-            dfs.append(_solve_segment(filled_dem_array, flow_direction_array, task, channel))
+        results = [solve(task) for task in pbar(args, desc="Processing streams")]
 
     fill_depth = _fill_depth(dem, filled_dem_array, bg)
-    close_shared_memory(['filled_dem_array', 'flow_direction_array'])
     # Not needed past the solves: free them before the library is assembled
     del filled_dem_array, flow_direction_array
 
     if max_cells:
-        limits = [d.attrs["depth_limit"] for d in dfs if d.attrs.get("depth_limit") is not None]
+        limits = [r[3] for r in results if r[3] is not None]
         if limits:
-            LOG.info(f"{len(limits)} of {len(dfs)} stream segments reached max_cells_per_segment={max_cells:,}; "
+            LOG.info(f"{len(limits)} of {len(results)} stream segments reached max_cells_per_segment={max_cells:,}; "
                      f"their floodplains stop at depths of {min(limits):.2f}-{max(limits):.2f} m "
                      f"(median {np.median(limits):.2f} m).")
 
-    df = pd.concat(dfs, ignore_index=True)
-    dfs = None
-    # Sorting like this allows very nice compression.  sort_values(['FSP', 'FPP'],
-    # kind='stable') ends in this same np.lexsort, after first factorising both
-    # keys into copies.
-    order = np.lexsort((df['FPP'].to_numpy(), df['FSP'].to_numpy()))
-    df = pd.DataFrame({c: df[c].to_numpy()[order] for c in df.columns}, copy=False)
+    # One column at a time, each segment's part of it freed as soon as it is copied
+    sizes = [r[0].size for r in results]
+    results = [list(r[:3]) for r in results]
+    columns = {}
+    for k, name in enumerate(("FSP", "FPP", "DTF")):
+        columns[name] = np.concatenate([r[k] for r in results])
+        for r in results:
+            r[k] = None
+    results = None
+    columns["segment"] = np.repeat(np.array([task[0] for task in args], dtype=np.int32), sizes)
+
+    # Sorting like this allows very nice compression
+    order = np.lexsort((columns["FPP"], columns["FSP"]))
+    for name in columns:
+        columns[name] = columns[name][order]
     del order
 
-    fill = fill_depth.ravel()[df['FPP'].to_numpy()]
+    fill = fill_depth.ravel()[columns["FPP"]]
     del fill_depth
     # Cells without a DEM value never flood
     has_dem = np.isfinite(fill)
     if not has_dem.all():
-        df = pd.DataFrame({c: df[c].to_numpy()[has_dem] for c in df.columns}, copy=False)
+        for name in columns:
+            columns[name] = columns[name][has_dem]
         fill = fill[has_dem]
-    df['fill'] = fill
+    columns["fill"] = fill
 
     if Path(library_file).suffix in {'.parquet', '.pq'}:
-        save_library(df, library_file)
+        save_library(columns, library_file)
     else:
-        df.to_csv(library_file, index=False)
+        pd.DataFrame(columns).to_csv(library_file, index=False)
 
 def _raster_shape(path: str) -> tuple[int, int]:
     ds = gdal.Open(path)
@@ -1626,23 +1571,36 @@ def _fill_depth(dem: str, filled_dem: np.ndarray, bg: float) -> np.ndarray:
     fill[no_data] = np.nan
     return fill
 
-def save_library(df: pd.DataFrame, path: str):
-    """Save a library as compact Parquet.
+def save_library(table: pd.DataFrame | dict[str, np.ndarray], path: str):
+    """Save a library (a table, or its columns' arrays by name) as compact Parquet.
 
     DTF and fill are stored as 2-decimal numbers, and each column gets the
     encoding that compresses it best; the file is several times smaller than
-    plain Brotli-compressed Parquet.
+    plain Brotli-compressed Parquet.  It is compressed with zstd: Brotli made
+    it 6% smaller, but took five times as long to write and twice as long to
+    read.  Rows are converted and written a row group at a time.
     """
-    cols, enc = {}, {"FPP": "DELTA_BINARY_PACKED"}
-    for c in df.columns:
-        if c in DECIMAL_COLS:
-            cols[c] = pc.cast(pa.array(df[c].to_numpy().astype(np.float32).round(2)), DECIMAL_COLS[c])
-            enc[c] = "BYTE_STREAM_SPLIT"
-        else:
-            cols[c] = pa.array(df[c].to_numpy())
+    columns = {c: np.asarray(table[c]) for c in table}
+    n = len(next(iter(columns.values()))) if columns else 0
+    enc = {"FPP": "DELTA_BINARY_PACKED"} | {c: "BYTE_STREAM_SPLIT" for c in DECIMAL_COLS if c in columns}
 
-    pq.write_table(pa.table(cols), path, use_dictionary=[c for c in ("FSP", "segment") if c in df.columns],
-                   column_encoding=enc, store_decimal_as_integer=True, compression="brotli")
+    def row_group(start: int, stop: int) -> pa.Table:
+        arrays = {}
+        for c, values in columns.items():
+            if c in DECIMAL_COLS:
+                arrays[c] = pc.cast(pa.array(values[start:stop].astype(np.float32).round(2)), DECIMAL_COLS[c])
+            else:
+                arrays[c] = pa.array(values[start:stop])
+        return pa.table(arrays)
+
+    first = row_group(0, min(n, _LIBRARY_SLICE_ROWS))
+    with pq.ParquetWriter(path, first.schema, use_dictionary=[c for c in ("FSP", "segment") if c in columns],
+                          column_encoding=enc, store_decimal_as_integer=True, compression="zstd",
+                          compression_level=9) as writer:
+        writer.write_table(first, row_group_size=_LIBRARY_SLICE_ROWS)
+        for start in range(_LIBRARY_SLICE_ROWS, n, _LIBRARY_SLICE_ROWS):
+            writer.write_table(row_group(start, min(start + _LIBRARY_SLICE_ROWS, n)),
+                               row_group_size=_LIBRARY_SLICE_ROWS)
 
 def _fill_missing_profile(valid: np.ndarray, values: np.ndarray) -> np.ndarray:
     """Spread a profile known at the ``valid`` pixels to the whole stream path.
@@ -1653,46 +1611,6 @@ def _fill_missing_profile(valid: np.ndarray, values: np.ndarray) -> np.ndarray:
     """
     pixel = np.arange(len(valid))
     return np.interp(pixel, pixel[valid], np.asarray(values, dtype=float))
-
-def longest_path_decomposition(G: nx.DiGraph, stream_wse_dict: dict[int, list[tuple[int, float]]]) -> list[list[int]]:
-    """Split a stream network into chains: the longest headwater-to-outlet path, then the longest of what is left, and so on.
-
-    Path length counts the stream pixels in ``stream_wse_dict``.  Returns lists
-    of stream ids ordered upstream to downstream.  Empties ``G``.
-    """
-    paths = []
-    length = {sid: len(stream_wse_dict[sid]) for sid in G}
-
-    while G.nodes:
-        topo = list(nx.topological_sort(G))
-
-        longest = {}
-
-        for node in reversed(topo):
-            children = list(G.successors(node))
-
-            if not children:
-                longest[node] = (length[node], [node])
-            else:
-                best = max(
-                    (longest[c] for c in children),
-                    key=lambda x: x[0]
-                )
-                longest[node] = (length[node] + best[0], [node] + best[1])
-
-        # Find longest path beginning at a headwater
-        headwaters = [n for n in G if G.in_degree(n) == 0]
-
-        _, path = max(
-            (longest[h] for h in headwaters),
-            key=lambda x: x[0]
-        )
-
-        paths.append(path)
-
-        G.remove_nodes_from(path)
-
-    return paths
 
 def _median_by_group(group: np.ndarray, value: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Each group's median: its middle value, or the lower of the two middle ones for an even count.
@@ -1733,25 +1651,112 @@ def _interpolate_within_segments(segment: np.ndarray, position: np.ndarray, meas
     out[known] = stage[b] + t * (stage[a] - stage[b])
     return out
 
+def _library_columns(library: pl.LazyFrame | str | os.PathLike) -> list[str]:
+    """The columns of a library: a LazyFrame, or a Parquet file's path."""
+    if isinstance(library, pl.LazyFrame):
+        return library.collect_schema().names()
+    return pq.read_schema(library).names
+
+def _library_parts(library: pl.LazyFrame | str | os.PathLike, columns: list[str]):
+    """The library's ``columns``, ``_LIBRARY_SLICE_ROWS`` rows at a time, with decimals as Float32.
+
+    A Parquet file is read through pyarrow, a batch at a time: two to five
+    times as fast as slicing ``pl.scan_parquet``, and half the memory.  The
+    decimals are cast by polars either way, so their values are the same.
+    """
+    if isinstance(library, pl.LazyFrame):
+        n = library.select(pl.len()).collect().item()
+        parts = (library.slice(offset, _LIBRARY_SLICE_ROWS).select(columns).collect()
+                 for offset in range(0, n, _LIBRARY_SLICE_ROWS))
+    else:
+        batches = pq.ParquetFile(library).iter_batches(batch_size=_LIBRARY_SLICE_ROWS, columns=columns)
+        parts = (pl.from_arrow(batch) for batch in batches)
+    for part in parts:
+        yield part.with_columns([pl.col(c).cast(pl.Float32) for c, d in part.schema.items() if d == pl.Decimal])
+
+@njit(cache=True, nogil=True)
+def _walk_reaches(starts: np.ndarray, lengths: np.ndarray, fdr: np.ndarray, nrows: int,
+                  ncols: int) -> tuple[np.ndarray, np.ndarray]:
+    """Each reach's stream pixels, walked ``lengths[i]`` pixels down the FDR from ``starts[i]`` (or to a sink or the
+    raster's edge): all of them, and where each reach's begin (``offsets``, one more than the reaches)."""
+    total = 0
+    for i in range(starts.size):
+        total += max(lengths[i], 0)
+    pixels = np.empty(total, dtype=np.int64)
+    offsets = np.zeros(starts.size + 1, dtype=np.int64)
+    n = 0
+    for i in range(starts.size):
+        pixel = starts[i]
+        for _ in range(lengths[i]):
+            pixels[n] = pixel
+            n += 1
+            pixel = _next_downstream(pixel, fdr, nrows, ncols)
+            if pixel == -1:
+                break
+        offsets[i + 1] = n
+    return pixels[:n], offsets
+
+@njit(cache=True, nogil=True)
+def _deepest_water(best: np.ndarray, key: np.ndarray, fpp: np.ndarray, dtf: np.ndarray, fill: np.ndarray,
+                   dof: np.ndarray, below: np.ndarray):
+    """Raise ``best[p]`` to the water of each library row ``(key, p, DTF, fill)`` that reaches ``p``'s filled
+    surface: ``dof[key] - DTF + max(fill, 0)`` where ``dof[key] - DTF > 0``.
+
+    ``dof`` is NaN for a key without a depth.  The arithmetic is in the
+    columns' own types, rounded to float32, and a NaN depth leaves its cell
+    NaN, as ``np.maximum.at`` did.  Unless ``below`` is empty, every row's
+    cell also gets ``min(fill, 0)`` there: how far the filled DEM sits below
+    the DEM.
+    """
+    zero = np.float32(0.0)
+    record = below.size > 0
+    for i in range(key.size):
+        if record:
+            f = fill[i]
+            below[fpp[i]] = f if f < zero else zero
+        k = key[i]
+        if k < 0 or k >= dof.size:
+            continue
+        water = dof[k]
+        if water != water:
+            continue
+        head = water - dtf[i]
+        if not head > zero:
+            continue
+        f = fill[i]
+        depth = np.float32(head + (f if (f > zero or f != f) else zero))
+        p = fpp[i]
+        current = best[p]
+        if current != current:
+            continue
+        if depth != depth or depth > current:
+            best[p] = depth
+
 def _make_fldpln_flood_map(
-        filled_dem: np.ndarray,
         vdt_df: pl.DataFrame,
         fdr: np.ndarray,
-        fldpln_library: pl.LazyFrame,
+        fldpln_library: pl.LazyFrame | str | os.PathLike,
         stream_info_df: pd.DataFrame,
-        stream_gdf: gpd.GeoDataFrame,
-        reach_id_field: str,
-        downstream_reach_id_field: str) -> np.ndarray:
+        fill_below_dem: np.ndarray | None = None) -> np.ndarray:
     """Flood depth raster for one event, from VDT stages and a floodplain library.
 
-    1. Stream pixels are chained along the network's longest paths.  Along
-       each chain, the stage of stream pixel ``s`` (its water depth over the
-       filled DEM) is the VDT's water surface minus the filled DEM.  Pixels
-       without a VDT value take the stage interpolated linearly between the
-       VDT cells on either side.  The depth, not the water surface: where ARC
-       has no rating curve, as down a cliff, the bed bends between the VDT
-       cells, and a straight water surface across the gap would stand metres
-       above it (or below it).
+    1. Along each reach (its pixels in ``stream_info_df``, walked down the
+       flow directions), the stage of stream pixel ``s`` (its water depth over
+       the filled DEM) is the VDT's water surface minus the filled DEM.  The
+       filled DEM there is the VDT's ``Elev`` (the DEM under the pixel, the
+       bed ARC's depths are measured from) plus the library's ``fill`` of the
+       pixel's own cell, its row with ``FPP == FSP``, so the filled DEM itself
+       is never read.  A pixel without that row counts as having no VDT
+       value.  Pixels without a VDT value take the stage interpolated linearly
+       between the reach's VDT cells on either side, and held beyond its
+       first and last.  The depth, not the water surface: where ARC has no
+       rating curve, as down a cliff, the bed bends between the VDT cells,
+       and a straight water surface across the gap would stand metres above
+       it (or below it).  The reaches used to be chained along the network's
+       longest paths, so that a gap at a reach's end took stages from the
+       next reach; but only a segment without any VDT value keeps the stages
+       of this step (see 2), and no map of 68 US test sites changed without
+       the chains.
     2. Each segment ``R`` floods at one depth ``DoF(R)``, as the library
        assumes: the median of its stream pixels' stages, every pixel counted
        once, however many floodplain cells it is the source of.  The depth is
@@ -1776,151 +1781,143 @@ def _make_fldpln_flood_map(
        surface, and the depth is measured from it.  Otherwise a raised cell
        inside the channel, routed through, read as a dry hole.
 
-    Returns the depth where it is above 0, NaN elsewhere.  Only the stream
-    pixels of ``filled_dem`` are used, and no DEM is needed.  ``vdt_df`` needs
-    ``COMID``, ``Row``, ``Col`` and ``WSE``; ``stream_gdf`` needs the two id
-    columns and ``topological_order``.
+    Returns the depth where it is above 0, NaN elsewhere, on ``fdr``'s grid;
+    no DEM is needed.  ``vdt_df`` needs ``COMID``, ``Row``, ``Col``, ``Elev``
+    and ``WSE``.  ``fldpln_library`` is a Parquet library's path or a
+    LazyFrame (a CSV library), read a part at a time.  ``fill_below_dem``, a
+    float32 raster, gets ``min(fill, 0)`` at every cell of the library: how
+    far the filled DEM sits below the DEM, for the water surface.
     """
-    columns = fldpln_library.collect_schema().names()
+    columns = _library_columns(fldpln_library)
     if 'fill' not in columns:
         raise ValueError("The FLDPLN library has no fill column. Rebuild it with build_fldpln_library, "
                          "which now takes the DEM the floods are mapped on.")
-    nrows, ncols = filled_dem.shape
+    nrows, ncols = fdr.shape
+    # C order: the library's flat pixel ids index it
+    depth_array = np.full((nrows, ncols), np.nan, dtype=np.float32)
 
-    vdt_df = vdt_df.with_columns(FSP=(pl.col('Row') * ncols + pl.col('Col')).cast(pl.Int32))
-    fsp_wse_dict = dict(zip(vdt_df['FSP'], vdt_df['WSE']))
-    stream_ids = set(vdt_df['COMID'])
+    # Each segment's stream pixels, read a part at a time like the depths
+    # below.  Every stream pixel of a reach in the library is the source of
+    # at least its own cell, so it has a row there, which gives its fill.
+    key = 'segment' if 'segment' in columns else 'FSP'
+    group = ['segment', 'FSP'] if key == 'segment' else ['FSP']
+    pairs, own_fsp, own_fill = [], [], []
+    for part in _library_parts(fldpln_library, group + ['FPP', 'fill']):
+        if not len(part):
+            continue
+        # A sorted library repeats each source over its rows: drop the repeats
+        # first, cheaply, and leave the rest to the unique below
+        repeat = np.ones(len(part) - 1, dtype=bool)
+        for column in group:
+            values = part[column].to_numpy()
+            repeat &= values[1:] == values[:-1]
+        pairs.append(part.select(group).filter(pl.Series(np.r_[True, ~repeat])))
+        fsp = part['FSP'].to_numpy()
+        is_own = fsp == part['FPP'].to_numpy()
+        own_fsp.append(fsp[is_own])
+        own_fill.append(part['fill'].to_numpy()[is_own])
+    if not pairs:
+        return depth_array
+    library_pixels = pl.concat(pairs).unique()
+    # A cell's fill is the same in every row: any one of a source's own rows will do
+    own_fsp, first = np.unique(np.concatenate(own_fsp), return_index=True)
+    own_fill = np.concatenate(own_fill)[first]
 
-    stream_gdf = stream_gdf.sort_values('topological_order')
-    G = nx.from_pandas_edgelist(
-        stream_gdf,
-        source=reach_id_field,
-        target=downstream_reach_id_field,
-        create_using=nx.DiGraph
-    )
-    if -1 in G:
-        G.remove_node(-1)  # Remove the dummy downstream node
+    # The VDT's WSE and Elev at its stream pixels, sorted by pixel; a pixel listed twice keeps its last row
+    vdt_fsp = vdt_df['Row'].to_numpy().astype(np.int64) * ncols + vdt_df['Col'].to_numpy()
+    order = np.argsort(vdt_fsp, kind='stable')
+    vdt_fsp, vdt_wse, vdt_elev = vdt_fsp[order], vdt_df['WSE'].to_numpy()[order], vdt_df['Elev'].to_numpy()[order]
+    stream_ids = list(set(vdt_df['COMID']))
 
-    fdr = fdr.ravel()
-    stream_rows: dict[list[tuple]] = defaultdict(list)
     stream_info_dict = stream_info_df.set_index('stream_id').to_dict(orient='index')
-
-    # Walk each segment's stream pixels, with the VDT's WSE where it has one
     for stream_id in stream_ids:
         if stream_id not in stream_info_dict:
             raise ValueError(f"Stream ID {stream_id} not found in stream_info_df.")
 
-        fsp = stream_info_dict[stream_id]['start_pixel']
-        length = stream_info_dict[stream_id]['length']
+    # Walk each reach's stream pixels, with the VDT's WSE and Elev where it has them
+    starts = np.array([stream_info_dict[s]['start_pixel'] for s in stream_ids], dtype=np.int64)
+    lengths = np.array([stream_info_dict[s]['length'] for s in stream_ids], dtype=np.int64)
+    pixels, offsets = _walk_reaches(starts, lengths, fdr.ravel(), nrows, ncols)
+    at = np.searchsorted(vdt_fsp, pixels, side='right') - 1
+    known = at >= 0
+    known[known] = vdt_fsp[at[known]] == pixels[known]
+    wse = np.full(pixels.size, np.nan)
+    wse[known] = vdt_wse[at[known]]
+    elevation = np.full(pixels.size, np.nan)
+    elevation[known] = vdt_elev[at[known]]
+    # The filled DEM: the VDT's Elev plus the fill of the pixel's own cell
+    fill = np.full(pixels.size, np.nan)
+    if own_fsp.size:
+        at = np.minimum(np.searchsorted(own_fsp, pixels), own_fsp.size - 1)
+        has_fill = own_fsp[at] == pixels
+        fill[has_fill] = own_fill[at[has_fill]]
 
-        for _ in range(length):
-            if fsp in fsp_wse_dict:
-                raw_wse = fsp_wse_dict[fsp]
-                stream_rows[stream_id].append((fsp, raw_wse))
-            else:
-                stream_rows[stream_id].append((fsp, np.nan))
+    # Along each reach, the depth over the filled DEM, interpolated across the
+    # pixels without a VDT value
+    pixel_stage = wse - (elevation + fill)
+    measured = ~np.isnan(pixel_stage)
+    reach_fsp, reach_dof, reach_measured = [], [], []
+    for start, end in zip(offsets[:-1], offsets[1:]):
+        mask = measured[start:end]
+        if not mask.any():
+            continue
+        dof_profile = _fill_missing_profile(mask, pixel_stage[start:end][mask])
+        finite = np.isfinite(dof_profile)
+        reach_fsp.append(pixels[start:end][finite])
+        reach_dof.append(dof_profile[finite])
+        reach_measured.append(mask[finite])
 
-            fsp = _next_downstream(fsp, fdr, nrows, ncols)
-            if fsp == -1:
-                break
-
-    # C order: the library's flat pixel ids index it
-    depth_array = np.full((nrows, ncols), np.nan, dtype=np.float32)
-    if not stream_rows:
+    if not reach_fsp:
         return depth_array
 
-    # Chain the segments along the main stems
-    paths = longest_path_decomposition(G, stream_rows)
-
-    row_chunks = []
-    for path in paths:
-        path_rows = []
-        for stream_id in path:
-            path_rows.extend(stream_rows[stream_id])
-    
-        if not path_rows:
-            continue
-
-        Y = np.array([wse for _, wse in path_rows])
-        mask = ~np.isnan(Y)
-        if mask.sum() == 0:
-            continue
-        filled_dem_profile = np.array([filled_dem[_pixel_to_rc(pixel, ncols)]
-                                       for pixel, _ in path_rows])
-
-        # The depth over the filled DEM, interpolated across the pixels
-        # without a VDT value
-        dof_profile = _fill_missing_profile(mask, (Y - filled_dem_profile)[mask])
-
-        row_chunks.extend([
-            (fsp, dof, bool(measured))
-            for (fsp, _), dof, measured in zip(path_rows, dof_profile, mask)
-            if np.isfinite(dof)
-        ])
-
-    if not row_chunks:
-        return depth_array
-
-    # A pixel on two chains keeps its deeper stage
-    stage = (pl.DataFrame(row_chunks, schema={'FSP': pl.Int32, 'DoF': pl.Float32, 'measured': pl.Boolean},
-                          orient='row')
+    # A pixel on two reaches keeps its deeper stage
+    stage = (pl.DataFrame({'FSP': np.concatenate(reach_fsp), 'DoF': np.concatenate(reach_dof),
+                           'measured': np.concatenate(reach_measured)},
+                          schema={'FSP': pl.Int32, 'DoF': pl.Float32, 'measured': pl.Boolean})
              .group_by('FSP').agg(pl.col('DoF').max(), pl.col('measured').max()))
 
-    # Each segment's stream pixels, read a slice at a time like the join below.
-    # Every stream pixel of a reach in the library is the source of at least
-    # its own cell, so it has a row there.
-    n_library = fldpln_library.select(pl.len()).collect().item()
-    if n_library == 0:
-        return depth_array
-    key = 'segment' if 'segment' in columns else 'FSP'
-    group = ['segment', 'FSP'] if key == 'segment' else ['FSP']
-    pixels = pl.concat([
-        fldpln_library.slice(offset, _LIBRARY_SLICE_ROWS).select(group).unique().collect()
-        for offset in range(0, n_library, _LIBRARY_SLICE_ROWS)
-    ]).unique()
     # Each stream pixel's reach and its place along it, from upstream: a
     # segment is a piece of one reach
-    place = pl.DataFrame([(fsp, stream_id, i) for stream_id, rows in stream_rows.items()
-                          for i, (fsp, _) in enumerate(rows)],
-                         schema={'FSP': pl.Int32, 'reach': pl.Int64, 'position': pl.Int32},
-                         orient='row').unique('FSP', keep='first', maintain_order=True)
+    sizes = np.diff(offsets)
+    place = pl.DataFrame({'FSP': pixels, 'reach': np.repeat(np.array(stream_ids, dtype=np.int64), sizes),
+                          'position': np.arange(pixels.size) - np.repeat(offsets[:-1], sizes)},
+                         schema={'FSP': pl.Int32, 'reach': pl.Int64, 'position': pl.Int32}
+                         ).unique('FSP', keep='first', maintain_order=True)
     if key == 'FSP':
         # A library built before reaches were split into segments: each reach is one
         reach_of = place.select('FSP', segment='reach')
-        pixels = pixels.join(reach_of, on='FSP', how='inner')
-    pixels = (pixels.join(stage, on='FSP', how='inner')
-              .join(place.select('FSP', 'position'), on='FSP', how='inner')
-              .sort(['segment', 'position']))
-    if pixels.is_empty():
+        library_pixels = library_pixels.join(reach_of, on='FSP', how='inner')
+    library_pixels = (library_pixels.join(stage, on='FSP', how='inner')
+                      .join(place.select('FSP', 'position'), on='FSP', how='inner')
+                      .sort(['segment', 'position']))
+    if library_pixels.is_empty():
         return depth_array
     # A pixel without a VDT value takes its stage from its own segment's pixels with one
-    stages = _interpolate_within_segments(pixels['segment'].to_numpy(), pixels['position'].to_numpy(),
-                                          pixels['measured'].to_numpy(), pixels['DoF'].to_numpy())
-    segments, depths = _median_by_group(pixels['segment'].to_numpy(), stages)
-    df = pl.DataFrame({'segment': segments, 'DoF': depths.astype(np.float32)},
-                      schema_overrides={'segment': pixels.schema['segment']})
+    stages = _interpolate_within_segments(library_pixels['segment'].to_numpy(), library_pixels['position'].to_numpy(),
+                                          library_pixels['measured'].to_numpy(), library_pixels['DoF'].to_numpy())
+    segments, depths = _median_by_group(library_pixels['segment'].to_numpy(), stages)
+    depths = depths.astype(np.float32)
     if key == 'FSP':
-        df = reach_of.join(df, on='segment', how='inner').select('FSP', 'DoF')
-    df = df.lazy()
+        df = pl.DataFrame({'segment': segments, 'DoF': depths},
+                          schema_overrides={'segment': library_pixels.schema['segment']})
+        df = reach_of.join(df, on='segment', how='inner')
+        segments, depths = df['FSP'].to_numpy(), df['DoF'].to_numpy()
+    # Each key's depth, looked up by the key itself
+    valid = segments >= 0
+    if not valid.any():
+        return depth_array
+    dof = np.full(int(segments[valid].max()) + 1, np.nan, dtype=np.float32)
+    dof[segments[valid]] = depths[valid]
 
-    # Join the library a slice at a time and keep only each pixel's deepest water
-    # so far, in ``depth_array`` itself: joined whole, the library and its join
-    # were several times the size of every raster in the run.
+    # Read the library a part at a time and keep only each pixel's deepest
+    # water so far, in ``depth_array`` itself: joined whole, the library and
+    # its join were several times the size of every raster in the run.
     best = depth_array.ravel()
     best[:] = -np.inf
-    for offset in range(0, n_library, _LIBRARY_SLICE_ROWS):
-        part = (fldpln_library.slice(offset, _LIBRARY_SLICE_ROWS)
-                .join(df, on=key, how='inner')
-                .select('FPP', 'DTF', 'fill', 'DoF')
-                .collect())
-        # ``DoF - DTF`` is the water above the filled DEM.  Only where it is
-        # positive does the water reach the cell, and then the fill adds the
-        # depth below the filled surface, as in a filled pit or a burned channel.
-        # A negative fill, raised bathymetry, takes nothing away (see above).
-        head = part['DoF'].to_numpy() - part['DTF'].to_numpy()
-        reaches = head > 0
-        depth = head[reaches] + np.maximum(part['fill'].to_numpy()[reaches], 0.0)
-        np.maximum.at(best, part['FPP'].to_numpy()[reaches], depth.astype(np.float32, copy=False))
+    below = np.empty(0, np.float32) if fill_below_dem is None else fill_below_dem.reshape(-1)
+    for part in _library_parts(fldpln_library, [key, 'FPP', 'DTF', 'fill']):
+        _deepest_water(best, part[key].to_numpy(), part['FPP'].to_numpy(), part['DTF'].to_numpy(),
+                       part['fill'].to_numpy(), dof, below)
     depth_array[~(depth_array > 0)] = np.nan
 
     return depth_array

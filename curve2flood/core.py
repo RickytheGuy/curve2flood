@@ -20,6 +20,7 @@ from numba import njit
 from osgeo import gdal, osr, ogr
 
 from shapely.geometry import shape
+from scipy.spatial import cKDTree
 from scipy.ndimage import label, generate_binary_structure, distance_transform_edt, uniform_filter
 
 from curve2flood import LOG
@@ -30,6 +31,10 @@ from curve2flood.spreaders import (
 
 gdal.UseExceptions()
 
+# GDAL compresses a raster's blocks in parallel with this creation option: eight
+# times as fast on a 3600 x 3600 float raster, and the same file
+_WRITE_THREADS = "NUM_THREADS=ALL_CPUS"
+
 def read_manning_table(s_manning_path: str, land_cover: np.ndarray):
     """Convert a land-cover raster to Manning's n.
 
@@ -38,38 +43,39 @@ def read_manning_table(s_manning_path: str, land_cover: np.ndarray):
     """
     df = pd.read_csv(s_manning_path, sep='\t')
 
-    # A lookup array is the fastest way to reclassify the raster
+    # A lookup array is the fastest way to reclassify the raster.  It is float32,
+    # as the velocity is, and an integer raster indexes it as it is, so no
+    # 8-byte copy of the raster is made.
     idx = df.iloc[:, 0].astype(int).values
     lookup_array = np.zeros(idx.max() + 1)
     lookup_array[idx] = df.iloc[:, 2].values
-    return lookup_array[land_cover.astype(int)]
+    if land_cover.dtype.kind not in 'iu':
+        land_cover = land_cover.astype(int)
+    return lookup_array.astype(np.float32)[land_cover]
 
 
-def create_velocity(config: Config, OutVEL, Depth_Array, LC_array, Slope_array_list,
+def create_velocity(config: Config, OutVEL, Depth_Array, LC_array, Slope_Array,
                            geotransform, projection, ncols, nrows,
                            Flood_Ensemble):
     """Write the velocity raster from Manning's equation, ``V = D^(2/3) S^(1/2) / n``.
 
     Each cell is treated as a wide rectangular channel: ``D`` is its flood
-    depth, ``S`` the largest positive slope over the flow events and ``n``
-    comes from its land cover.  Flooded cells without a value take their
-    nearest neighbour's.
+    depth, ``S`` the largest positive slope over the flow events
+    (``Slope_Array``, NaN where there is none) and ``n`` comes from its land
+    cover.  Flooded cells without a value take their nearest neighbour's.
     """
-    Slope_Array = create_positive_max_array(Slope_array_list)
+    VEL_Array = 1 / read_manning_table(config.lu_manning_n, LC_array)
+    VEL_Array *= Depth_Array ** (2/3)
+    VEL_Array *= Slope_Array ** (1/2)
 
-    da_input_mannings = read_manning_table(config.lu_manning_n, LC_array).astype(np.float32)
-
-    VEL_Array = (1/(da_input_mannings))*((Depth_Array)**(2/3))*((Slope_Array)**(1/2))
-
-    VEL_Array = Flood_Flooded_Cells_in_Map(VEL_Array, Flood_Ensemble, eps=0.01)
-
+    out_band_data = Flood_Flooded_Cells_in_Map(VEL_Array, Flood_Ensemble, eps=0.01)
     nodata_value = np.nan
-    out_band_data = np.where(np.isnan(VEL_Array), nodata_value, VEL_Array).astype(np.float32)
+    del VEL_Array
 
     driver = gdal.GetDriverByName("GTiff")
     ds: gdal.Dataset = driver.Create(
         OutVEL, ncols, nrows, 1, gdal.GDT_Float32,
-        options=[f"COMPRESS={config.compression}", "PREDICTOR=2", "TILED=YES"]
+        options=[f"COMPRESS={config.compression}", "PREDICTOR=2", "TILED=YES", _WRITE_THREADS]
     )
     if ds is None:
         raise RuntimeError(f"Failed to create output raster: {OutVEL}")
@@ -274,6 +280,7 @@ def interp1d_numba(x: np.ndarray, y: np.ndarray, xi: float | int) -> float:
 
     return y0 + (xi - x0) * (y1 - y0) / (x1 - x0) if (x1 - x0) != 0 else y0
 
+@njit(cache=True)
 def vdt_interpolate(flow: np.ndarray,
                     qb: np.ndarray,
                     flow_values: np.ndarray,
@@ -470,7 +477,7 @@ def Write_Output_Raster(s_output_filename, raster_data, ncols, nrows, dem_geotra
     o_driver = gdal.GetDriverByName(s_file_format)  #Typically will be a GeoTIFF "GTiff"
 
     if creation_options is None:
-        creation_options = [f"COMPRESS={compression}", 'PREDICTOR=2']
+        creation_options = [f"COMPRESS={compression}", 'PREDICTOR=2', _WRITE_THREADS]
 
     o_output_file = o_driver.Create(s_output_filename, xsize=ncols, ysize=nrows, bands=1, eType=s_output_type, options=creation_options)
     o_output_file.SetGeoTransform(dem_geotransform)
@@ -584,15 +591,15 @@ def CreateSimpleKernelFloodMap(config: Config, RR, CC, T_Rast, W_Rast, S_Rast, E
 
     Depth_array = None
     if config.outdep or config.outwse or S_Rast is not None:
-        Depth_array = np.where(mask, WSE_array - E, np.nan).astype(np.float32)[1:-1, 1:-1]
+        Depth_array = np.where(mask, WSE_array - E, np.nan).astype(np.float32, copy=False)[1:-1, 1:-1]
 
     Slope_array = None
     if S_Rast is not None:
         # Cells no stream cell reached have no weight, hence 0 / 0
         with np.errstate(divide='ignore', invalid='ignore'):
             Slope_divided_by_weight = Slope_Times_Weight / Total_Weight
-        Slope_array = np.where(mask, Slope_divided_by_weight, np.nan).astype(np.float32)
-        Slope_array = np.where((Slope_array <= 0), 0.0002, Slope_array).astype(np.float32)[1:-1, 1:-1]
+        Slope_array = np.where(mask, Slope_divided_by_weight, np.nan).astype(np.float32, copy=False)
+        Slope_array = np.where((Slope_array <= 0), 0.0002, Slope_array).astype(np.float32, copy=False)[1:-1, 1:-1]
 
     return Flooded_array[1:-1, 1:-1], Depth_array, Slope_array
 
@@ -619,7 +626,7 @@ def Create_Topobathy_Dataset(E: np.ndarray, Bathy: np.ndarray, Bathy_Use_Banks: 
     ``Elev``), and the channel keeps the banks its cross sections were carved
     with.
     """
-    burned = np.where(np.isfinite(Bathy), Bathy, E).astype(np.float32)
+    burned = np.where(np.isfinite(Bathy), Bathy, E).astype(np.float32, copy=False)
     if not Bathy_Use_Banks:
         np.minimum(burned, E, out=burned)
     return burned
@@ -665,19 +672,19 @@ def make_fldpln_flood_map(
         config: Config,
         COMID_Unique_Flow,
         S_Rast,
-        filled_dem,
+        fill_below_dem,
         stream_info,
         flow_dir,
         fldpln_library,
-        streams_gdf,
         ):
     """FLDPLN mapper: ``(flood, depth, None)`` for one flow event.
 
     The VDT gives each stream cell's WSE for the event and the floodplain
-    library spreads it (see ``_make_fldpln_flood_map``); the DEM is not
-    needed.  ``depth`` is None unless a depth, WSE or velocity raster is
-    written.  When ``S_Rast`` is given, the stream cells' slopes are written
-    into it.
+    library spreads it (see ``_make_fldpln_flood_map``); neither the DEM nor
+    the filled DEM is needed.  ``depth`` is None unless a depth, WSE or
+    velocity raster is written.  When ``S_Rast`` is given, the stream cells'
+    slopes are written into it, and when ``fill_below_dem`` is, how far the
+    filled DEM sits below the DEM at each library cell (for ``water_surface``).
     """
     vdt_df = calculate_interpolated_vdt(
         config.print_vdt_database,
@@ -688,14 +695,11 @@ def make_fldpln_flood_map(
         S_Rast[vdt_df['Row'].to_numpy(), vdt_df['Col'].to_numpy()] = vdt_df['Slope'].to_numpy()
 
     depth = _make_fldpln_flood_map(
-        filled_dem,
         vdt_df,
         flow_dir,
         fldpln_library,
         stream_info,
-        streams_gdf,
-        config.reach_id,
-        config.downstream_reach_id,
+        fill_below_dem=fill_below_dem,
     )
 
     Flood_array = (depth > 0).astype(np.uint8)
@@ -709,10 +713,9 @@ def Curve2Flood(config: Config, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique
                 TW_for_WeightBox_ElipseMask,
                 quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast,
                 flowdir,
-                filled_dem,
+                fill_below_dem,
                 stream_info,
-                fldpln_library,
-                streams_gdf,):
+                fldpln_library,):
     """Map one flow event with the configured mapper.
 
     Returns ``(flood, depth, slope)`` on the DEM grid; ``depth`` and ``slope``
@@ -725,11 +728,10 @@ def Curve2Flood(config: Config, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique
             config,
             COMID_Unique_Flow,
             S_Rast,
-            filled_dem,
+            fill_below_dem,
             stream_info,
             flowdir,
             fldpln_library,
-            streams_gdf,
         )
 
     (COMID_Unique_TW, COMID_Unique_Depth, TopWidthMax,
@@ -802,12 +804,52 @@ def Flood_Bathy_Mask_in_Flood_Map(Flood_Ensemble, mask):
 
     return Flood_Ensemble
 
+def _nearest_sources(source_mask: np.ndarray, target_mask: np.ndarray, k: int = 8,
+                     chunk: int = 1 << 16) -> tuple[np.ndarray, np.ndarray]:
+    """The row and column of the nearest source cell to each target cell, the targets in ``np.nonzero`` order.
+
+    Of two sources equally near, the one in the lower column wins, then the
+    lower row: the way ``distance_transform_edt`` breaks ties.  Its feature
+    transform sweeps the whole raster, so while the sources and targets are
+    few (a flood covers a few percent of a tile) a KD-tree over the sources
+    finds the same cells several times faster; it queries each target's ``k``
+    nearest sources, a ``chunk`` of targets at a time.
+    """
+    tr, tc = np.nonzero(target_mask)
+    sr, sc = np.nonzero(source_mask)
+    if 10 * (sr.size + tr.size) > source_mask.size:
+        # EDT returns indices of the nearest ZERO in the input,
+        # so pass the inverse to point toward TRUE source cells.
+        ny, nx = distance_transform_edt(~source_mask, return_distances=False, return_indices=True)
+        return ny[tr, tc], nx[tr, tc]
+
+    tree = cKDTree(np.column_stack((sr, sc)))
+    k = min(k, sr.size)
+    nearest = np.empty(tr.size, dtype=np.int64)
+    for start in range(0, tr.size, chunk):
+        rows, cols = tr[start:start + chunk], tc[start:start + chunk]
+        _, index = tree.query(np.column_stack((rows, cols)), k=k)
+        index = index.reshape(rows.size, k)
+        # Exact squared distances, to find the ties
+        d2 = (sr[index] - rows[:, None]) ** 2 + (sc[index] - cols[:, None]) ** 2
+        least = d2.min(axis=1)
+        tied = d2 == least[:, None]
+        order = np.where(tied, (sc[index] << 32) + sr[index], np.iinfo(np.int64).max)
+        nearest[start:start + rows.size] = index[np.arange(rows.size), order.argmin(axis=1)]
+        # All k equally near: more sources may be as near, beyond the k
+        if k < sr.size:
+            for i in np.flatnonzero(tied.all(axis=1)):
+                candidates = np.asarray(tree.query_ball_point((rows[i], cols[i]), np.sqrt(least[i]) + 1e-6))
+                candidates = candidates[(sr[candidates] - rows[i]) ** 2 + (sc[candidates] - cols[i]) ** 2 == least[i]]
+                nearest[start + i] = candidates[np.lexsort((sr[candidates], sc[candidates]))[0]]
+    return sr[nearest], sc[nearest]
+
 def Flood_Flooded_Cells_in_Map(Array_Ensemble: np.ndarray, Flood_Ensemble: np.ndarray, eps=0.01):
     """Match a value raster (depth, WSE, velocity, slope) to the flood extent.
 
     Flooded cells that are NaN take the value of the nearest flooded cell that
-    has one; flooded cells with no such cell get ``eps``.  Cells outside the
-    flood become NaN.  Returns a new float32 array.
+    has one (see ``_nearest_sources``); flooded cells with no such cell get
+    ``eps``.  Cells outside the flood become NaN.  Returns a new float32 array.
     """
     flood_mask = Flood_Ensemble > 0
     nan_mask = np.isnan(Array_Ensemble)
@@ -818,12 +860,8 @@ def Flood_Flooded_Cells_in_Map(Array_Ensemble: np.ndarray, Flood_Ensemble: np.nd
 
     filled = Array_Ensemble.astype(np.float32, copy=True)
 
-    if np.any(source_mask):
-        # EDT returns indices of the nearest ZERO in the input,
-        # so pass the inverse to point toward TRUE source cells.
-        ny, nx = distance_transform_edt(~source_mask, return_distances=False, return_indices=True)
-        nn_vals = Array_Ensemble[ny, nx]
-        filled[target_mask] = nn_vals[target_mask]
+    if np.any(source_mask) and np.any(target_mask):
+        filled[target_mask] = Array_Ensemble[_nearest_sources(source_mask, target_mask)]
 
     # A flooded blob with no source anywhere is still NaN
     still_nan = (flood_mask) & np.isnan(filled)
@@ -849,32 +887,57 @@ def remove_cells_not_connected(flood_array: np.ndarray, streams_array: np.ndarra
 
     return flood_array * mask
 
+def accumulate_positive_max(maximum: np.ndarray | None, array: np.ndarray | None) -> np.ndarray | None:
+    """Raise ``maximum`` (float32, -inf where nothing is positive yet) to ``array``'s positive values, in place.
+
+    Starts a new maximum when ``maximum`` is None; an ``array`` of None
+    changes nothing.  Each flow event's raster is folded in as it is mapped,
+    so the events' rasters are never all held at once.
+    """
+    if array is None:
+        return maximum
+    array = np.asarray(array, dtype=np.float32)
+    positive = np.where(array > 0, array, np.float32(-np.inf))
+    if maximum is None:
+        return positive
+    return np.maximum(maximum, positive, out=maximum)
+
+def finish_positive_max(maximum: np.ndarray) -> np.ndarray:
+    """``accumulate_positive_max``'s result with NaN, in place, where no value was positive."""
+    maximum[maximum == -np.inf] = np.nan
+    return maximum
+
 def create_positive_max_array(array_list: list[np.ndarray]) -> np.ndarray:
     """Cell-wise maximum of the positive values in ``array_list``; NaN where there are none."""
-    arr_stack = np.stack(array_list, axis=0, dtype=np.float32)
-    result = np.nanmax(arr_stack, where=arr_stack > 0, axis=0, initial=-np.inf)
-    result[result == -np.inf] = np.nan
-    return result
+    maximum = None
+    for array in array_list:
+        maximum = accumulate_positive_max(maximum, array)
+    return finish_positive_max(maximum)
 
-def create_depth(
-                array_list: list[np.ndarray],
-                Flood_Ensemble: np.ndarray,
-    ):
-    """Maximum depth over the flow events, matched to the flood extent (see ``Flood_Flooded_Cells_in_Map``)."""
-    max_vals = create_positive_max_array(array_list)
-    return Flood_Flooded_Cells_in_Map(max_vals, Flood_Ensemble, eps=0.01)
+def create_depth(max_depth: np.ndarray, Flood_Ensemble: np.ndarray):
+    """The maximum depth over the flow events (``create_positive_max_array``), matched to the flood extent (see
+    ``Flood_Flooded_Cells_in_Map``)."""
+    return Flood_Flooded_Cells_in_Map(max_depth, Flood_Ensemble, eps=0.01)
 
 
-def water_surface(depth: np.ndarray, dem: np.ndarray, filled_dem: np.ndarray | None = None) -> np.ndarray:
+def water_surface(depth: np.ndarray, dem: np.ndarray, fill_below_dem: np.ndarray | None = None) -> np.ndarray:
     """The water surface elevation where the depth is above 0 and the DEM has a value, NaN elsewhere.
 
-    The depth is measured from the DEM, except with the FLDPLN mapper (``filled_dem`` given), which measures it from
-    the lower of the DEM and the filled DEM: where bathymetry raises the DEM above the filled DEM, the water was
-    routed across the filled surface and its depth taken from there (see ``_make_fldpln_flood_map``), and the water
-    surface must be too, or it would stand above its neighbours by the raise.
+    The depth is measured from the DEM, except with the FLDPLN mapper, which measures it from the lower of the DEM
+    and the filled DEM: where bathymetry raises the DEM above the filled DEM, the water was routed across the filled
+    surface and its depth taken from there (see ``_make_fldpln_flood_map``), and the water surface must be too, or it
+    would stand above its neighbours by the raise.  ``fill_below_dem`` is how far the filled DEM sits below the DEM
+    there (0, or negative where raised; NaN where the library doesn't say), as the mapper writes it from the
+    library's fill.  Only the flooded cells are worked out.
     """
-    ground = dem if filled_dem is None else np.where(filled_dem > -9998.0, np.minimum(dem, filled_dem), dem)
-    return np.where((depth > 0) & (dem > -9998.0), depth + ground, np.nan).astype(np.float32)
+    wse = np.full(depth.shape, np.nan, dtype=np.float32)
+    flooded = np.nonzero((depth > 0) & (dem > -9998.0))
+    ground = dem[flooded]
+    if fill_below_dem is not None:
+        below = fill_below_dem[flooded]
+        ground = np.where(np.isnan(below), ground, ground + below)
+    wse[flooded] = depth[flooded] + ground
+    return wse
 
 
 def create_bathymetry(config: Config, E: np.ndarray, nrows: int, ncols: int, dem_geotransform: tuple, dem_projection: str,
@@ -886,7 +949,7 @@ def create_bathymetry(config: Config, E: np.ndarray, nrows: int, ncols: int, dem
     LOG.info('Working on Bathymetry')
     ds: gdal.Dataset = gdal.Open(config.bathy_out_file)
     band = ds.GetRasterBand(1)
-    bathy = band.ReadAsArray().astype(np.float32)
+    bathy = band.ReadAsArray().astype(np.float32, copy=False)
     nodata = band.GetNoDataValue()
     ds = None
     if bathy.shape != (nrows, ncols):
@@ -945,31 +1008,22 @@ def main_flood_ouputs(
         FlowDir = gdal.Open(config.flow_direction_file).ReadAsArray().astype(np.uint8, copy=False)
         _check_shape(FlowDir, (nrows, ncols), "Flow direction raster")
 
-        filled_dem: np.ndarray = gdal.Open(config.filled_dem_file).ReadAsArray()
-        _check_shape(filled_dem, (nrows, ncols), "Filled DEM raster")
-
         if Path(config.stream_info_file).suffix == '.parquet':
             stream_info: pd.DataFrame = pd.read_parquet(config.stream_info_file)
         else:
             stream_info: pd.DataFrame = pd.read_csv(config.stream_info_file)
-        if Path(config.strmshp_file).suffix == '.parquet':
-            streams_gdf = gpd.read_parquet(config.strmshp_file)
-        else:
-            streams_gdf = gpd.read_file(config.strmshp_file, use_arrow=True, ignore_geometry=True)
 
+        # A Parquet library is read by its path, a row group at a time (see _make_fldpln_flood_map)
         if Path(config.fldpln_library).suffix == '.parquet':
-            fldpln_library = pl.scan_parquet(config.fldpln_library)
-            fldpln_library = fldpln_library.with_columns(
-                [pl.col(c).cast(pl.Float32)
-                for c, d in fldpln_library.collect_schema().items() if d == pl.Decimal]
-            )
+            fldpln_library = config.fldpln_library
         else:
             fldpln_library = pl.scan_csv(config.fldpln_library)
+        # How far the filled DEM sits below the DEM, from the library, for the water surface (see water_surface)
+        fill_below_dem = np.full((nrows, ncols), np.nan, np.float32) if config.outwse else None
     else:
         FlowDir = None
-        filled_dem = None
+        fill_below_dem = None
         stream_info = None
-        streams_gdf = None
         fldpln_library = None
 
     LOG.info("Executing flood mapping logic...")
@@ -1015,8 +1069,9 @@ def main_flood_ouputs(
     S_Rast = np.full((nrows,ncols), np.nan, np.float32) if config.outvel else None
 
     Flood_Ensemble = np.zeros((nrows, ncols), dtype=np.float16 if num_flows > 1 else np.uint8)  # use uint8 if only one flow, otherwise float16 for percentage calculation
-    Depth_array_list = []
-    Slope_array_list = []
+    # The largest depth and slope over the events so far (see accumulate_positive_max)
+    Depth_Max = None
+    Slope_Max = None
     for flow_event_num in range(num_flows):
         LOG.info('Working on Flow Event ' + str(flow_event_num))
         # clear out last events values
@@ -1031,12 +1086,13 @@ def main_flood_ouputs(
             config, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
             COMID_Unique_Flow, WeightBox, TW_for_WeightBox_ElipseMask,
             quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast, FlowDir,
-            filled_dem, stream_info, fldpln_library, streams_gdf
+            fill_below_dem, stream_info, fldpln_library
             )
         Flood_array_this_flow = remove_cells_not_connected(Flood_array_this_flow, S)
         Flood_Ensemble += Flood_array_this_flow
-        Depth_array_list.append(Depth_array)
-        Slope_array_list.append(Slope_array)
+        Depth_Max = accumulate_positive_max(Depth_Max, Depth_array)
+        Slope_Max = accumulate_positive_max(Slope_Max, Slope_array)
+        del Flood_array_this_flow, Depth_array, Slope_array
 
     # clear some memory by deleting large arrays that are no longer needed
     del T_Rast
@@ -1074,7 +1130,7 @@ def main_flood_ouputs(
 
     if Flood_File:
         LOG.info('Creating Ensemble Flood Map...' + str(Flood_File))
-        out_ds: gdal.Dataset = gdal.GetDriverByName("GTiff").Create(Flood_File, ncols, nrows, 1, gdal.GDT_Byte, options=[f"COMPRESS={config.compression}", "PREDICTOR=2"])
+        out_ds: gdal.Dataset = gdal.GetDriverByName("GTiff").Create(Flood_File, ncols, nrows, 1, gdal.GDT_Byte, options=[f"COMPRESS={config.compression}", "PREDICTOR=2", _WRITE_THREADS])
         out_ds.SetGeoTransform(dem_geotransform)
         out_ds.SetProjection(dem_projection)
         out_ds.WriteArray(Flood_Ensemble)
@@ -1083,14 +1139,15 @@ def main_flood_ouputs(
 
 
     if OutDEP or OutWSE or OutVEL:
-        Depth_Array = create_depth(Depth_array_list, Flood_Ensemble)
+        Depth_Array = create_depth(finish_positive_max(Depth_Max), Flood_Ensemble)
+        del Depth_Max
 
         if OutDEP:
-            out_band_data = np.where(np.isnan(Depth_Array), -9999.0, Depth_Array).astype(np.float32)
+            out_band_data = np.where(np.isnan(Depth_Array), -9999.0, Depth_Array).astype(np.float32, copy=False)
 
             ds: gdal.Dataset = gdal.GetDriverByName("GTiff").Create(
                 OutDEP, ncols, nrows, 1, gdal.GDT_Float32,
-                options=[f"COMPRESS={config.compression}", "PREDICTOR=2", "TILED=YES"]
+                options=[f"COMPRESS={config.compression}", "PREDICTOR=2", "TILED=YES", _WRITE_THREADS]
             )
             if ds is None:
                 raise RuntimeError(f"Failed to create output raster: {OutDEP}")
@@ -1106,14 +1163,15 @@ def main_flood_ouputs(
 
             band = None
             ds = None
+            del out_band_data
 
     if OutWSE:
-        WSE_Array = water_surface(Depth_Array, E[1:-1, 1:-1], filled_dem if config.mapper == FLDPLN else None)
+        WSE_Array = water_surface(Depth_Array, E[1:-1, 1:-1], fill_below_dem)
 
         driver = gdal.GetDriverByName("GTiff")
         ds: gdal.Dataset = driver.Create(
             OutWSE, ncols, nrows, 1, gdal.GDT_Float32,
-            options=[f"COMPRESS={config.compression}", "PREDICTOR=2", "TILED=YES"]
+            options=[f"COMPRESS={config.compression}", "PREDICTOR=2", "TILED=YES", _WRITE_THREADS]
         )
         if ds is None:
             raise RuntimeError(f"Failed to create output raster: {OutWSE}")
@@ -1129,6 +1187,7 @@ def main_flood_ouputs(
 
         band = None
         ds = None
+        del WSE_Array
 
     # The FLDPLN mapper gives no slopes: each flooded cell takes its nearest
     # stream cell's slope, averaged over its 3x3 neighbourhood
@@ -1137,10 +1196,12 @@ def main_flood_ouputs(
         valid = Slope_array > 0
         Slope_array[~valid] = np.nan
         uniform_smoothing(valid, Slope_array)
-        Slope_array_list = [Slope_array]
+        Slope_Max = accumulate_positive_max(None, Slope_array)
+        del Slope_array, valid
 
     if OutVEL:
-        create_velocity(config, OutVEL, Depth_Array, LC_array, Slope_array_list, dem_geotransform, dem_projection, ncols, nrows, Flood_Ensemble)
+        create_velocity(config, OutVEL, Depth_Array, LC_array, finish_positive_max(Slope_Max), dem_geotransform,
+                        dem_projection, ncols, nrows, Flood_Ensemble)
 
     if config.strmshp_file and config.make_output_gpkg and Flood_File:
         flood_gdf = Write_Output_Raster_As_GeoDataFrame(Flood_Ensemble, ncols, nrows, dem_geotransform, dem_projection, gdal.GDT_Byte)

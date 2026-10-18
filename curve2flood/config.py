@@ -39,6 +39,7 @@ _REMOVED_KEYS = {
     'fldpln_median_filter_size': "the FLDPLN mapper no longer smooths the stages with a running median",
     'max_drop_below_source': "FLDPLN no longer limits how far below its stream pixel a cell may lie",
     'fldpln_max_drop_below_source': "FLDPLN no longer limits how far below its stream pixel a cell may lie",
+    'filled_dem_file': "the FLDPLN mapper takes the filled DEM at the stream from the VDT's Elev and the library's fill",
 }
 
 _TRUE = {'true', 'yes', 'y', 'on', '1'}
@@ -69,9 +70,8 @@ class Config:
     stream_file: str | None = None
     lu_raster_sameres: str | None = None
     lu_manning_n: str | None = None
+    # Only the GeoPackage output (make_output_gpkg) asks for it; ARC reads it, with its reach_id fields
     strmshp_file: str | None = None
-    reach_id: str = "LINKNO"
-    downstream_reach_id: str = "DSLINKNO"
 
     # Outputs
     outfld: str | None = None
@@ -94,7 +94,6 @@ class Config:
 
     # FLDPLN mapper
     flow_direction_file: str | None = None
-    filled_dem_file: str | None = None
     stream_info_file: str | None = None
     fldpln_library: str | None = None
 
@@ -247,10 +246,8 @@ class Config:
         if fldpln:
             required.update({
                 'Flow_Direction_File': self.flow_direction_file,
-                'Filled_DEM_File': self.filled_dem_file,
                 'Stream_Info_File': self.stream_info_file,
                 'FLDPLN_Library': self.fldpln_library,
-                'StrmShp_File': self.strmshp_file,
             })
         if self.outvel:
             required['LU_Manning_n'] = self.lu_manning_n

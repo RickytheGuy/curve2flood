@@ -33,7 +33,6 @@ dependencies = [
     "tqdm",
     "polars",
     "pyproj",
-    "networkx",
 ]
 
 [project.optional-dependencies]
