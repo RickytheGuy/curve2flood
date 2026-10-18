@@ -14,14 +14,21 @@ depth per segment, which is all mapping an event then needs.
 
 Two solvers build the library:
 
-``solver="exact"`` (default)
+``solver="iterative"`` (default)
+    The depth-stepped algorithm, raising the water ``dh`` at a time.  Without
+    ``iterative_spill`` water spills over a divide once per step, as FLDPLN
+    recommends for coarse DEMs (30 m); a larger ``dh`` damps spillover more.
+
+``solver="exact"``
     DTF is the smallest total climb along any 8-connected path from the stream
     to the pixel (downhill steps are free), found in one Dijkstra sweep.  This
-    is the limit of the depth-stepped algorithm as ``dh`` goes to 0.
-
-``solver="iterative"``
-    The depth-stepped algorithm, raising the water ``dh`` at a time.  A larger
-    ``dh`` damps spillover, which can over-flood on coarse DEMs.
+    is the limit of the depth-stepped algorithm with ``iterative_spill`` as
+    ``dh`` goes to 0: water keeps spilling and running downhill for as long as
+    it can.  On a valley floor or fan below a canyon that spreads a stream's
+    water over everything lower: on a 30 m DEM of the Grand Valley (Colorado),
+    small desert washes flooded 355 km2 outside the river at the 2-year flow,
+    against 47 km2 with the default.  On 68 US test sites the default scores
+    about the same (mean MCC 0.5705 against 0.5649).
 
 Both solve each stream segment in a window around it that grows when the
 floodplain reaches its edge, so the result never depends on the window size.
@@ -907,7 +914,7 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
                                global_max_wse: float = 0.0,
                                bg: float = -9999,
                                spill_decay: float = 0.0,
-                               solver: str = "exact",
+                               solver: str = "iterative",
                                max_cells: int = 0,
                                channel: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None) -> pd.DataFrame:
     """Floodplain table for one stream segment.
@@ -1268,10 +1275,10 @@ def build_fldpln_library(
     stream_info_file: str,
     flow_direction_file: str,
     library_file: str,
-    dh: float,
-    fldmn: float,
-    fldmx: float,
-    iterative_spill: bool,
+    dh: float = 0.5,
+    fldmn: float = 0.1,
+    fldmx: float = 25.0,
+    iterative_spill: bool = False,
     vdt_file: str = None,
     bg_mask: np.ndarray | None = None,
     stream_ids: list[int] | None = None,
@@ -1281,7 +1288,7 @@ def build_fldpln_library(
     pbar: bool = True,
     processes: int | None = None,
     spill_decay: float = 0.0,
-    solver: str = "exact",
+    solver: str = "iterative",
     max_cells_per_segment: int | None = None,
     max_reach_length: float | None = 5000.0,
     max_profile_deviation: float | None = 1.0,
@@ -1316,14 +1323,15 @@ def build_fldpln_library(
     library_file: str
         Where to save the library: Parquet (``.parquet``/``.pq``, compact) or CSV.
     dh: float
-        Depth step of the iterative solver (m).  Ignored by the exact solver.
+        Depth step of the iterative solver (m), 0.5 by default.  Ignored by the
+        exact solver.
     fldmn: float
-        Smallest DTF stored (m); smaller DTFs are raised to it.
+        Smallest DTF stored (m); smaller DTFs are raised to it.  0.1 by default.
     fldmx: float
-        Largest depth to flood to (m).
+        Largest depth to flood to (m).  25 by default.
     iterative_spill: bool
         Iterative solver only: keep spilling until the floodplain stops growing.
-        Recommended for fine DEMs (10 m or less).
+        Recommended for fine DEMs (10 m or less); off by default.
     vdt_file: str | None
         A VDT database.  Each segment then floods only to the deepest water its
         last ``wse_*`` column gives (at most ``fldmx``), and segments without
@@ -1347,7 +1355,7 @@ def build_fldpln_library(
         each pixel's D8 successor, so other downhill steps stay free and it
         trims little (see the FLDPLN docs).  0 (default) for none.
     solver: str
-        ``"exact"`` (default) or ``"iterative"``; see the module docstring.
+        ``"iterative"`` (default) or ``"exact"``; see the module docstring.
     max_cells_per_segment: int | None
         Most rows one segment may contribute.  A segment that would flood more
         stops at the depth where it fills up, so deeper floods there are mapped
@@ -1397,10 +1405,10 @@ def _build_fldpln_library(
     stream_info_file: str,
     flow_direction_file: str,
     library_file: str,
-    dh: float,
-    fldmn: float,
-    fldmx: float,
-    iterative_spill: bool,
+    dh: float = 0.5,
+    fldmn: float = 0.1,
+    fldmx: float = 25.0,
+    iterative_spill: bool = False,
     vdt_file: str = None,
     stream_ids: list[int] | None = None,
     global_max_wse: float = 0.0,
@@ -1410,7 +1418,7 @@ def _build_fldpln_library(
     processes: int | None = None,
     bg_mask: np.ndarray | None = None,
     spill_decay: float = 0.0,
-    solver: str = "exact",
+    solver: str = "iterative",
     max_cells_per_segment: int | None = None,
     max_reach_length: float | None = 5000.0,
     max_profile_deviation: float | None = 1.0,
@@ -1715,13 +1723,18 @@ def _make_fldpln_flood_map(
     1. Stream pixels are chained along the network's longest paths.  Along
        each chain, the stage of stream pixel ``s`` (its water depth over the
        filled DEM) is the VDT's water surface minus the filled DEM.  Pixels
-       without a VDT value take the water surface interpolated linearly
-       between the VDT cells on either side.
+       without a VDT value take the stage interpolated linearly between the
+       VDT cells on either side.  The depth, not the water surface: where ARC
+       has no rating curve, as down a cliff, the bed bends between the VDT
+       cells, and a straight water surface across the gap would stand metres
+       above it (or below it).
     2. Each segment ``R`` floods at one depth ``DoF(R)``, as the library
        assumes: the median of its stream pixels' stages, each pixel weighted
        by the library rows it is the source of, so by the floodplain cells it
        floods.  That is the single depth closest, summed over those cells, to
-       the stage at each cell's own source.  A library without a ``segment``
+       the stage at each cell's own source.  Only the pixels with a VDT value
+       vote, unless the segment has none: one interpolated pixel can be the
+       source of most of a segment's rows.  A library without a ``segment``
        column (built before reaches were split) floods each reach at one
        depth.
     3. Each library row ``(s, p, DTF, fill)`` whose water reaches ``p``'s
@@ -1808,13 +1821,13 @@ def _make_fldpln_flood_map(
         filled_dem_profile = np.array([filled_dem[_pixel_to_rc(pixel, ncols)]
                                        for pixel, _ in path_rows])
 
-        # The water surface, interpolated across the pixels without a VDT
-        # value, over the filled DEM
-        dof_profile = _fill_missing_profile(mask, Y[mask]) - filled_dem_profile
+        # The depth over the filled DEM, interpolated across the pixels
+        # without a VDT value
+        dof_profile = _fill_missing_profile(mask, (Y - filled_dem_profile)[mask])
 
         row_chunks.extend([
-            (fsp, dof)
-            for (fsp, _), dof in zip(path_rows, dof_profile)
+            (fsp, dof, bool(measured))
+            for (fsp, _), dof, measured in zip(path_rows, dof_profile, mask)
             if np.isfinite(dof)
         ])
 
@@ -1822,8 +1835,9 @@ def _make_fldpln_flood_map(
         return depth_array
 
     # A pixel on two chains keeps its deeper stage
-    stage = (pl.DataFrame(row_chunks, schema={'FSP': pl.Int32, 'DoF': pl.Float32}, orient='row')
-             .group_by('FSP').agg(pl.col('DoF').max()))
+    stage = (pl.DataFrame(row_chunks, schema={'FSP': pl.Int32, 'DoF': pl.Float32, 'measured': pl.Boolean},
+                          orient='row')
+             .group_by('FSP').agg(pl.col('DoF').max(), pl.col('measured').max()))
 
     # Each segment's stream pixels, with the library rows each is the source of,
     # counted a slice at a time like the join below
@@ -1842,6 +1856,8 @@ def _make_fldpln_flood_map(
                                 schema={'FSP': pl.Int32, 'segment': pl.Int64}, orient='row').unique('FSP')
         votes = votes.join(reach_of, on='FSP', how='inner')
     votes = votes.join(stage, on='FSP', how='inner')
+    # A pixel without a VDT value votes only in a segment that has none with one
+    votes = votes.filter(pl.col('measured') | ~pl.col('measured').any().over('segment'))
     if votes.is_empty():
         return depth_array
     segments, depths = _weighted_median_by_group(votes['segment'].to_numpy(), votes['DoF'].to_numpy(),
