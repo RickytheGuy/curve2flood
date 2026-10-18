@@ -1694,20 +1694,44 @@ def longest_path_decomposition(G: nx.DiGraph, stream_wse_dict: dict[int, list[tu
 
     return paths
 
-def _weighted_median_by_group(group: np.ndarray, value: np.ndarray, weight: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Each group's weighted median: the smallest value whose cumulative weight reaches half the group's total.
+def _median_by_group(group: np.ndarray, value: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Each group's median: its middle value, or the lower of the two middle ones for an even count.
 
     Returns the groups, sorted, and their medians.
     """
     order = np.lexsort((value, group))
-    group, value, weight = group[order], value[order], weight[order].astype(np.float64)
+    group, value = group[order], value[order]
     starts = np.flatnonzero(np.r_[True, group[1:] != group[:-1]])
     sizes = np.diff(np.r_[starts, len(group)])
-    cumulative = np.cumsum(weight)
-    within = cumulative - np.repeat(cumulative[starts] - weight[starts], sizes)
-    half = np.repeat(np.add.reduceat(weight, starts) / 2, sizes)
-    first = np.minimum.reduceat(np.where(within >= half, np.arange(len(group)), len(group)), starts)
-    return group[starts], value[first]
+    return group[starts], value[starts + (sizes - 1) // 2]
+
+def _interpolate_within_segments(segment: np.ndarray, position: np.ndarray, measured: np.ndarray,
+                                 stage: np.ndarray) -> np.ndarray:
+    """Each pixel's stage, with the unmeasured pixels' taken from the measured pixels of their own segment.
+
+    The pixels are sorted by segment, then by ``position`` along the stream.
+    Between two measured pixels of a segment the stage is interpolated
+    linearly by position; before the first and after the last it is that
+    pixel's.  A segment without a measured pixel keeps ``stage``.
+    """
+    n = len(segment)
+    index = np.arange(n)
+    starts = np.flatnonzero(np.r_[True, segment[1:] != segment[:-1]])
+    sizes = np.diff(np.r_[starts, n])
+    first, end = np.repeat(starts, sizes), np.repeat(starts + sizes, sizes)
+    # The nearest measured pixel of the same segment before or at, and after or at, each pixel
+    before = np.maximum.accumulate(np.where(measured, index, -1))
+    after = np.minimum.accumulate(np.where(measured, index, n)[::-1])[::-1]
+    before = np.where(before >= first, before, after)
+    after = np.where(after < end, after, before)
+    stage = np.asarray(stage, dtype=float)
+    out = stage.copy()
+    known = ~measured & (before < end)
+    b, a = before[known], after[known]
+    span = (position[a] - position[b]).astype(float)
+    t = np.divide(position[known] - position[b], span, out=np.zeros(len(b)), where=span > 0)
+    out[known] = stage[b] + t * (stage[a] - stage[b])
+    return out
 
 def _make_fldpln_flood_map(
         filled_dem: np.ndarray,
@@ -1729,14 +1753,17 @@ def _make_fldpln_flood_map(
        cells, and a straight water surface across the gap would stand metres
        above it (or below it).
     2. Each segment ``R`` floods at one depth ``DoF(R)``, as the library
-       assumes: the median of its stream pixels' stages, each pixel weighted
-       by the library rows it is the source of, so by the floodplain cells it
-       floods.  That is the single depth closest, summed over those cells, to
-       the stage at each cell's own source.  Only the pixels with a VDT value
-       vote, unless the segment has none: one interpolated pixel can be the
-       source of most of a segment's rows.  A library without a ``segment``
-       column (built before reaches were split) floods each reach at one
-       depth.
+       assumes: the median of its stream pixels' stages, every pixel counted
+       once, however many floodplain cells it is the source of.  The depth is
+       the one the VDT gives the segment, not one chosen for what it floods.
+       In a segment with VDT values, a pixel without one takes the stage
+       interpolated between the segment's own pixels with one, and held
+       beyond the first and last, so ``DoF(R)`` never leaves the range of
+       the stages ARC gave the segment: interpolated from the next segment,
+       its stage would pull the median toward that segment's.  Only a
+       segment without VDT values keeps the stages of step 1.  A library
+       without a ``segment`` column (built before reaches were split) floods
+       each reach at one depth.
     3. Each library row ``(s, p, DTF, fill)`` whose water reaches ``p``'s
        filled surface (``DoF(R) - DTF(s, p) > 0``, ``R`` being ``s``'s
        segment) gives ``p`` the depth ``DoF(R) - DTF(s, p) + max(fill(p), 0)``:
@@ -1839,31 +1866,39 @@ def _make_fldpln_flood_map(
                           orient='row')
              .group_by('FSP').agg(pl.col('DoF').max(), pl.col('measured').max()))
 
-    # Each segment's stream pixels, with the library rows each is the source of,
-    # counted a slice at a time like the join below
+    # Each segment's stream pixels, read a slice at a time like the join below.
+    # Every stream pixel of a reach in the library is the source of at least
+    # its own cell, so it has a row there.
     n_library = fldpln_library.select(pl.len()).collect().item()
     if n_library == 0:
         return depth_array
     key = 'segment' if 'segment' in columns else 'FSP'
     group = ['segment', 'FSP'] if key == 'segment' else ['FSP']
-    votes = pl.concat([
-        fldpln_library.slice(offset, _LIBRARY_SLICE_ROWS).group_by(group).agg(pl.len().alias('rows')).collect()
+    pixels = pl.concat([
+        fldpln_library.slice(offset, _LIBRARY_SLICE_ROWS).select(group).unique().collect()
         for offset in range(0, n_library, _LIBRARY_SLICE_ROWS)
-    ]).group_by(group).agg(pl.col('rows').sum())
+    ]).unique()
+    # Each stream pixel's reach and its place along it, from upstream: a
+    # segment is a piece of one reach
+    place = pl.DataFrame([(fsp, stream_id, i) for stream_id, rows in stream_rows.items()
+                          for i, (fsp, _) in enumerate(rows)],
+                         schema={'FSP': pl.Int32, 'reach': pl.Int64, 'position': pl.Int32},
+                         orient='row').unique('FSP', keep='first', maintain_order=True)
     if key == 'FSP':
         # A library built before reaches were split into segments: each reach is one
-        reach_of = pl.DataFrame([(fsp, stream_id) for stream_id, rows in stream_rows.items() for fsp, _ in rows],
-                                schema={'FSP': pl.Int32, 'segment': pl.Int64}, orient='row').unique('FSP')
-        votes = votes.join(reach_of, on='FSP', how='inner')
-    votes = votes.join(stage, on='FSP', how='inner')
-    # A pixel without a VDT value votes only in a segment that has none with one
-    votes = votes.filter(pl.col('measured') | ~pl.col('measured').any().over('segment'))
-    if votes.is_empty():
+        reach_of = place.select('FSP', segment='reach')
+        pixels = pixels.join(reach_of, on='FSP', how='inner')
+    pixels = (pixels.join(stage, on='FSP', how='inner')
+              .join(place.select('FSP', 'position'), on='FSP', how='inner')
+              .sort(['segment', 'position']))
+    if pixels.is_empty():
         return depth_array
-    segments, depths = _weighted_median_by_group(votes['segment'].to_numpy(), votes['DoF'].to_numpy(),
-                                                 votes['rows'].to_numpy())
+    # A pixel without a VDT value takes its stage from its own segment's pixels with one
+    stages = _interpolate_within_segments(pixels['segment'].to_numpy(), pixels['position'].to_numpy(),
+                                          pixels['measured'].to_numpy(), pixels['DoF'].to_numpy())
+    segments, depths = _median_by_group(pixels['segment'].to_numpy(), stages)
     df = pl.DataFrame({'segment': segments, 'DoF': depths.astype(np.float32)},
-                      schema_overrides={'segment': votes.schema['segment']})
+                      schema_overrides={'segment': pixels.schema['segment']})
     if key == 'FSP':
         df = reach_of.join(df, on='segment', how='inner').select('FSP', 'DoF')
     df = df.lazy()
