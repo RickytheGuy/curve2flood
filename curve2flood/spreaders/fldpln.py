@@ -30,8 +30,12 @@ Two solvers build the library:
     against 47 km2 with the default.  On 68 US test sites the default scores
     about the same (mean MCC 0.5705 against 0.5649).
 
-Both solve each stream segment in a window around it that grows when the
-floodplain reaches its edge, so the result never depends on the window size.
+The exact solver solves each stream segment in a window around it that grows
+when the floodplain reaches its edge, so the result never depends on the
+window size.  A library build solves with the iterative solver on the whole
+raster, in arrays each thread keeps from one segment to the next
+(``_Workspace``), which gives what the windows give without solving any
+segment twice.
 
 Flow directions use WhiteboxTools D8 codes, and the stream table has columns
 ``start_pixel, end_pixel, length, stream_id``.  Pixels are flat row-major
@@ -43,6 +47,7 @@ from __future__ import annotations
 import os
 import math
 import itertools
+import threading
 import contextlib
 from pathlib import Path
 from collections import deque
@@ -113,6 +118,13 @@ _DTF_UNITS_PER_METRE = 10000.0
 # Library rows written and read at a time: one row group of a library written by
 # save_library.
 _LIBRARY_SLICE_ROWS = 1 << 20
+
+# Segments whose rows may wait for the library's writer thread
+_WRITES_AHEAD = 4
+
+# The most threads a parallel build takes by default: each holds a copy of the
+# solver's arrays of the whole raster, and more than two hardly build faster
+_DEFAULT_THREADS = 4
 
 
 @register_jitable(cache=True, nogil=True, forceinline=True)
@@ -550,10 +562,44 @@ def _solve_exact(fil: np.ndarray, fdr: np.ndarray, ncols: int,
 # Depth-stepped solver -- algorithm steps 1-8
 # ---------------------------------------------------------------------------
 
+# The depth-stepped solver tests a cell's eight neighbours over and over: are
+# they dry, do they have data, do they drain into it?  It reads the answers as
+# bit masks, bit ``pos`` for the neighbour at ``NEIGHBOR_DELTAS[pos]``: one
+# byte rather than eight scattered reads.
+
+@njit(cache=True, nogil=True)
+def _neighbour_bits(fil: np.ndarray, fdr: np.ndarray, ncols: int, bg: float) -> tuple[np.ndarray, np.ndarray]:
+    """For each cell of a window with its halo (flat, ``ncols`` wide): which neighbours drain into it (``inflow``),
+    and which have data (``has_data``, not ``bg``).  The halo's cells have neither."""
+    inflow = np.zeros(fdr.size, dtype=np.uint8)
+    has_data = np.zeros(fdr.size, dtype=np.uint8)
+    for row in range(1, fdr.size // ncols - 1):
+        for pixel in range(row * ncols + 1, (row + 1) * ncols - 1):
+            drains, data = 0, 0
+            for pos in range(8):
+                dr, dc = NEIGHBOR_DELTAS[pos]
+                neighbor = pixel + dr * ncols + dc
+                if fdr[neighbor] == INFLOW[pos]:
+                    drains |= 1 << pos
+                if fil[neighbor] != bg:
+                    data |= 1 << pos
+            inflow[pixel] = drains
+            has_data[pixel] = data
+    return inflow, has_data
+
+@njit(cache=True, nogil=True, inline="always")
+def _flood(cell: int, in_flood: np.ndarray, wet: np.ndarray, offsets: np.ndarray):
+    """Mark ``cell`` flooded, and so a wet neighbour of each of its neighbours (``wet``: bit ``pos`` for the
+    neighbour at ``NEIGHBOR_DELTAS[pos]``, whose own neighbour at ``7 - pos`` is the cell)."""
+    in_flood[cell] = True
+    for pos in range(8):
+        neighbor = cell + offsets[pos]
+        wet[neighbor] = wet[neighbor] | (1 << (7 - pos))
+
 @njit(cache=True, nogil=True)
 def _backfill_from_source(source: int, base_dtf: float, max_wse: float,
-                          fil: np.ndarray, fdr: np.ndarray, offsets: np.ndarray,
-                          bg: float, skip_flooded: bool, in_flood: np.ndarray,
+                          fil: np.ndarray, inflow: np.ndarray, offsets: np.ndarray,
+                          bg: float, skip_flooded: bool, wet: np.ndarray,
                           blocked: np.ndarray, blocked_stamp: int,
                           stack: np.ndarray, visited: np.ndarray, visit_stamp: int,
                           out_pixels: np.ndarray, out_dtf: np.ndarray) -> int:
@@ -561,7 +607,9 @@ def _backfill_from_source(source: int, base_dtf: float, max_wse: float,
 
     ``DTF`` is measured from ``source``'s elevation, as the dissertation defines
     it; on a filled DEM the inverse-D8 walk is elevation-monotone, so that equals
-    the accumulated positive rise.  Returns the number of cells written.
+    the accumulated positive rise.  ``inflow`` (``_neighbour_bits``) gives
+    the neighbours that drain into each cell, and ``wet`` those flooded,
+    skipped with ``skip_flooded``.  Returns the number of cells written.
     """
     source_elev = fil[source]
     visited[source] = visit_stamp
@@ -571,18 +619,19 @@ def _backfill_from_source(source: int, base_dtf: float, max_wse: float,
     while top > 0:
         top -= 1
         center = stack[top]
+        bits = inflow[center]
+        if skip_flooded:
+            bits &= ~wet[center]
         for pos in range(8):
+            if not (bits >> pos) & 1:
+                continue
             neighbor = center + offsets[pos]
             if visited[neighbor] == visit_stamp:
                 continue
             if blocked_stamp != 0 and blocked[neighbor] == blocked_stamp:
                 continue
-            if skip_flooded and in_flood[neighbor]:
-                continue
             neighbor_elev = fil[neighbor]
             if neighbor_elev == bg or neighbor_elev > max_wse:
-                continue
-            if fdr[neighbor] != INFLOW[pos]:
                 continue
             visited[neighbor] = visit_stamp
             out_pixels[count] = neighbor
@@ -593,22 +642,11 @@ def _backfill_from_source(source: int, base_dtf: float, max_wse: float,
     return count
 
 @njit(cache=True, nogil=True)
-def _is_interior_boundary(pixel: int, fil: np.ndarray, offsets: np.ndarray,
-                          in_flood: np.ndarray, bg: float) -> bool:
-    """``pixel`` is on the interior boundary if some neighbour is dry, non-background."""
-    for pos in range(8):
-        neighbor = pixel + offsets[pos]
-        if not in_flood[neighbor] and fil[neighbor] != bg:
-            return True
-    return False
-
-@njit(cache=True, nogil=True)
 def _refresh_boundary(boundary: np.ndarray, n_boundary: int,
                       added: np.ndarray, n_added: int,
-                      fil: np.ndarray, offsets: np.ndarray,
-                      in_flood: np.ndarray, on_boundary: np.ndarray,
-                      bg: float) -> int:
-    """Re-derive the full interior boundary ``dI F`` (algorithm steps 3 and 8).
+                      has_data: np.ndarray, wet: np.ndarray, on_boundary: np.ndarray) -> int:
+    """Re-derive the full interior boundary ``dI F`` (algorithm steps 3 and 8):
+    the flooded cells with a dry neighbour that has data.
 
     The floodplain only grows, so a flooded cell that is not on the boundary can
     never rejoin it.  Retesting the previous boundary plus the newly flooded
@@ -618,7 +656,7 @@ def _refresh_boundary(boundary: np.ndarray, n_boundary: int,
     kept = 0
     for i in range(n_boundary):
         pixel = boundary[i]
-        if _is_interior_boundary(pixel, fil, offsets, in_flood, bg):
+        if has_data[pixel] & ~wet[pixel]:
             boundary[kept] = pixel
             kept += 1
         else:
@@ -627,7 +665,7 @@ def _refresh_boundary(boundary: np.ndarray, n_boundary: int,
         pixel = added[i]
         if on_boundary[pixel]:
             continue
-        if _is_interior_boundary(pixel, fil, offsets, in_flood, bg):
+        if has_data[pixel] & ~wet[pixel]:
             on_boundary[pixel] = True
             boundary[kept] = pixel
             kept += 1
@@ -643,9 +681,49 @@ def _order_by_depth_then_elevation(keys: np.ndarray, depth: np.ndarray,
     spillover flood depth ... decreasing in elevation").  Order matters because
     assimilation keeps the first-arriving minimum, so it decides which FSP claims
     a cell -- and, as Kastens notes, it "help[s] limit redundant processing".
+
+    Ties keep the order of ``keys``.  Past a few hundred keys they are sorted
+    by a radix sort of both as one 64-bit key, which is several times faster.
     """
-    by_elevation = keys[np.argsort(-elevation[keys], kind="mergesort")]
-    return by_elevation[np.argsort(depth[by_elevation], kind="mergesort")]
+    n = keys.size
+    if n < 512:
+        by_elevation = keys[np.argsort(-elevation[keys], kind="mergesort")]
+        return by_elevation[np.argsort(depth[by_elevation], kind="mergesort")]
+    
+    key = (_ordered_bits(depth[keys]) << np.uint64(32)) | _ordered_bits(-elevation[keys])
+    # Stable least-significant-digit radix sort, 11 bits at a time
+    order = keys.copy()
+    spare_order = np.empty_like(order)
+    spare_key = np.empty_like(key)
+    counts = np.empty(2049, dtype=np.int64)
+    for shift in range(0, 64, 11):
+        counts[:] = 0
+        for i in range(n):
+            counts[((key[i] >> np.uint64(shift)) & np.uint64(2047)) + 1] += 1
+        if counts.max() == n:
+            continue  # every key has this digit
+        for d in range(2048):
+            counts[d + 1] += counts[d]
+        for i in range(n):
+            d = (key[i] >> np.uint64(shift)) & np.uint64(2047)
+            at = counts[d]
+            counts[d] = at + 1
+            spare_order[at] = order[i]
+            spare_key[at] = key[i]
+        order, spare_order = spare_order, order
+        key, spare_key = spare_key, key
+    return order
+
+@njit(cache=True, nogil=True)
+def _ordered_bits(values: np.ndarray) -> np.ndarray:
+    """float32 ``values`` as unsigned integers in the same order, ties as ties (-0.0 is 0.0); no NaN."""
+    bits = (values + np.float32(0.0)).view(np.uint32)
+    sign = np.uint32(0x80000000)
+    out = np.empty(values.size, dtype=np.uint64)
+    for i in range(values.size):
+        b = bits[i]
+        out[i] = np.uint64(~b if b & sign else b | sign)
+    return out
 
 @njit(cache=True, nogil=True)
 def _forward_path(start: int, spill_dtf: float, fil: np.ndarray, fdr: np.ndarray,
@@ -689,30 +767,55 @@ def _forward_path(start: int, spill_dtf: float, fil: np.ndarray, fdr: np.ndarray
         spill_dtf += spill_decay
     return length
 
-@njit(cache=True, nogil=True)
-def _solve_iterative(fil: np.ndarray, fdr: np.ndarray, ncols: int,
-                     sources: np.ndarray, excluded: np.ndarray,
-                     dh: float, fldmn: float, fldmx: float, iterative_spill: bool,
-                     global_max_wse: float, bg: float, spill_decay: float):
-    """Depth-stepped FLDPLN (algorithm steps 1-8).
+# The iterative solver's arrays, one value per cell of its window (``_iterative_arrays``), in this order:
+#  0-4    dtf, fsp, in_flood, on_boundary, flood_depths: the floodplain, set only at the cells it floods
+#  5-13   dirty, boundary, added, stack, fill_pixels, fill_dtf, path, touched, flooded: lists of cells
+#  14-17  cand_avail, cand_belev, cand_fsp, cand_dtf: spillover candidates, read only where cand_stamp is current
+#  18     spilled_depth: the path depth a cell was last backfilled from, read only where spilled_round is current
+#  19-24  dirty_stamp, visited, seen, on_path, cand_stamp, spilled_round: generation stamps
+#  25     wet: which neighbours are flooded (see _flood), set only next to the cells it floods
+# ``counters`` holds the last stamp and spill round, so that stamps go on rising when the arrays are reused.
+_UNREACHED = np.float32(3.4e38)
+_STAMPS = slice(19, 25)
 
-    Returns ``(cells, dtf, fsp)`` in window-local flat ids.
+def _iterative_arrays(n: int) -> tuple[np.ndarray, ...]:
+    """The iterative solver's arrays for a window of ``n`` cells, as it starts.
+
+    Allocated by numpy, not numba, whose zeros are written out: numpy's are
+    the operating system's, and take no memory until the solver writes them.
     """
-    n = fil.size
-    unreached = np.float32(3.4e38)
-    dtf = np.full(n, unreached, dtype=np.float32)
-    fsp = np.full(n, np.int32(-1), dtype=np.int32)
-    in_flood = np.zeros(n, dtype=np.bool_)
-    on_boundary = np.zeros(n, dtype=np.bool_)
+    return (np.full(n, _UNREACHED, dtype=np.float32), np.full(n, np.int32(-1), dtype=np.int32),
+            np.zeros(n, dtype=np.bool_), np.zeros(n, dtype=np.bool_), np.zeros(n, dtype=np.float32),
+            np.empty(n, dtype=np.int32), np.empty(n, dtype=np.int32), np.empty(n, dtype=np.int32),
+            np.empty(n, dtype=np.int32), np.empty(n, dtype=np.int32), np.empty(n, dtype=np.float32),
+            np.empty(n + 2, dtype=np.int32), np.empty(n, dtype=np.int32), np.empty(n, dtype=np.int32),
+            np.empty(n, dtype=np.float32), np.empty(n, dtype=np.float32), np.empty(n, dtype=np.int32),
+            np.empty(n, dtype=np.float32), np.empty(n, dtype=np.float64),
+            np.zeros(n, dtype=np.int32), np.zeros(n, dtype=np.int32), np.zeros(n, dtype=np.int32),
+            np.zeros(n, dtype=np.int32), np.zeros(n, dtype=np.int32), np.zeros(n, dtype=np.int32),
+            np.zeros(n, dtype=np.uint8))
 
-    # The reference's ``flddat``.  It tracks ``dtf`` during the backfill phase
-    # but is frozen while a spill round processes its candidates, so writes made
-    # then are queued in ``dirty`` and folded in at the start of the next round.
-    flood_depths = np.zeros(n, dtype=np.float32)
-    dirty = np.empty(n, dtype=np.int32)
-    dirty_stamp = np.zeros(n, dtype=np.int32)
+@njit(cache=True, nogil=True)
+def _iterate(fil: np.ndarray, fdr: np.ndarray, inflow: np.ndarray, has_data: np.ndarray, ncols: int,
+             sources: np.ndarray, excluded: np.ndarray,
+             dh: float, fldmn: float, fldmx: float, iterative_spill: bool,
+             global_max_wse: float, bg: float, spill_decay: float, arrays, counters: np.ndarray) -> int:
+    """Depth-stepped FLDPLN (algorithm steps 1-8) on ``arrays`` (``_iterative_arrays``).
+
+    Returns how many cells were listed in ``flooded``: each cell of the
+    floodplain, in the order it was flooded (a source given twice, twice).
+    """
+    (dtf, fsp, in_flood, on_boundary, flood_depths,
+     dirty, boundary, added, stack, fill_pixels, fill_dtf, path, touched, flooded,
+     cand_avail, cand_belev, cand_fsp, cand_dtf, spilled_depth,
+     dirty_stamp, visited, seen, on_path, cand_stamp, spilled_round, wet) = arrays
+
+    # ``flood_depths`` is the reference's ``flddat``.  It tracks ``dtf`` during
+    # the backfill phase but is frozen while a spill round processes its
+    # candidates, so writes made then are queued in ``dirty`` and folded in at
+    # the start of the next round.
     n_dirty = 0
-    round_id = 0
+    round_id = counters[1]
 
     offsets = np.empty(8, dtype=np.int64)
     offsets[0] = -ncols - 1
@@ -726,25 +829,8 @@ def _solve_iterative(fil: np.ndarray, fdr: np.ndarray, ncols: int,
 
     # Generation stamps stand in for the transient sets of the reference
     # implementation, so nothing has to be cleared between rounds.
-    visited = np.zeros(n, dtype=np.int32)
-    seen = np.zeros(n, dtype=np.int32)
-    on_path = np.zeros(n, dtype=np.int32)
-    stamp = 0
-
-    boundary = np.empty(n, dtype=np.int32)
-    added = np.empty(n, dtype=np.int32)
-    stack = np.empty(n, dtype=np.int32)
-    fill_pixels = np.empty(n, dtype=np.int32)
-    fill_dtf = np.empty(n, dtype=np.float32)
-    path = np.empty(n + 2, dtype=np.int32)
-
-    # Spillover candidates, one slot per cell plus a touched list (step 4).
-    cand_stamp = np.zeros(n, dtype=np.int32)
-    cand_avail = np.empty(n, dtype=np.float32)
-    cand_belev = np.empty(n, dtype=np.float32)
-    cand_fsp = np.empty(n, dtype=np.int32)
-    cand_dtf = np.empty(n, dtype=np.float32)
-    touched = np.empty(n, dtype=np.int32)
+    stamp = counters[0]
+    n_flooded = 0
 
     n_added = 0
     for i in range(sources.size):
@@ -753,12 +839,14 @@ def _solve_iterative(fil: np.ndarray, fdr: np.ndarray, ncols: int,
             continue
         dtf[source] = 0.0
         fsp[source] = source
-        in_flood[source] = True
+        _flood(source, in_flood, wet, offsets)
         flood_depths[source] = fldmn
         added[n_added] = source
+        flooded[n_flooded] = source
+        n_flooded += 1
         n_added += 1
-    n_boundary = _refresh_boundary(boundary, 0, added, n_added, fil, offsets,
-                                   in_flood, on_boundary, bg)
+
+    n_boundary = _refresh_boundary(boundary, 0, added, n_added, has_data, wet, on_boundary)
 
     fldht = 0.0
     iterations = int(np.ceil(fldmx / dh))
@@ -772,11 +860,14 @@ def _solve_iterative(fil: np.ndarray, fdr: np.ndarray, ncols: int,
             pixel = order[i]
             pixel_dtf = dtf[pixel]
             pixel_fsp = fsp[pixel]
+            if not inflow[pixel] & ~wet[pixel]:
+                continue  # no dry neighbour drains into it: there is nothing to backfill
+
             max_wse = min(global_max_wse, fil[pixel] + fldht - pixel_dtf)
             stamp += 1
             count = _backfill_from_source(
-                pixel, pixel_dtf, max_wse, fil, fdr, offsets, bg,
-                True, in_flood, on_path, 0, stack, visited, stamp,
+                pixel, pixel_dtf, max_wse, fil, inflow, offsets, bg,
+                True, wet, on_path, 0, stack, visited, stamp,
                 fill_pixels, fill_dtf)
             for j in range(count):
                 target = fill_pixels[j]
@@ -786,11 +877,12 @@ def _solve_iterative(fil: np.ndarray, fdr: np.ndarray, ncols: int,
                     fsp[target] = pixel_fsp
                     flood_depths[target] = max(fldmn, value)
                     if not in_flood[target]:
-                        in_flood[target] = True
+                        _flood(target, in_flood, wet, offsets)
                         added[n_added] = target
+                        flooded[n_flooded] = target
+                        n_flooded += 1
                         n_added += 1
-        n_boundary = _refresh_boundary(boundary, n_boundary, added, n_added, fil,
-                                       offsets, in_flood, on_boundary, bg)
+        n_boundary = _refresh_boundary(boundary, n_boundary, added, n_added, has_data, wet, on_boundary)
 
         # Steps 3-7: spillover, optionally repeated until the floodplain settles.
         # The reference filters the boundary to ``dtf < fldht`` at the end of a
@@ -822,12 +914,16 @@ def _solve_iterative(fil: np.ndarray, fdr: np.ndarray, ncols: int,
                     continue
                 pixel_fsp = fsp[pixel]
                 limit = min(global_max_wse, pixel_elev + fldht - pixel_dtf)
+                dry = has_data[pixel] & ~wet[pixel]
+
                 for pos in range(8):
+                    if not (dry >> pos) & 1:
+                        continue
                     neighbor = pixel + offsets[pos]
-                    if in_flood[neighbor] or excluded[neighbor]:
+                    if excluded[neighbor]:
                         continue
                     neighbor_elev = fil[neighbor]
-                    if neighbor_elev == bg or neighbor_elev > limit:
+                    if neighbor_elev > limit:
                         continue
                     climb = max(0.0, neighbor_elev - pixel_elev)
                     available = fldht - pixel_dtf - climb
@@ -859,6 +955,7 @@ def _solve_iterative(fil: np.ndarray, fdr: np.ndarray, ncols: int,
                                        path, seen, stamp)
                 if length == 0:
                     continue
+
                 path_stamp = stamp
                 for j in range(length):
                     on_path[path[j]] = path_stamp
@@ -874,17 +971,32 @@ def _solve_iterative(fil: np.ndarray, fdr: np.ndarray, ncols: int,
                             dirty[n_dirty] = source
                             n_dirty += 1
                         if not in_flood[source]:
-                            in_flood[source] = True
+                            _flood(source, in_flood, wet, offsets)
                             added[n_added] = source
+                            flooded[n_flooded] = source
+                            n_flooded += 1
                             n_added += 1
                             n_new += 1
+
                 for j in range(length):
                     source = path[j]
+                    # Spills run shallowest first, so an earlier path of this
+                    # round that backfilled from here, at least as deep, gave
+                    # every cell above it as little DTF as this one would:
+                    # its own path cells above it too, which block this one's
+                    # backfill and are no lower.  Most path cells of a round
+                    # are another's.
+                    if spilled_round[source] == round_id and path_depth <= spilled_depth[source]:
+                        continue
+
+                    spilled_round[source] = round_id
+                    spilled_depth[source] = path_depth
                     stamp += 1
                     count = _backfill_from_source(
-                        source, 0.0, fil[source] + path_depth, fil, fdr, offsets, bg,
-                        False, in_flood, on_path, path_stamp, stack, visited, stamp,
+                        source, 0.0, fil[source] + path_depth, fil, inflow, offsets, bg,
+                        False, wet, on_path, path_stamp, stack, visited, stamp,
                         fill_pixels, fill_dtf)
+                    
                     for k in range(count):
                         target = fill_pixels[k]
                         value = fill_dtf[k] + spill_dtf
@@ -896,13 +1008,14 @@ def _solve_iterative(fil: np.ndarray, fdr: np.ndarray, ncols: int,
                                 dirty[n_dirty] = target
                                 n_dirty += 1
                             if not in_flood[target]:
-                                in_flood[target] = True
+                                _flood(target, in_flood, wet, offsets)
                                 added[n_added] = target
+                                flooded[n_flooded] = target
+                                n_flooded += 1
                                 n_added += 1
                                 n_new += 1
 
-            n_boundary = _refresh_boundary(boundary, n_boundary, added, n_added, fil,
-                                           offsets, in_flood, on_boundary, bg)
+            n_boundary = _refresh_boundary(boundary, n_boundary, added, n_added, has_data, wet, on_boundary)
 
             # Step 7: keep spilling while the boundary can still afford to.
             spill = False
@@ -913,23 +1026,149 @@ def _solve_iterative(fil: np.ndarray, fdr: np.ndarray, ncols: int,
                         break
             shallow_only = True
 
-    n_out = 0
-    for pixel in range(n):
-        if in_flood[pixel]:
-            n_out += 1
-    cells = np.empty(n_out, dtype=np.int32)
-    out_dtf = np.empty(n_out, dtype=np.float32)
-    out_fsp = np.empty(n_out, dtype=np.int32)
-    k = 0
-    for pixel in range(n):
-        if in_flood[pixel]:
-            cells[k] = pixel
-            value = dtf[pixel]
-            out_dtf[k] = fldmn if value < fldmn else value
-            out_fsp[k] = fsp[pixel]
-            k += 1
-    return cells, out_dtf, out_fsp
+    counters[0] = stamp
+    counters[1] = round_id
+    return n_flooded
 
+def _solve_iterative(fil: np.ndarray, fdr: np.ndarray, ncols: int,
+                     sources: np.ndarray, excluded: np.ndarray,
+                     dh: float, fldmn: float, fldmx: float, iterative_spill: bool,
+                     global_max_wse: float, bg: float, spill_decay: float):
+    """Depth-stepped FLDPLN (algorithm steps 1-8) in a window of its own.
+
+    Returns ``(cells, dtf, fsp)`` in window-local flat ids, ascending.
+    """
+    inflow, has_data = _neighbour_bits(fil, fdr, ncols, bg)
+    return _solve_iterative_reusing(fil, fdr, inflow, has_data, ncols, sources, excluded, dh, fldmn, fldmx,
+                                    iterative_spill, global_max_wse, bg, spill_decay, _iterative_arrays(fil.size),
+                                    np.zeros(2, dtype=np.int64), 0, ncols)
+
+
+@njit(cache=True, nogil=True)
+def _solve_iterative_reusing(fil: np.ndarray, fdr: np.ndarray, inflow: np.ndarray, has_data: np.ndarray, ncols: int,
+                             sources: np.ndarray, excluded: np.ndarray,
+                             dh: float, fldmn: float, fldmx: float, iterative_spill: bool,
+                             global_max_wse: float, bg: float, spill_decay: float, arrays, counters: np.ndarray,
+                             halo: int, out_cols: int):
+    """``_solve_iterative`` on ``arrays`` (``_iterative_arrays``), which it leaves as it found them, resetting only
+    the cells it flooded: a thread can keep them from one segment to the next (see ``_Workspace``).
+
+    The cells come out in ascending order: the flooded cells' bounding box
+    is scanned row by row, not the whole window.  A cell at ``(row, col)``
+    of the window comes out as ``(row - halo) * out_cols + col - halo``: its
+    window-local id with ``halo`` 0 and ``out_cols`` ``ncols``, or with 1
+    and the raster's width, its raster id when the window is the raster.
+    """
+    n_flooded = _iterate(fil, fdr, inflow, has_data, ncols, sources, excluded, dh, fldmn, fldmx, iterative_spill,
+                         global_max_wse, bg, spill_decay, arrays, counters)
+    dtf, fsp, in_flood, on_boundary, flood_depths, flooded = (arrays[0], arrays[1], arrays[2], arrays[3], arrays[4],
+                                                              arrays[13])
+    cells = np.empty(n_flooded, dtype=np.int32)
+    out_dtf = np.empty(n_flooded, dtype=np.float32)
+    out_fsp = np.empty(n_flooded, dtype=np.int32)
+    if n_flooded == 0:
+        return cells, out_dtf, out_fsp
+    r0, c0 = fil.size, fil.size
+    r1, c1 = -1, -1
+    for i in range(n_flooded):
+        row = flooded[i] // ncols
+        col = flooded[i] - row * ncols
+        r0, r1, c0, c1 = min(r0, row), max(r1, row), min(c0, col), max(c1, col)
+    k = 0
+    for row in range(r0, r1 + 1):
+        for pixel in range(row * ncols + c0, row * ncols + c1 + 1):
+            if in_flood[pixel]:
+                cells[k] = (row - halo) * out_cols + pixel - row * ncols - halo
+                value = dtf[pixel]
+                out_dtf[k] = fldmn if value < fldmn else value
+                source = fsp[pixel]
+                source_row = source // ncols
+                out_fsp[k] = (source_row - halo) * out_cols + source - source_row * ncols - halo
+                k += 1
+    wet = arrays[25]
+    for i in range(n_flooded):
+        pixel = flooded[i]
+        dtf[pixel] = _UNREACHED
+        fsp[pixel] = -1
+        in_flood[pixel] = False
+        on_boundary[pixel] = False
+        flood_depths[pixel] = 0.0
+        for neighbor in (pixel - ncols - 1, pixel - ncols, pixel - ncols + 1, pixel - 1, pixel + 1,
+                         pixel + ncols - 1, pixel + ncols, pixel + ncols + 1):
+            wet[neighbor] = 0
+    return cells[:k], out_dtf[:k], out_fsp[:k]
+
+class _Workspace:
+    """One thread's iterative solver, on the whole raster, kept from one segment to the next.
+
+    A segment is first solved in a window around it, and again in a larger
+    one whenever its floodplain reaches the window's edge.  The solver's work
+    grows with the cells a segment floods, not with its window, so half of
+    it went to windows thrown away: 42% on the Karnali, 52% on a tile of the
+    Mississippi's floodplain.  The workspace solves every segment once, on
+    the whole raster with the windows' one-cell halo, which a window that
+    the floodplain doesn't reach gives the same result as.  Its arrays are
+    allocated once, about 100 bytes a cell; only DTF and FSP are written in
+    full at once, the rest as segments flood cells, and each solve resets
+    the cells it flooded.
+
+    ``fil`` and ``fdr`` are the filled DEM and flow directions with the halo
+    (``_crop`` of the whole raster), flattened, and ``inflow`` and
+    ``has_data`` their ``_neighbour_bits``; ``channel`` is
+    ``_channel_lookup``'s, empty without a water mask.  The threads share
+    them.
+    """
+
+    def __init__(self, fil: np.ndarray, fdr: np.ndarray, inflow: np.ndarray, has_data: np.ndarray,
+                 channel: tuple[np.ndarray, np.ndarray, np.ndarray]):
+        self.fil, self.fdr, self.inflow, self.has_data, self.channel = fil, fdr, inflow, has_data, channel
+        self.excluded = np.zeros(fil.size, dtype=np.bool_)
+        self.arrays = _iterative_arrays(fil.size)
+        self.counters = np.zeros(2, dtype=np.int64)
+
+    def solve(self, sources: np.ndarray, downstream: np.ndarray, dh: float, fldmn: float, fldmx: float,
+              iterative_spill: bool, global_max_wse: float, bg: float, spill_decay: float, ncols: int):
+        """``_solve_iterative`` of the raster (``ncols`` wide), with ``sources`` as ids of the raster with its halo
+        and ``downstream`` (TD(R)'s stream pixels, which the channel widens) as its own; the cells and sources
+        come out as the raster's own ids."""
+        if self.counters.max() > 2 ** 30:
+            # The int32 stamps would run out: start them again from 0
+            for stamps in self.arrays[_STAMPS]:
+                stamps[:] = 0
+            self.counters[:] = 0
+        _mark_downstream(self.excluded, downstream, *self.channel, ncols, True)
+        try:
+            return _solve_iterative_reusing(self.fil, self.fdr, self.inflow, self.has_data, ncols + 2, sources,
+                                            self.excluded, dh, fldmn, fldmx, iterative_spill, global_max_wse, bg,
+                                            spill_decay, self.arrays, self.counters, 1, ncols)
+        finally:
+            _mark_downstream(self.excluded, downstream, *self.channel, ncols, False)
+
+def _channel_lookup(channel: tuple[np.ndarray, np.ndarray, np.ndarray] | None, n: int
+                    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``_channel_cells``' groups looked up by raster id: ``(group, starts, cells)``, the group of pixel ``p``
+    being ``cells[starts[group[p]]:starts[group[p] + 1]]``, ``group[p]`` -1 for none.  Empty for no channel."""
+    if channel is None:
+        return np.empty(0, np.int32), np.empty(0, np.int64), np.empty(0, np.int64)
+    keys, starts, cells = channel
+    group = np.full(n, -1, dtype=np.int32)
+    group[keys] = np.arange(keys.size, dtype=np.int32)
+    return group, starts, cells
+
+@njit(cache=True, nogil=True)
+def _mark_downstream(excluded: np.ndarray, downstream: np.ndarray, group: np.ndarray, starts: np.ndarray,
+                     cells: np.ndarray, ncols: int, value: bool):
+    """Set ``excluded`` (ids of the raster with its halo) to ``value`` at TD(R)'s pixels (``downstream``, raster
+    ids, ``ncols`` wide) and at the channel cells of their groups (``_channel_lookup``): ``_widen_downstream``
+    without building the list."""
+    wc = ncols + 2
+    for pixel in downstream:
+        row = pixel // ncols
+        excluded[(row + 1) * wc + pixel - row * ncols + 1] = value
+        if group.size and group[pixel] >= 0:
+            for cell in cells[starts[group[pixel]]:starts[group[pixel] + 1]]:
+                row = cell // ncols
+                excluded[(row + 1) * wc + cell - row * ncols + 1] = value
 
 # ---------------------------------------------------------------------------
 # Segment driver
@@ -1004,10 +1243,13 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
 def _segment_rows(filled_dem: np.ndarray, flow_direction: np.ndarray, stream_id: int, stream_info: np.ndarray,
                   dh: float, fldmn: float, fldmx: float, iterative_spill: bool, global_max_wse: float = 0.0,
                   bg: float = -9999, spill_decay: float = 0.0, solver: str = "iterative", max_cells: int = 0,
-                  channel: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+                  channel: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+                  workspace: _Workspace | None = None
                   ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float | None]:
     """``fldpln_library_for_segment`` as arrays: ``(FSP, FPP, DTF, depth_limit)``.  The library build takes these
-    rather than a table per segment, whose construction cost more than solving most segments."""
+    rather than a table per segment, whose construction cost more than solving most segments.  With a
+    ``workspace`` (of these rasters and this ``channel``), the iterative solver solves the segment on the whole
+    raster, not in windows."""
     if solver not in SOLVERS:
         raise ValueError(f"solver must be one of {SOLVERS}, got {solver!r}.")
     if solver == "iterative" and dh <= 0:
@@ -1029,11 +1271,19 @@ def _segment_rows(filled_dem: np.ndarray, flow_direction: np.ndarray, stream_id:
     flat_fdr = flow_direction.ravel()
     stream_pixels = _segment_pixels(stream_id, stream_info, flat_fdr, nrows, ncols)
     downstream = _downstream_exclusion(stream_id, stream_info, flat_fdr, nrows, ncols)
-    if channel is not None:
-        downstream = _widen_downstream(downstream, channel)
 
     if stream_pixels.size == 0:
         return np.empty(0, np.int32), np.empty(0, np.int32), np.empty(0, np.float32), None
+
+    if workspace is not None and solver == "iterative":
+        # The whole raster with its halo: ids of a window from (0, 0).  The
+        # workspace widens TD(R) with its own channel cells.
+        fpp, dtf, fsp = workspace.solve(_to_local(stream_pixels, ncols, 0, 0, ncols + 2), downstream, dh, fldmn,
+                                        fldmx, iterative_spill, global_max_wse, bg, spill_decay, ncols)
+        return fsp, fpp, dtf, None
+
+    if channel is not None:
+        downstream = _widen_downstream(downstream, channel)
 
     # Each side of the window has its own margin and grows only when the
     # floodplain reaches it: a floodplain usually runs off one way, and growing
@@ -1330,12 +1580,15 @@ def build_fldpln_library(
         No-data value of the filled DEM.
     parallel: bool
         Solve several segments at once, in threads: the solvers release
-        Python's lock, and the threads share the rasters.  Each thread holds
-        its own window, so memory grows with the number of threads.
+        Python's lock, and the threads share the rasters.  Each thread keeps
+        its own arrays of the whole raster, about 100 bytes a cell, so memory
+        grows with the threads, and writing the library, in one thread, soon
+        sets the pace: 2 to 8 threads built 10% faster than one.
     pbar: bool
         Show a progress bar.
     processes: int | None
-        Number of threads when ``parallel``; defaults to the CPU count.
+        Number of threads when ``parallel``; defaults to the CPU count, at
+        most 4.
     spill_decay: float
         DTF added per pixel along a spillover path, to shorten spills: only on
         each pixel's D8 successor, so other downhill steps stay free and it
@@ -1506,21 +1759,36 @@ def build_fldpln_library(
     args.sort(key=lambda x: x[4], reverse=True)
 
     if processes is None:
-        processes = max(min(os.cpu_count() or 1, len(args)), 1)
+        processes = max(min(os.cpu_count() or 1, _DEFAULT_THREADS, len(args)), 1)
         if processes == 1:
             parallel = False
 
     fill_depth = _fill_depth(dem, filled_dem_array, bg).ravel()
 
+    # The iterative solver solves every segment on the whole raster, each
+    # thread with its own workspace (see _Workspace); the rasters with the
+    # windows' halo are shared
+    halo = None
+    if solver == "iterative":
+        halo_fil = _crop(filled_dem_array, 0, nrows, 0, ncols, bg).ravel()
+        halo_fdr = _crop(flow_direction_array, 0, nrows, 0, ncols, np.uint8(0)).ravel()
+        halo = (halo_fil, halo_fdr, *_neighbour_bits(halo_fil, halo_fdr, ncols + 2, bg),
+                _channel_lookup(channel, nrows * ncols))
+    local = threading.local()
+
     def solve(task):
-        return _segment_rows(filled_dem_array, flow_direction_array, *task, channel=channel)
+        workspace = getattr(local, "workspace", None)
+        if workspace is None and halo is not None:
+            workspace = local.workspace = _Workspace(*halo)
+        return _segment_rows(filled_dem_array, flow_direction_array, *task, channel=channel, workspace=workspace)
 
     # Each segment's rows are written as soon as they are solved, and in the
     # order of args however many threads solve them: holding every segment's
     # rows to sort them together took 12 bytes a row, and twice that to sort,
-    # which on a big river's floodplain is billions of rows.
+    # which on a big river's floodplain is billions of rows.  They are sorted
+    # and compressed in the writer's thread, while the next segments solve
     limits = []
-    with _LibraryWriter(library_file) as writer, \
+    with _LibraryWriter(library_file, background=True) as writer, \
             (ThreadPoolExecutor(processes) if parallel else contextlib.nullcontext()) as pool:
         if parallel:
             results = pbar(_ordered_map(pool, solve, args, 2 * processes), total=len(args),
@@ -1530,7 +1798,7 @@ def build_fldpln_library(
         for task, (fsp, fpp, dtf, limit) in zip(args, results):
             if limit is not None:
                 limits.append(limit)
-            writer.write(_library_rows(task[0], fsp, fpp, dtf, fill_depth))
+            writer.write_later(_library_rows, task[0], fsp, fpp, dtf, fill_depth)
 
     if limits:
         LOG.info(f"{len(limits)} of {len(args)} stream segments reached max_cells_per_segment={max_cells:,}; "
@@ -1599,11 +1867,14 @@ class _LibraryWriter:
     The file is written beside ``path`` and takes its name only once closed
     without an error, so a build that fails or is killed never leaves a
     library that looks finished.  ``parquet`` is from ``path``'s suffix when
-    None.
+    None.  With ``background``, ``write_later`` makes and writes the rows in
+    a thread of the writer's own, at most ``_WRITES_AHEAD`` parts behind.
     """
 
-    def __init__(self, path: str | os.PathLike, parquet: bool | None = None):
+    def __init__(self, path: str | os.PathLike, parquet: bool | None = None, background: bool = False):
         self.path = Path(path)
+        self._thread = ThreadPoolExecutor(1) if background else None
+        self._queued = deque()
         self.parquet = self.path.suffix in {'.parquet', '.pq'} if parquet is None else parquet
         self._partial = self.path.with_name(self.path.name + ".partial")
         self._begun = False
@@ -1618,6 +1889,12 @@ class _LibraryWriter:
     def __exit__(self, kind, error, traceback):
         finished = False
         try:
+            if self._thread is not None:
+                try:
+                    while self._queued and kind is None:
+                        self._queued.popleft().result()
+                finally:
+                    self._thread.shutdown(wait=True, cancel_futures=True)
             if kind is None:
                 self._flush(final=True)
                 finished = True
@@ -1628,6 +1905,16 @@ class _LibraryWriter:
                 os.replace(self._partial, self.path)
             else:
                 self._partial.unlink(missing_ok=True)
+
+    def write_later(self, make_rows, *args):
+        """``write(make_rows(*args))``, in the writer's thread if it has one: the rows are made and compressed
+        while the caller goes on.  An error there is raised by a later call, or on closing."""
+        if self._thread is None:
+            self.write(make_rows(*args))
+            return
+        while len(self._queued) >= _WRITES_AHEAD:
+            self._queued.popleft().result()
+        self._queued.append(self._thread.submit(lambda: self.write(make_rows(*args))))
 
     def write(self, columns: dict[str, np.ndarray]):
         """Add rows: each column's values by name, the same columns every time."""
