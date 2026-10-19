@@ -42,7 +42,10 @@ from __future__ import annotations
 
 import os
 import math
+import itertools
+import contextlib
 from pathlib import Path
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 import tqdm
@@ -1284,6 +1287,11 @@ def build_fldpln_library(
     ``max_profile_deviation``) and into pieces no longer than
     ``max_reach_length``, each solved and flooded on its own.
 
+    Each segment's rows are written as soon as it is solved, sorted by
+    ``FSP`` and then ``FPP``, so the build holds only a few segments' rows
+    however big the library.  The file is written as ``<library_file>.partial``
+    and renamed once complete: a build that fails leaves no library.
+
     Parameters
     ----------
     dem: str
@@ -1502,57 +1510,58 @@ def build_fldpln_library(
         if processes == 1:
             parallel = False
 
+    fill_depth = _fill_depth(dem, filled_dem_array, bg).ravel()
+
     def solve(task):
         return _segment_rows(filled_dem_array, flow_direction_array, *task, channel=channel)
 
-    if parallel:
-        with ThreadPoolExecutor(processes) as pool:
-            results = list(pbar(pool.map(solve, args), total=len(args), desc="Processing streams in parallel"))
-    else:
-        results = [solve(task) for task in pbar(args, desc="Processing streams")]
+    # Each segment's rows are written as soon as they are solved, and in the
+    # order of args however many threads solve them: holding every segment's
+    # rows to sort them together took 12 bytes a row, and twice that to sort,
+    # which on a big river's floodplain is billions of rows.
+    limits = []
+    with _LibraryWriter(library_file) as writer, \
+            (ThreadPoolExecutor(processes) if parallel else contextlib.nullcontext()) as pool:
+        if parallel:
+            results = pbar(_ordered_map(pool, solve, args, 2 * processes), total=len(args),
+                           desc="Processing streams in parallel")
+        else:
+            results = (solve(task) for task in pbar(args, desc="Processing streams"))
+        for task, (fsp, fpp, dtf, limit) in zip(args, results):
+            if limit is not None:
+                limits.append(limit)
+            writer.write(_library_rows(task[0], fsp, fpp, dtf, fill_depth))
 
-    fill_depth = _fill_depth(dem, filled_dem_array, bg)
-    # Not needed past the solves: free them before the library is assembled
-    del filled_dem_array, flow_direction_array
+    if limits:
+        LOG.info(f"{len(limits)} of {len(args)} stream segments reached max_cells_per_segment={max_cells:,}; "
+                 f"their floodplains stop at depths of {min(limits):.2f}-{max(limits):.2f} m "
+                 f"(median {np.median(limits):.2f} m).")
 
-    if max_cells:
-        limits = [r[3] for r in results if r[3] is not None]
-        if limits:
-            LOG.info(f"{len(limits)} of {len(results)} stream segments reached max_cells_per_segment={max_cells:,}; "
-                     f"their floodplains stop at depths of {min(limits):.2f}-{max(limits):.2f} m "
-                     f"(median {np.median(limits):.2f} m).")
+def _ordered_map(pool: ThreadPoolExecutor, fn, tasks, ahead: int):
+    """``pool.map(fn, tasks)``, with at most ``ahead`` tasks submitted and not yet taken.
 
-    # One column at a time, each segment's part of it freed as soon as it is copied
-    sizes = [r[0].size for r in results]
-    results = [list(r[:3]) for r in results]
-    columns = {}
-    for k, name in enumerate(("FSP", "FPP", "DTF")):
-        columns[name] = np.concatenate([r[k] for r in results])
-        for r in results:
-            r[k] = None
-    results = None
-    columns["segment"] = np.repeat(np.array([task[0] for task in args], dtype=np.int32), sizes)
+    ``pool.map`` submits every task at once, and the results of those that
+    finish early wait for the ones before them, all at once if one is slow.
+    """
+    tasks = iter(tasks)
+    pending = deque(pool.submit(fn, task) for task in itertools.islice(tasks, ahead))
+    while pending:
+        yield pending.popleft().result()
+        for task in itertools.islice(tasks, 1):
+            pending.append(pool.submit(fn, task))
 
-    # Sorting like this allows very nice compression
-    order = np.lexsort((columns["FPP"], columns["FSP"]))
-    for name in columns:
-        columns[name] = columns[name][order]
-    del order
-
-    fill = fill_depth.ravel()[columns["FPP"]]
-    del fill_depth
-    # Cells without a DEM value never flood
+def _library_rows(segment: int, fsp: np.ndarray, fpp: np.ndarray, dtf: np.ndarray,
+                  fill_depth: np.ndarray) -> dict[str, np.ndarray]:
+    """One segment's library rows, sorted by FSP and then FPP (which compresses well), with each cell's fill from
+    the flat ``fill_depth``.  Cells without a DEM value (a NaN fill) never flood, and are left out."""
+    order = np.lexsort((fpp, fsp))
+    fpp = fpp[order]
+    fill = fill_depth[fpp]
     has_dem = np.isfinite(fill)
     if not has_dem.all():
-        for name in columns:
-            columns[name] = columns[name][has_dem]
-        fill = fill[has_dem]
-    columns["fill"] = fill
-
-    if Path(library_file).suffix in {'.parquet', '.pq'}:
-        save_library(columns, library_file)
-    else:
-        pd.DataFrame(columns).to_csv(library_file, index=False)
+        order, fpp, fill = order[has_dem], fpp[has_dem], fill[has_dem]
+    return {"FSP": fsp[order], "FPP": fpp, "DTF": dtf[order],
+            "segment": np.full(order.size, segment, dtype=np.int32), "fill": fill}
 
 def _raster_shape(path: str) -> tuple[int, int]:
     ds = gdal.Open(path)
@@ -1580,27 +1589,98 @@ def save_library(table: pd.DataFrame | dict[str, np.ndarray], path: str):
     it 6% smaller, but took five times as long to write and twice as long to
     read.  Rows are converted and written a row group at a time.
     """
-    columns = {c: np.asarray(table[c]) for c in table}
-    n = len(next(iter(columns.values()))) if columns else 0
-    enc = {"FPP": "DELTA_BINARY_PACKED"} | {c: "BYTE_STREAM_SPLIT" for c in DECIMAL_COLS if c in columns}
+    with _LibraryWriter(path, parquet=True) as writer:
+        writer.write({c: np.asarray(table[c]) for c in table})
 
-    def row_group(start: int, stop: int) -> pa.Table:
-        arrays = {}
-        for c, values in columns.items():
-            if c in DECIMAL_COLS:
-                arrays[c] = pc.cast(pa.array(values[start:stop].astype(np.float32).round(2)), DECIMAL_COLS[c])
+class _LibraryWriter:
+    """Writes a library a part at a time: Parquet as ``save_library`` saves it, in row groups of
+    ``_LIBRARY_SLICE_ROWS`` rows whatever the parts' sizes, or CSV.
+
+    The file is written beside ``path`` and takes its name only once closed
+    without an error, so a build that fails or is killed never leaves a
+    library that looks finished.  ``parquet`` is from ``path``'s suffix when
+    None.
+    """
+
+    def __init__(self, path: str | os.PathLike, parquet: bool | None = None):
+        self.path = Path(path)
+        self.parquet = self.path.suffix in {'.parquet', '.pq'} if parquet is None else parquet
+        self._partial = self.path.with_name(self.path.name + ".partial")
+        self._begun = False
+        self._writer = None
+        self._pending: list[dict[str, np.ndarray]] = []
+        self._n_pending = 0
+        self._empty = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, error, traceback):
+        finished = False
+        try:
+            if kind is None:
+                self._flush(final=True)
+                finished = True
+        finally:
+            if self._writer is not None:
+                self._writer.close()
+            if finished:
+                os.replace(self._partial, self.path)
             else:
-                arrays[c] = pa.array(values[start:stop])
-        return pa.table(arrays)
+                self._partial.unlink(missing_ok=True)
 
-    first = row_group(0, min(n, _LIBRARY_SLICE_ROWS))
-    with pq.ParquetWriter(path, first.schema, use_dictionary=[c for c in ("FSP", "segment") if c in columns],
-                          column_encoding=enc, store_decimal_as_integer=True, compression="zstd",
-                          compression_level=9) as writer:
-        writer.write_table(first, row_group_size=_LIBRARY_SLICE_ROWS)
-        for start in range(_LIBRARY_SLICE_ROWS, n, _LIBRARY_SLICE_ROWS):
-            writer.write_table(row_group(start, min(start + _LIBRARY_SLICE_ROWS, n)),
-                               row_group_size=_LIBRARY_SLICE_ROWS)
+    def write(self, columns: dict[str, np.ndarray]):
+        """Add rows: each column's values by name, the same columns every time."""
+        if self._empty is None:
+            self._empty = {c: v[:0] for c, v in columns.items()}
+        n = len(next(iter(columns.values()))) if columns else 0
+        if not n:
+            return
+        self._pending.append(columns)
+        self._n_pending += n
+        if self._n_pending >= _LIBRARY_SLICE_ROWS:
+            self._flush(final=False)
+
+    def _flush(self, final: bool):
+        """Write the pending rows: every whole row group of them, and the rest too if ``final``."""
+        if not self._pending:
+            if final and not self._begun and self._empty is not None:
+                self._write_part(self._empty)  # a library without rows still has its columns
+            return
+        names = list(self._pending[0])
+        if len(self._pending) == 1:
+            rows = self._pending[0]
+        else:
+            rows = {c: np.concatenate([part[c] for part in self._pending]) for c in names}
+        n = self._n_pending
+        stop = n if final else n - n % _LIBRARY_SLICE_ROWS
+        step = _LIBRARY_SLICE_ROWS if self.parquet else max(stop, 1)
+        for start in range(0, stop, step):
+            self._write_part({c: v[start:min(start + step, stop)] for c, v in rows.items()})
+        # A copy, so that the rows written are freed
+        self._pending = [{c: v[stop:].copy() for c, v in rows.items()}] if stop < n else []
+        self._n_pending = n - stop
+
+    def _write_part(self, part: dict[str, np.ndarray]):
+        if not self.parquet:
+            pd.DataFrame(part).to_csv(self._partial, index=False, mode="a" if self._begun else "w",
+                                      header=not self._begun)
+            self._begun = True
+            return
+        arrays = {}
+        for c, values in part.items():
+            if c in DECIMAL_COLS:
+                arrays[c] = pc.cast(pa.array(values.astype(np.float32).round(2)), DECIMAL_COLS[c])
+            else:
+                arrays[c] = pa.array(values)
+        table = pa.table(arrays)
+        if not self._begun:
+            encoding = {"FPP": "DELTA_BINARY_PACKED"} | {c: "BYTE_STREAM_SPLIT" for c in DECIMAL_COLS if c in part}
+            self._writer = pq.ParquetWriter(
+                self._partial, table.schema, use_dictionary=[c for c in ("FSP", "segment") if c in part],
+                column_encoding=encoding, store_decimal_as_integer=True, compression="zstd", compression_level=9)
+            self._begun = True
+        self._writer.write_table(table, row_group_size=_LIBRARY_SLICE_ROWS)
 
 def _fill_missing_profile(valid: np.ndarray, values: np.ndarray) -> np.ndarray:
     """Spread a profile known at the ``valid`` pixels to the whole stream path.
@@ -1663,13 +1743,17 @@ def _library_parts(library: pl.LazyFrame | str | os.PathLike, columns: list[str]
     A Parquet file is read through pyarrow, a batch at a time: two to five
     times as fast as slicing ``pl.scan_parquet``, and half the memory.  The
     decimals are cast by polars either way, so their values are the same.
+    Without pre-buffering: pyarrow would hold the requested columns of every
+    row group until the last batch, 1.1 GB of an 860-million-row library,
+    and read it no faster.
     """
     if isinstance(library, pl.LazyFrame):
         n = library.select(pl.len()).collect().item()
         parts = (library.slice(offset, _LIBRARY_SLICE_ROWS).select(columns).collect()
                  for offset in range(0, n, _LIBRARY_SLICE_ROWS))
     else:
-        batches = pq.ParquetFile(library).iter_batches(batch_size=_LIBRARY_SLICE_ROWS, columns=columns)
+        batches = pq.ParquetFile(library, pre_buffer=False).iter_batches(batch_size=_LIBRARY_SLICE_ROWS,
+                                                                         columns=columns)
         parts = (pl.from_arrow(batch) for batch in batches)
     for part in parts:
         yield part.with_columns([pl.col(c).cast(pl.Float32) for c, d in part.schema.items() if d == pl.Decimal])
@@ -1811,7 +1895,10 @@ def _make_fldpln_flood_map(
         for column in group:
             values = part[column].to_numpy()
             repeat &= values[1:] == values[:-1]
-        pairs.append(part.select(group).filter(pl.Series(np.r_[True, ~repeat])))
+            
+        # Converting to numpy here saves lots of memory
+        first = np.r_[True, ~repeat]
+        pairs.append(pl.DataFrame({column: part[column].to_numpy()[first] for column in group}))
         fsp = part['FSP'].to_numpy()
         is_own = fsp == part['FPP'].to_numpy()
         own_fsp.append(fsp[is_own])
