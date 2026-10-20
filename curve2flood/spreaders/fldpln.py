@@ -726,11 +726,16 @@ def _ordered_bits(values: np.ndarray) -> np.ndarray:
     return out
 
 @njit(cache=True, nogil=True)
-def _forward_path(start: int, spill_dtf: float, fil: np.ndarray, fdr: np.ndarray,
+def _forward_path(start: int, spill_dtf: float, head: float, fil: np.ndarray, fdr: np.ndarray,
                   offsets: np.ndarray, flood_depths: np.ndarray,
                   bg: float, excluded: np.ndarray, spill_decay: float,
                   path: np.ndarray, seen: np.ndarray, seen_stamp: int) -> int:
     """Algorithm step 6a: the trajectory ``T(y_k)``, with its two halt criteria.
+
+    The spill floods ``start`` from ``spill_dtf`` with ``head`` metres of water
+    above it, and every step down the path costs ``spill_decay`` of both: the
+    path's ``j``-th cell floods from ``spill_dtf + j * spill_decay``.  So with a
+    decay the path also ends where its head would run out on the next step.
 
     ``flood_depths`` is the reference's ``flddat``: a snapshot of the floodplain
     taken at the top of the spill round and deliberately *not* refreshed while
@@ -755,28 +760,30 @@ def _forward_path(start: int, spill_dtf: float, fil: np.ndarray, fdr: np.ndarray
                     break
         if nxt == -1:
             break
+        if spill_decay > 0.0 and length * spill_decay > head:
+            break
         if excluded[nxt]:
             path[length] = nxt
             length += 1
             break
         if fil[nxt] == bg:
             break
-        if flood_depths[nxt] > 0.0 and spill_dtf >= flood_depths[nxt]:
+        if flood_depths[nxt] > 0.0 and np.float32(spill_dtf + length * spill_decay) >= flood_depths[nxt]:
             break
         current = nxt
-        spill_dtf += spill_decay
     return length
 
 # The iterative solver's arrays, one value per cell of its window (``_iterative_arrays``), in this order:
 #  0-4    dtf, fsp, in_flood, on_boundary, flood_depths: the floodplain, set only at the cells it floods
 #  5-13   dirty, boundary, added, stack, fill_pixels, fill_dtf, path, touched, flooded: lists of cells
 #  14-17  cand_avail, cand_belev, cand_fsp, cand_dtf: spillover candidates, read only where cand_stamp is current
-#  18     spilled_depth: the path depth a cell was last backfilled from, read only where spilled_round is current
-#  19-24  dirty_stamp, visited, seen, on_path, cand_stamp, spilled_round: generation stamps
-#  25     wet: which neighbours are flooded (see _flood), set only next to the cells it floods
+#  18-19  spilled_depth, spilled_dtf: the path depth and DTF a cell was last backfilled from, read only where
+#         spilled_round is current
+#  20-25  dirty_stamp, visited, seen, on_path, cand_stamp, spilled_round: generation stamps
+#  26     wet: which neighbours are flooded (see _flood), set only next to the cells it floods
 # ``counters`` holds the last stamp and spill round, so that stamps go on rising when the arrays are reused.
 _UNREACHED = np.float32(3.4e38)
-_STAMPS = slice(19, 25)
+_STAMPS = slice(20, 26)
 
 def _iterative_arrays(n: int) -> tuple[np.ndarray, ...]:
     """The iterative solver's arrays for a window of ``n`` cells, as it starts.
@@ -790,7 +797,7 @@ def _iterative_arrays(n: int) -> tuple[np.ndarray, ...]:
             np.empty(n, dtype=np.int32), np.empty(n, dtype=np.int32), np.empty(n, dtype=np.float32),
             np.empty(n + 2, dtype=np.int32), np.empty(n, dtype=np.int32), np.empty(n, dtype=np.int32),
             np.empty(n, dtype=np.float32), np.empty(n, dtype=np.float32), np.empty(n, dtype=np.int32),
-            np.empty(n, dtype=np.float32), np.empty(n, dtype=np.float64),
+            np.empty(n, dtype=np.float32), np.empty(n, dtype=np.float64), np.empty(n, dtype=np.float32),
             np.zeros(n, dtype=np.int32), np.zeros(n, dtype=np.int32), np.zeros(n, dtype=np.int32),
             np.zeros(n, dtype=np.int32), np.zeros(n, dtype=np.int32), np.zeros(n, dtype=np.int32),
             np.zeros(n, dtype=np.uint8))
@@ -807,7 +814,7 @@ def _iterate(fil: np.ndarray, fdr: np.ndarray, inflow: np.ndarray, has_data: np.
     """
     (dtf, fsp, in_flood, on_boundary, flood_depths,
      dirty, boundary, added, stack, fill_pixels, fill_dtf, path, touched, flooded,
-     cand_avail, cand_belev, cand_fsp, cand_dtf, spilled_depth,
+     cand_avail, cand_belev, cand_fsp, cand_dtf, spilled_depth, spilled_dtf,
      dirty_stamp, visited, seen, on_path, cand_stamp, spilled_round, wet) = arrays
 
     # ``flood_depths`` is the reference's ``flddat``.  It tracks ``dtf`` during
@@ -941,7 +948,9 @@ def _iterate(fil: np.ndarray, fdr: np.ndarray, inflow: np.ndarray, has_data: np.
                     cand_dtf[neighbor] = pixel_dtf + climb
 
             # Step 6: flood each spillover trajectory and its backfill watershed,
-            # shallowest spill first.
+            # shallowest spill first.  Each step down a trajectory costs
+            # spill_decay: its j-th cell floods from spill_dtf + j * spill_decay,
+            # with path_depth - j * spill_decay of water to backfill with.
             ordered = _order_by_depth_then_elevation(touched[:n_touched],
                                                      cand_dtf, cand_belev)
             for i in range(n_touched):
@@ -949,8 +958,9 @@ def _iterate(fil: np.ndarray, fdr: np.ndarray, inflow: np.ndarray, has_data: np.
                 spill_dtf = cand_dtf[start]
                 spill_fsp = cand_fsp[start]
                 start_elev = fil[start]
+                path_depth = min(global_max_wse, start_elev + fldht - spill_dtf) - start_elev
                 stamp += 1
-                length = _forward_path(start, spill_dtf, fil, fdr, offsets,
+                length = _forward_path(start, spill_dtf, path_depth, fil, fdr, offsets,
                                        flood_depths, bg, excluded, spill_decay,
                                        path, seen, stamp)
                 if length == 0:
@@ -959,12 +969,12 @@ def _iterate(fil: np.ndarray, fdr: np.ndarray, inflow: np.ndarray, has_data: np.
                 path_stamp = stamp
                 for j in range(length):
                     on_path[path[j]] = path_stamp
-                path_depth = min(global_max_wse, start_elev + fldht - spill_dtf) - start_elev
 
                 for j in range(length):
                     source = path[j]
-                    if spill_dtf < dtf[source]:
-                        dtf[source] = spill_dtf
+                    source_dtf = np.float32(spill_dtf + j * spill_decay)
+                    if source_dtf < dtf[source]:
+                        dtf[source] = source_dtf
                         fsp[source] = spill_fsp
                         if dirty_stamp[source] != round_id:
                             dirty_stamp[source] = round_id
@@ -980,26 +990,31 @@ def _iterate(fil: np.ndarray, fdr: np.ndarray, inflow: np.ndarray, has_data: np.
 
                 for j in range(length):
                     source = path[j]
-                    # Spills run shallowest first, so an earlier path of this
-                    # round that backfilled from here, at least as deep, gave
-                    # every cell above it as little DTF as this one would:
-                    # its own path cells above it too, which block this one's
-                    # backfill and are no lower.  Most path cells of a round
-                    # are another's.
-                    if spilled_round[source] == round_id and path_depth <= spilled_depth[source]:
+                    source_dtf = np.float32(spill_dtf + j * spill_decay)
+                    source_depth = path_depth - j * spill_decay
+                    # An earlier path of this round that backfilled from here
+                    # from no more DTF, at least as deep, gave every cell above
+                    # it as little DTF as this one would: its own path cells
+                    # above it too, which block this one's backfill and are no
+                    # lower.  Most path cells of a round are another's.  (Spills
+                    # run shallowest first, so without a decay the earlier DTF
+                    # is never more.)
+                    if (spilled_round[source] == round_id and source_depth <= spilled_depth[source]
+                            and source_dtf >= spilled_dtf[source]):
                         continue
 
                     spilled_round[source] = round_id
-                    spilled_depth[source] = path_depth
+                    spilled_depth[source] = source_depth
+                    spilled_dtf[source] = source_dtf
                     stamp += 1
                     count = _backfill_from_source(
-                        source, 0.0, fil[source] + path_depth, fil, inflow, offsets, bg,
+                        source, 0.0, fil[source] + source_depth, fil, inflow, offsets, bg,
                         False, wet, on_path, path_stamp, stack, visited, stamp,
                         fill_pixels, fill_dtf)
                     
                     for k in range(count):
                         target = fill_pixels[k]
-                        value = fill_dtf[k] + spill_dtf
+                        value = fill_dtf[k] + source_dtf
                         if value < dtf[target]:
                             dtf[target] = value
                             fsp[target] = spill_fsp
@@ -1085,7 +1100,7 @@ def _solve_iterative_reusing(fil: np.ndarray, fdr: np.ndarray, inflow: np.ndarra
                 source_row = source // ncols
                 out_fsp[k] = (source_row - halo) * out_cols + source - source_row * ncols - halo
                 k += 1
-    wet = arrays[25]
+    wet = arrays[26]
     for i in range(n_flooded):
         pixel = flooded[i]
         dtf[pixel] = _UNREACHED
@@ -1214,7 +1229,11 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
     bg : float, optional
         No-data value of the DEM; such cells never flood.
     spill_decay : float, optional
-        DTF added per pixel along a spillover path, to shorten spills.
+        Head (m) a spill loses per pixel down its spillover path: the path's
+        ``j``-th pixel floods from ``j * spill_decay`` more DTF than its first
+        and backfills with that much less water, and the path ends where its
+        water runs out.  The exact solver adds it on each step to a pixel's D8
+        successor.  0 for none.
     solver : {"exact", "iterative"}, optional
         See the module docstring.
     max_cells : int, optional
@@ -1590,9 +1609,15 @@ def build_fldpln_library(
         Number of threads when ``parallel``; defaults to the CPU count, at
         most 4.
     spill_decay: float
-        DTF added per pixel along a spillover path, to shorten spills: only on
-        each pixel's D8 successor, so other downhill steps stay free and it
-        trims little (see the FLDPLN docs).  0 (default) for none.
+        Head (m) water spilling over a divide loses per pixel down its path:
+        a minimum slope of its water surface.  The path's ``j``-th pixel floods
+        from ``j * spill_decay`` more DTF than its first, it backfills with
+        that much less water, and the path ends where the water runs out.
+        Without it a spill keeps its whole depth however far it runs, so on
+        flat ground it floods everything below its source's water surface as
+        a level pool.  The exact solver adds it on each step to a pixel's D8
+        successor, so its other downhill steps stay free and it trims little.
+        0 (default) for none.
     solver: str
         ``"iterative"`` (default) or ``"exact"``; see the module docstring.
     max_cells_per_segment: int | None
