@@ -24,9 +24,11 @@ _ARC_KEYS = {'dem_file', 'stream_file', 'strmshp_file', 'flow_file', 'lu_raster_
              'exponent_depth', 'coefficient_width', 'exponent_width', 'x_section_dist', 'degree_manip',
              'degree_interval', 'low_spot_range', 'gen_dir_dist', 'gen_slope_dist', 'stream_slope_method',
              'slope_low_percentile', 'slope_high_percentile', 'slope_adjustment_factor', 'depth_varying_n', 'k_decay',
-             'shallow_factor', 'deep_factor', 'bathy_trap_h', 'bathy_use_banks', 'bathy_bed_cap', 'bathy_smooth_banks',
-             'bathy_smooth_bed', 'findbanksbasedonlandcover', 'vdt_database_numiterations', 'standard_step',
-             'print_vdt_database', 'print_ap_database', 'print_curve_file', 'xs_out_file', 'reach_average_curve_file',
+             'shallow_factor', 'deep_factor', 'bathy_trap_h', 'bathy_use_banks', 'bathy_bed_cap',
+             'bathy_smooth_banks', 'bathy_smooth_bed', 'bathy_bankless_max_baseflow', 'findbanksbasedonlandcover', 'vdt_database_numiterations',
+             'standard_step', 'standard_step_eddy_length', 'print_vdt_database', 'print_ap_database',
+             'print_curve_file', 'xs_out_file',
+             'reach_average_curve_file',
              'build_representative_cross_section', 'representative_cross_section_file', 'bathy_out_file', 'aroutflood',
              'compression'}
 # Keys that input files often carry (nencarta writes OutSHP and FS_ADJUST_FLOW_BY_FRACTION) but neither model uses
@@ -51,6 +53,11 @@ def path_exists(path: str | os.PathLike | None) -> bool:
     return bool(path) and Path(path).exists()
 
 
+def is_parquet(path: str | os.PathLike) -> bool:
+    """Whether a table's path names a Parquet file (.parquet or .pq, in any case) rather than CSV."""
+    return Path(path).suffix.lower() in ('.parquet', '.pq')
+
+
 @dataclass(kw_only=True, frozen=True)
 class Config:
     """Curve2Flood's inputs, checked and typed.
@@ -58,8 +65,9 @@ class Config:
     Make one with from_file (YAML, or text with a key and its value on each line) or from_mapping (a dictionary).
     Each field is its input-file key in lower case, and keys are case-insensitive, so DEM_File and dem_file are the
     same. A key set to nothing (an empty value, or null in YAML) takes its default. ARC's keys are allowed and
-    ignored, so that one file can drive both models; any other unknown key raises ValueError, naming the closest
-    known key. See the Input File page of the documentation for what each key does.
+    ignored, so that one file can drive both models, as are a few that input files often carry but neither model
+    reads; any other unknown key raises ValueError, naming the closest known key. See the Input File page of the
+    documentation for what each key does.
     """
     # Input files
     dem_file: str | None = None
@@ -96,6 +104,9 @@ class Config:
     flow_direction_file: str | None = None
     stream_info_file: str | None = None
     fldpln_library: str | None = None
+    # Water shallower than this (m) floods nothing: a stream's water that just tops a rise beside it leaves a film of
+    # a few millimetres over everything downhill (see _make_fldpln_flood_map)
+    fldpln_min_flood_depth: float = 0.01
 
     # Multi-point interpolation mapper (see multi_point_options)
     mpi_topwidth_threshold_m: float = 200.0
@@ -224,6 +235,8 @@ class Config:
         for key, value in (('TW_MultFact', self.tw_multfact), ('TopWidthPlausibleLimit', self.topwidthplausiblelimit)):
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f'{key} must be finite and positive, not {value!r}.')
+        if not math.isfinite(self.fldpln_min_flood_depth) or self.fldpln_min_flood_depth < 0.0:
+            raise ValueError(f'FLDPLN_Min_Flood_Depth must be finite and 0 or more, not {self.fldpln_min_flood_depth!r}.')
         if not self.needs_flood_map:
             return
 

@@ -65,6 +65,7 @@ from osgeo import gdal
 from numba.extending import register_jitable
 
 from curve2flood import LOG
+from curve2flood.config import is_parquet
 
 # Columns stored as 2-decimal numbers.  A fill can be deep (a pit filled to its
 # rim), so it gets more digits than a DTF, which is at most the library's fldmx.
@@ -110,9 +111,9 @@ _WINDOW_MARGINS = (128, 384, 1152)
 
 # The exact solver carries DTF as an integer count of these units, so that the
 # priority queue can be keyed on a single packed int64.  Tenths of a millimetre
-# keep the per-edge rounding an order of magnitude below the 3 decimals the
-# library is written with, even after accumulating over a long path, while
-# leaving an int32 range worth hundreds of kilometres of depth.
+# keep the per-edge rounding well below the centimetres the library is written
+# in (DECIMAL_COLS), even after accumulating over a long path, while leaving an
+# int32 range worth hundreds of kilometres of depth.
 _DTF_UNITS_PER_METRE = 10000.0
 
 # Library rows written and read at a time: one row group of a library written by
@@ -1485,7 +1486,8 @@ def _segments(stream_info: np.ndarray, stream_ids: np.ndarray, max_depths, flat_
     cap, and how many reaches were split.
 
     A segment cut from a reach floods as deep as the deepest VDT water among its own pixels (at most ``fldmx``), or
-    as deep as its reach when it has no VDT cell, so that every stream pixel stays a source. ``flat_fil`` is the
+    as deep as its reach when it has no VDT cell (the mapper floods no such segment, but the library may be mapped with
+    another VDT database). ``flat_fil`` is the
     filled DEM, for ``max_deviation``; stream pixels without a value there are left out of the profile.
     """
     rows, caps = [], []
@@ -1567,7 +1569,9 @@ def build_fldpln_library(
         The DEM floods are mapped on (with the bathymetry, if any).  Only the
         ``fill`` column comes from it, so the mapper never reads it.
     filled_dem: str
-        Filled (depression-free) DEM raster.  The mapper must use the same one.
+        Filled (depression-free) DEM raster, the one the flow directions were
+        made from.  The mapper never reads it: the library's ``fill`` and the
+        VDT's ``Elev`` give it at the stream.
     stream_info_file: str
         CSV or Parquet table of the segments, with columns ``start_pixel``,
         ``end_pixel``, ``length`` (pixels) and ``stream_id``.
@@ -1649,8 +1653,9 @@ def build_fldpln_library(
         alone, water runs down the channel beside it, past the segment's end:
         below the Karnali's Chisapani gorge, one gorge segment flooded 920 km2
         of its fan at the 2-year flow (80 km2 of the whole site with the
-        channel); the 68 US test sites score the same either way (mean MCC
-        0.5629 against 0.5639).  None (default) keeps the line alone.
+        channel); the 68 US test sites score about the same either way (mean
+        MCC 0.5639 with the channel, 0.5629 without).  None (default) keeps
+        the line alone.
     """
     if solver not in SOLVERS:
         raise ValueError(f"solver must be one of {SOLVERS}, got {solver!r}.")
@@ -1665,7 +1670,7 @@ def build_fldpln_library(
     split = max_reach_length is not None or max_profile_deviation is not None
     max_cells = int(max_cells_per_segment or 0)
 
-    if Path(stream_info_file).suffix in {'.parquet', '.pq'}:
+    if is_parquet(stream_info_file):
         stream_info = pd.read_parquet(stream_info_file)
     else:
         stream_info = pd.read_csv(stream_info_file)
@@ -1705,8 +1710,8 @@ def build_fldpln_library(
         max_depths = [fldmx] * len(stream_ids)
     else:
         # Read only the columns used: the VDT carries ~120 more
-        is_parquet = Path(vdt_file).suffix in {'.parquet', '.pq'}
-        if is_parquet:
+        vdt_is_parquet = is_parquet(vdt_file)
+        if vdt_is_parquet:
             vdt_columns = pq.read_schema(vdt_file).names
         else:
             vdt_columns = pd.read_csv(vdt_file, nrows=0).columns
@@ -1715,7 +1720,7 @@ def build_fldpln_library(
         assert wse_cols, "No wse_* columns found in VDT file"
         max_wse_col = wse_cols[-1]
         usecols = ['COMID', 'Row', 'Col', max_wse_col]
-        if is_parquet:
+        if vdt_is_parquet:
             vdt_df = pd.read_parquet(vdt_file, columns=usecols)
         else:
             vdt_df = pd.read_csv(vdt_file, usecols=usecols)
@@ -1900,7 +1905,7 @@ class _LibraryWriter:
         self.path = Path(path)
         self._thread = ThreadPoolExecutor(1) if background else None
         self._queued = deque()
-        self.parquet = self.path.suffix in {'.parquet', '.pq'} if parquet is None else parquet
+        self.parquet = is_parquet(self.path) if parquet is None else parquet
         self._partial = self.path.with_name(self.path.name + ".partial")
         self._begun = False
         self._writer = None
@@ -1993,16 +1998,6 @@ class _LibraryWriter:
                 column_encoding=encoding, store_decimal_as_integer=True, compression="zstd", compression_level=9)
             self._begun = True
         self._writer.write_table(table, row_group_size=_LIBRARY_SLICE_ROWS)
-
-def _fill_missing_profile(valid: np.ndarray, values: np.ndarray) -> np.ndarray:
-    """Spread a profile known at the ``valid`` pixels to the whole stream path.
-
-    ``values`` holds the profile at the valid pixels only.  A gap between two
-    valid pixels is interpolated linearly, pixel by pixel; before the first and
-    after the last valid pixel the profile holds its end value.
-    """
-    pixel = np.arange(len(valid))
-    return np.interp(pixel, pixel[valid], np.asarray(values, dtype=float))
 
 def _median_by_group(group: np.ndarray, value: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Each group's median: its middle value, or the lower of the two middle ones for an even count.
@@ -2133,7 +2128,8 @@ def _make_fldpln_flood_map(
         fdr: np.ndarray,
         fldpln_library: pl.LazyFrame | str | os.PathLike,
         stream_info_df: pd.DataFrame,
-        fill_below_dem: np.ndarray | None = None) -> np.ndarray:
+        fill_below_dem: np.ndarray | None = None,
+        min_depth: float = 0.0) -> np.ndarray:
     """Flood depth raster for one event, from VDT stages and a floodplain library.
 
     1. Along each reach (its pixels in ``stream_info_df``, walked down the
@@ -2143,16 +2139,7 @@ def _make_fldpln_flood_map(
        bed ARC's depths are measured from) plus the library's ``fill`` of the
        pixel's own cell, its row with ``FPP == FSP``, so the filled DEM itself
        is never read.  A pixel without that row counts as having no VDT
-       value.  Pixels without a VDT value take the stage interpolated linearly
-       between the reach's VDT cells on either side, and held beyond its
-       first and last.  The depth, not the water surface: where ARC has no
-       rating curve, as down a cliff, the bed bends between the VDT cells,
-       and a straight water surface across the gap would stand metres above
-       it (or below it).  The reaches used to be chained along the network's
-       longest paths, so that a gap at a reach's end took stages from the
-       next reach; but only a segment without any VDT value keeps the stages
-       of this step (see 2), and no map of 68 US test sites changed without
-       the chains.
+       value, and so does a pixel without a VDT row: it has no stage.
     2. Each segment ``R`` floods at one depth ``DoF(R)``, as the library
        assumes: the median of its stream pixels' stages, every pixel counted
        once, however many floodplain cells it is the source of.  The depth is
@@ -2160,11 +2147,19 @@ def _make_fldpln_flood_map(
        In a segment with VDT values, a pixel without one takes the stage
        interpolated between the segment's own pixels with one, and held
        beyond the first and last, so ``DoF(R)`` never leaves the range of
-       the stages ARC gave the segment: interpolated from the next segment,
-       its stage would pull the median toward that segment's.  Only a
-       segment without VDT values keeps the stages of step 1.  A library
-       without a ``segment`` column (built before reaches were split) floods
-       each reach at one depth.
+       the stages ARC gave the segment.  The depth, not the water surface:
+       where ARC has no rating curve, as down a cliff, the bed bends between
+       the VDT cells, and a straight water surface across the gap would stand
+       metres above it (or below it).  A segment without any VDT value floods
+       nothing.  Its pixels used to take the stages of the reach's VDT cells
+       on either side, but ARC rates no cross section of it, as down a cliff
+       whose cross sections fall away on one side, and a stage borrowed from
+       elsewhere spread over whatever lies below it: a 9 cm film down the
+       cliff and fan below reach 710510156 at Grand Junction (N39W109) at
+       the 2-year flow, and on 68 US test sites mostly ground their observed
+       maps have dry (mean MCC 0.5659 with those segments, 0.5691 without).
+       A library without a ``segment`` column (built before reaches were
+       split) floods each reach at one depth.
     3. Each library row ``(s, p, DTF, fill)`` whose water reaches ``p``'s
        filled surface (``DoF(R) - DTF(s, p) > 0``, ``R`` being ``s``'s
        segment) gives ``p`` the depth ``DoF(R) - DTF(s, p) + max(fill(p), 0)``:
@@ -2176,8 +2171,12 @@ def _make_fldpln_flood_map(
        the filled surface, so it covers the cell wherever it reaches that
        surface, and the depth is measured from it.  Otherwise a raised cell
        inside the channel, routed through, read as a dry hole.
+    4. A cell floods where its depth is above 0 and at least ``min_depth``.
+       Water that only just tops a low rise beside a stream on a slope runs
+       down everything below it in a film: the library's DTF to all of it is
+       that of the rise, so each cell gets the same few millimetres.
 
-    Returns the depth where it is above 0, NaN elsewhere, on ``fdr``'s grid;
+    Returns the depth where the cell floods, NaN elsewhere, on ``fdr``'s grid;
     no DEM is needed.  ``vdt_df`` needs ``COMID``, ``Row``, ``Col``, ``Elev``
     and ``WSE``.  ``fldpln_library`` is a Parquet library's path or a
     LazyFrame (a CSV library), read a part at a time.  ``fill_below_dem``, a
@@ -2251,27 +2250,15 @@ def _make_fldpln_flood_map(
         has_fill = own_fsp[at] == pixels
         fill[has_fill] = own_fill[at[has_fill]]
 
-    # Along each reach, the depth over the filled DEM, interpolated across the
-    # pixels without a VDT value
+    # Each stream pixel's depth over the filled DEM, missing without a VDT value
     pixel_stage = wse - (elevation + fill)
     measured = ~np.isnan(pixel_stage)
-    reach_fsp, reach_dof, reach_measured = [], [], []
-    for start, end in zip(offsets[:-1], offsets[1:]):
-        mask = measured[start:end]
-        if not mask.any():
-            continue
-        dof_profile = _fill_missing_profile(mask, pixel_stage[start:end][mask])
-        finite = np.isfinite(dof_profile)
-        reach_fsp.append(pixels[start:end][finite])
-        reach_dof.append(dof_profile[finite])
-        reach_measured.append(mask[finite])
-
-    if not reach_fsp:
+    if not measured.any():
         return depth_array
 
     # A pixel on two reaches keeps its deeper stage
-    stage = (pl.DataFrame({'FSP': np.concatenate(reach_fsp), 'DoF': np.concatenate(reach_dof),
-                           'measured': np.concatenate(reach_measured)},
+    stage = (pl.DataFrame({'FSP': pixels, 'DoF': pl.Series(pixel_stage, dtype=pl.Float32, nan_to_null=True),
+                           'measured': measured},
                           schema={'FSP': pl.Int32, 'DoF': pl.Float32, 'measured': pl.Boolean})
              .group_by('FSP').agg(pl.col('DoF').max(), pl.col('measured').max()))
 
@@ -2291,7 +2278,9 @@ def _make_fldpln_flood_map(
                       .sort(['segment', 'position']))
     if library_pixels.is_empty():
         return depth_array
-    # A pixel without a VDT value takes its stage from its own segment's pixels with one
+    
+    # A pixel without a VDT value takes its stage from its own segment's pixels with one; a segment without any has
+    # none, and floods nothing
     stages = _interpolate_within_segments(library_pixels['segment'].to_numpy(), library_pixels['position'].to_numpy(),
                                           library_pixels['measured'].to_numpy(), library_pixels['DoF'].to_numpy())
     segments, depths = _median_by_group(library_pixels['segment'].to_numpy(), stages)
@@ -2317,6 +2306,6 @@ def _make_fldpln_flood_map(
     for part in _library_parts(fldpln_library, [key, 'FPP', 'DTF', 'fill']):
         _deepest_water(best, part[key].to_numpy(), part['FPP'].to_numpy(), part['DTF'].to_numpy(),
                        part['fill'].to_numpy(), dof, below)
-    depth_array[~(depth_array > 0)] = np.nan
+    depth_array[~((depth_array > 0) & (depth_array >= min_depth))] = np.nan
 
     return depth_array

@@ -7,7 +7,6 @@ surface elevation (WSE), velocity and an optional topobathymetric DEM.
 # built-in imports
 import os
 import json
-from pathlib import Path
 
 # third-party imports
 import numpy as np
@@ -24,7 +23,7 @@ from scipy.spatial import cKDTree
 from scipy.ndimage import label, generate_binary_structure, distance_transform_edt, uniform_filter
 
 from curve2flood import LOG
-from curve2flood.config import Config, FLDPLN, KERNEL_WEIGHTED, MULTI_POINT, MAPPERS
+from curve2flood.config import Config, FLDPLN, KERNEL_WEIGHTED, MULTI_POINT, MAPPERS, is_parquet
 from curve2flood.spreaders import (
     _make_fldpln_flood_map, create_kernel_weighted_spread_map, filter_outliers, compute_tw_multfact_scale, multi_point_interpolation
 )
@@ -133,7 +132,7 @@ def convert_cell_size(
 
 def _count_flow_events(FlowFileName: str) -> int:
     """Number of flow events (columns after the COMID column) in a flow file."""
-    if FlowFileName.endswith('.parquet'):
+    if is_parquet(FlowFileName):
         return pd.read_parquet(FlowFileName).shape[1] - 1
     return pd.read_csv(FlowFileName, nrows=0).shape[1] - 1
 
@@ -143,7 +142,7 @@ def FindFlowRateForEachCOMID_Ensemble(FlowFileName: str, flow_event_num: int) ->
     The flow file (CSV or Parquet) has the COMID in its first column and one
     column of flows per event.  Missing flows are treated as zero.
     """
-    if FlowFileName.endswith('.parquet'):
+    if is_parquet(FlowFileName):
         flow_df = pd.read_parquet(FlowFileName).iloc[:, [0, flow_event_num + 1]]
     else:
         flow_df = pd.read_csv(FlowFileName, usecols=[0, flow_event_num + 1])
@@ -167,7 +166,7 @@ def calculate_interpolated_curvefile(CurveParamFileName: str, COMID_Unique_Flow:
     """
     LOG.debug('\nOpening and Reading ' + CurveParamFileName)
 
-    if CurveParamFileName.endswith('.parquet'):
+    if is_parquet(CurveParamFileName):
         curve_df = pd.read_parquet(CurveParamFileName)
     else:
         curve_df = pd.read_csv(CurveParamFileName)
@@ -342,7 +341,7 @@ def calculate_interpolated_vdt(
     """
     LOG.debug('\nOpening and Reading ' + VDTDatabaseFileName)
 
-    if VDTDatabaseFileName.endswith('.parquet'):
+    if is_parquet(VDTDatabaseFileName):
         vdt_df = pl.read_parquet(VDTDatabaseFileName)
     else:
         vdt_df = pl.read_csv(VDTDatabaseFileName)
@@ -700,6 +699,7 @@ def make_fldpln_flood_map(
         fldpln_library,
         stream_info,
         fill_below_dem=fill_below_dem,
+        min_depth=config.fldpln_min_flood_depth,
     )
 
     Flood_array = (depth > 0).astype(np.uint8)
@@ -781,7 +781,7 @@ def Set_Stream_Locations(nrows: int, ncols: int, infilename: str):
     Cells without a stream are -9999.
     """
     S = np.full((nrows, ncols), -9999, dtype=np.int32)
-    if infilename.endswith('.parquet'):
+    if is_parquet(infilename):
         df = pd.read_parquet(infilename, columns=['Row', 'Col', 'COMID'])
     else:
         df = pd.read_csv(infilename, usecols=['Row', 'Col', 'COMID'])
@@ -1008,13 +1008,13 @@ def main_flood_ouputs(
         FlowDir = gdal.Open(config.flow_direction_file).ReadAsArray().astype(np.uint8, copy=False)
         _check_shape(FlowDir, (nrows, ncols), "Flow direction raster")
 
-        if Path(config.stream_info_file).suffix == '.parquet':
+        if is_parquet(config.stream_info_file):
             stream_info: pd.DataFrame = pd.read_parquet(config.stream_info_file)
         else:
             stream_info: pd.DataFrame = pd.read_csv(config.stream_info_file)
 
         # A Parquet library is read by its path, a row group at a time (see _make_fldpln_flood_map)
-        if Path(config.fldpln_library).suffix == '.parquet':
+        if is_parquet(config.fldpln_library):
             fldpln_library = config.fldpln_library
         else:
             fldpln_library = pl.scan_csv(config.fldpln_library)

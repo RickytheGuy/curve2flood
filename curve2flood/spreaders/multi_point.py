@@ -16,6 +16,7 @@ from scipy.spatial import cKDTree
 from shapely.geometry import Point
 
 from curve2flood._log import LOG
+from curve2flood.config import is_parquet
 
 ID_SYNONYMS = ["COMID", "RIVID", "river_id", "LINKNO"]
 GeoTransform = tuple[float, float, float, float, float, float]
@@ -246,10 +247,9 @@ def read_curve2flood_table(table_filename: str) -> pd.DataFrame:
     """Read a CSV, TSV or Parquet table."""
     if not table_filename:
         raise ValueError("A table filename is required.")
-    lower_name = table_filename.lower()
-    if lower_name.endswith(".parquet"):
+    if is_parquet(table_filename):
         return pd.read_parquet(table_filename)
-    if lower_name.endswith(".tsv"):
+    if table_filename.lower().endswith(".tsv"):
         return pd.read_csv(table_filename, sep="\t")
     return pd.read_csv(table_filename)
 
