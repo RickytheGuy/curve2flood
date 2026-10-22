@@ -26,8 +26,8 @@ _ARC_KEYS = {'dem_file', 'stream_file', 'strmshp_file', 'flow_file', 'lu_raster_
              'slope_low_percentile', 'slope_high_percentile', 'slope_adjustment_factor', 'depth_varying_n', 'k_decay',
              'shallow_factor', 'deep_factor', 'bathy_trap_h', 'bathy_use_banks', 'bathy_bed_cap',
              'bathy_smooth_banks', 'bathy_smooth_bed', 'bathy_bankless_max_baseflow', 'findbanksbasedonlandcover', 'vdt_database_numiterations',
-             'standard_step', 'standard_step_eddy_length', 'print_vdt_database', 'print_ap_database',
-             'print_curve_file', 'xs_out_file',
+             'standard_step', 'standard_step_eddy_length', 'valley_sections', 'valley_dir_dist', 'print_vdt_database',
+             'print_ap_database', 'print_curve_file', 'xs_out_file',
              'reach_average_curve_file',
              'build_representative_cross_section', 'representative_cross_section_file', 'bathy_out_file', 'aroutflood',
              'compression'}
