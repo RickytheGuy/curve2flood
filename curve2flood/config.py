@@ -62,12 +62,10 @@ def is_parquet(path: str | os.PathLike) -> bool:
 class Config:
     """Curve2Flood's inputs, checked and typed.
 
-    Make one with from_file (YAML, or text with a key and its value on each line) or from_mapping (a dictionary).
+    Make one with `from_file` (YAML, or text with a key and its value on each line) or `from_mapping` (a dictionary).
     Each field is its input-file key in lower case, and keys are case-insensitive, so DEM_File and dem_file are the
     same. A key set to nothing (an empty value, or null in YAML) takes its default. ARC's keys are allowed and
-    ignored, so that one file can drive both models, as are a few that input files often carry but neither model
-    reads; any other unknown key raises ValueError, naming the closest known key. See the Input File page of the
-    documentation for what each key does.
+    ignored, so that one file can drive both models.
     """
     # Input files
     dem_file: str | None = None
@@ -78,8 +76,6 @@ class Config:
     stream_file: str | None = None
     lu_raster_sameres: str | None = None
     lu_manning_n: str | None = None
-    # Only the GeoPackage output (make_output_gpkg) asks for it; ARC reads it, with its reach_id fields
-    strmshp_file: str | None = None
 
     # Outputs
     outfld: str | None = None

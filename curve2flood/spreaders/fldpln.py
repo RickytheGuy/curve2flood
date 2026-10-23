@@ -551,8 +551,7 @@ def _solve_exact(fil: np.ndarray, fdr: np.ndarray, ncols: int,
     for pixel in range(n):
         if settled[pixel] and (stop < 0 or dist[pixel] < stop):
             cells[k] = pixel
-            value = dist[pixel] / _DTF_UNITS_PER_METRE
-            out_dtf[k] = fldmn if value < fldmn else value
+            out_dtf[k] = dist[pixel] / _DTF_UNITS_PER_METRE  # as found, not raised to fldmn (see build_fldpln_library)
             out_fsp[k] = fsp[pixel]
             k += 1
     depth_limit = stop / _DTF_UNITS_PER_METRE if stop >= 0 else -1.0
@@ -1095,8 +1094,7 @@ def _solve_iterative_reusing(fil: np.ndarray, fdr: np.ndarray, inflow: np.ndarra
         for pixel in range(row * ncols + c0, row * ncols + c1 + 1):
             if in_flood[pixel]:
                 cells[k] = (row - halo) * out_cols + pixel - row * ncols - halo
-                value = dtf[pixel]
-                out_dtf[k] = fldmn if value < fldmn else value
+                out_dtf[k] = dtf[pixel]  # as found, not raised to fldmn (see build_fldpln_library)
                 source = fsp[pixel]
                 source_row = source // ncols
                 out_fsp[k] = (source_row - halo) * out_cols + source - source_row * ncols - halo
@@ -1220,7 +1218,9 @@ def fldpln_library_for_segment(filled_dem: np.ndarray,
         Depth step of the iterative solver (m); must be positive.  Ignored by
         the exact solver.
     fldmn : float
-        Smallest DTF reported (m); smaller DTFs are raised to it.
+        Iterative solver only: the least depth (m) a flooded pixel counts as
+        when it decides where a spill stops.  DTFs are reported as found, not
+        raised to it (see ``build_fldpln_library``).
     fldmx : float
         Largest depth to flood to (m).
     iterative_spill : bool
@@ -1546,8 +1546,8 @@ def build_fldpln_library(
 ):
     """Build the FLDPLN floodplain library for every stream segment and save it.
 
-    Each row is a stream pixel ``FSP``, a cell it floods ``FPP``, the depth
-    to flood ``DTF``, the ``segment`` the stream pixel belongs to and the
+    Each row is a stream pixel ``FSP`` (Flood Source Pixel), a cell it floods ``FPP`` (FloodPlain Pixel), the Depth
+    to Flood ``DTF``, the ``segment`` the stream pixel belongs to and the
     cell's ``fill``: the filled DEM minus ``dem``.  Cells where ``dem`` has no
     data never flood, and are left out.
 
@@ -1566,12 +1566,11 @@ def build_fldpln_library(
     Parameters
     ----------
     dem: str
-        The DEM floods are mapped on (with the bathymetry, if any).  Only the
-        ``fill`` column comes from it, so the mapper never reads it.
+        The DEM floods are mapped on (with the bathymetry, if any).  Used to
+        derive the ``fill`` column.
     filled_dem: str
         Filled (depression-free) DEM raster, the one the flow directions were
-        made from.  The mapper never reads it: the library's ``fill`` and the
-        VDT's ``Elev`` give it at the stream.
+        made from.
     stream_info_file: str
         CSV or Parquet table of the segments, with columns ``start_pixel``,
         ``end_pixel``, ``length`` (pixels) and ``stream_id``.
@@ -1583,7 +1582,11 @@ def build_fldpln_library(
         Depth step of the iterative solver (m), 0.5 by default.  Ignored by the
         exact solver.
     fldmn: float
-        Smallest DTF stored (m); smaller DTFs are raised to it.  0.1 by default.
+        Iterative solver only: the least depth (m) a flooded pixel counts as
+        when it decides where a spill stops, as the KU FLDPLN's minimum flood
+        depth.  0.1 by default.  DTFs are stored as found, from 0 at the
+        stream: the KU FLDPLN raises those below ``fldmn`` to it, which mapped
+        every stream pixel and flat channel bed ``fldmn`` too shallow.
     fldmx: float
         Largest depth to flood to (m).  25 by default.
     iterative_spill: bool
@@ -1602,19 +1605,15 @@ def build_fldpln_library(
     bg: float
         No-data value of the filled DEM.
     parallel: bool
-        Solve several segments at once, in threads: the solvers release
-        Python's lock, and the threads share the rasters.  Each thread keeps
-        its own arrays of the whole raster, about 100 bytes a cell, so memory
-        grows with the threads, and writing the library, in one thread, soon
-        sets the pace: 2 to 8 threads built 10% faster than one.
+        Solve several segments at once.
     pbar: bool
         Show a progress bar.
     processes: int | None
         Number of threads when ``parallel``; defaults to the CPU count, at
-        most 4.
+        most 4. Tests indicate that more threads do not help and consume more memory.
     spill_decay: float
-        Head (m) water spilling over a divide loses per pixel down its path:
-        a minimum slope of its water surface.  The path's ``j``-th pixel floods
+        Head (m) water spilling over a divide loses per pixel down its path. 
+        The path's ``j``-th pixel floods
         from ``j * spill_decay`` more DTF than its first, it backfills with
         that much less water, and the path ends where the water runs out.
         Without it a spill keeps its whole depth however far it runs, so on
@@ -1633,8 +1632,7 @@ def build_fldpln_library(
         Longest segment (m), measured along the flow directions with the
         filled DEM's cell size.  A longer reach is cut into
         ``ceil(length / max_reach_length)`` segments of about equal length.
-        5000 (default), as the University of Kansas FLDPLN keeps them; None
-        keeps each reach whole.
+        5000 (default). None keeps each reach whole.
     max_profile_deviation: float | None
         Also cut each reach where the filled DEM under the stream bends or
         steps, so that the bed is about straight along every segment: its
@@ -1643,18 +1641,13 @@ def build_fldpln_library(
         its piece's straight line.  The pieces are then cut by
         ``max_reach_length``.  One depth per segment fits a straight bed
         best: the stage jumps at a step and where a filled flat begins.
-        1 m (default) did best on 68 US test sites; None makes no such cuts.
+        None makes no such cuts.
     water_mask: np.ndarray | None
         The river's water, such as the bathymetry water mask; same shape as
         the DEM, positive for water.  Each segment's ``TD(R)``, the cells below
         its end that its water may not spill into, is then the channel below
         it and not only the stream line: every water cell whose D8 path first
-        meets the stream network inside ``TD(R)`` joins it.  With the line
-        alone, water runs down the channel beside it, past the segment's end:
-        below the Karnali's Chisapani gorge, one gorge segment flooded 920 km2
-        of its fan at the 2-year flow (80 km2 of the whole site with the
-        channel); the 68 US test sites score about the same either way (mean
-        MCC 0.5639 with the channel, 0.5629 without).  None (default) keeps
+        meets the stream network inside ``TD(R)`` joins it.  None (default) keeps
         the line alone.
     """
     if solver not in SOLVERS:

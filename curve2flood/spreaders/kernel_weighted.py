@@ -69,6 +69,8 @@ def create_kernel_weighted_spread_map(
     TW_for_WeightBox_ElipseMask,
     TopWidthPlausibleLimit,
     Set_Depth,
+    V_Rast=None,
+    channel=None,
 ):
     """Spread each stream cell's WSE over its neighbourhood.
 
@@ -81,7 +83,9 @@ def create_kernel_weighted_spread_map(
 
     Returns ``(WSE, total weight, slope times weight)`` on the padded grid;
     WSE is NaN where it is not above the DEM.  ``S_Rast`` (slopes) may be None,
-    and the slope sums are then a 1 x 1 placeholder.
+    and the slope sums are then a 1 x 1 placeholder.  Given the stream cells'
+    valley slopes ``V_Rast`` and the ``channel`` cells (unpadded, as
+    ``S_Rast``), a cell outside the channel sums the valley slopes instead.
 
     The sums are added cell by cell, with the arithmetic of the array sums
     this replaced (a WSE times a weight in float64, a slope times a weight in
@@ -90,7 +94,10 @@ def create_kernel_weighted_spread_map(
     """
     WSE_Times_Weight = np.zeros((nrows + 2, ncols + 2), dtype=np.float32)
     Total_Weight = np.zeros((nrows + 2, ncols + 2), dtype=np.float32)
+    # Each a test of an argument alone, so that numba drops the branches of one that isn't given
     has_slope = S_Rast is not None
+    has_valley = V_Rast is not None
+    has_channel = channel is not None
     Slope_Times_Weight = np.zeros((nrows + 2, ncols + 2) if has_slope else (1, 1), dtype=np.float32)
     state = np.zeros((1, 1), dtype=np.uint8)  # FloodAllLocalAreas' cells, grown as needed
 
@@ -112,6 +119,10 @@ def create_kernel_weighted_spread_map(
         SLOPE = 0.0
         if has_slope:
             SLOPE = float(S_Rast[r-1,c-1])
+        # Outside the channel, the valley's slope (the stream's without valley slopes)
+        VALLEY_SLOPE = SLOPE
+        if has_valley:
+            VALLEY_SLOPE = float(V_Rast[r-1,c-1])
 
         if COMID_TW_m > TW_m:
             COMID_TW_m = TW_m
@@ -146,8 +157,12 @@ def create_kernel_weighted_spread_map(
                                                           + WSE * np.float64(weight) * reached)
                     Total_Weight[rr, cc] = np.float32(np.float64(Total_Weight[rr, cc]) + np.float64(weight) * reached)
                     if has_slope:
+                        slope = SLOPE
+                        if has_channel:
+                            if not channel[rr - 1, cc - 1]:
+                                slope = VALLEY_SLOPE
                         Slope_Times_Weight[rr, cc] = np.float32(np.float64(Slope_Times_Weight[rr, cc])
-                                                                + np.float64(np.float32(SLOPE) * weight) * reached)
+                                                                + np.float64(np.float32(slope) * weight) * reached)
         else:
             for a in range(r_max - r_min):
                 for b in range(c_max - c_min):
@@ -156,9 +171,13 @@ def create_kernel_weighted_spread_map(
                     cc = c_min + b
                     WSE_Times_Weight[rr, cc] = np.float32(np.float64(WSE_Times_Weight[rr, cc]) + WSE * np.float64(weight))
                     Total_Weight[rr, cc] += weight
-                    # A weighted slope, for velocity
+                    # A weighted slope, for velocity: the valley's outside the channel, where there is one
                     if has_slope:
-                        Slope_Times_Weight[rr, cc] += np.float32(SLOPE) * weight
+                        slope = SLOPE
+                        if has_channel:
+                            if not channel[rr - 1, cc - 1]:
+                                slope = VALLEY_SLOPE
+                        Slope_Times_Weight[rr, cc] += np.float32(slope) * weight
 
     # Flood where the weighted WSE is above a valid elevation; the weighted
     # WSE takes the place of the WSE x weight sums
