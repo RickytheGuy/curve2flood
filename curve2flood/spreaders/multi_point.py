@@ -8,17 +8,24 @@ local grid whose origin is the DEM's top-left corner.
 """
 from pathlib import Path
 
+import numba
+import shapely
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+from numba import njit, prange
 from osgeo import gdal, ogr
 from scipy import ndimage as ndi
 from scipy.spatial import cKDTree
-from shapely.geometry import Point
 
 from curve2flood._log import LOG
+from curve2flood._patches import patches_holding
 from curve2flood.config import is_parquet
 
 ID_SYNONYMS = ["COMID", "RIVID", "river_id", "LINKNO"]
+# Cells interpolated at a time: each keeps its k nearest points meanwhile.  The KD-tree is queried with as many
+# threads as numba has (NUMBA_NUM_THREADS)
+_IDW_TARGETS = 1 << 20
 GeoTransform = tuple[float, float, float, float, float, float]
 
 def rasterize_shapes_gdal(shapes, out_shape: tuple[int, int], transform: GeoTransform) -> np.ndarray:
@@ -36,15 +43,21 @@ def rasterize_shapes_gdal(shapes, out_shape: tuple[int, int], transform: GeoTran
     layer = vector_ds.CreateLayer("shapes", geom_type=ogr.wkbUnknown)
     layer_defn = layer.GetLayerDefn()
 
-    feature_count = 0
-    for geom in shapes:
-        if geom is None or geom.is_empty:
-            continue
-        feature = ogr.Feature(layer_defn)
-        feature.SetGeometry(ogr.CreateGeometryFromWkb(geom.wkb))
-        layer.CreateFeature(feature)
-        feature = None
-        feature_count += 1
+    shapes = np.asarray(shapes if isinstance(shapes, np.ndarray) else list(shapes), dtype=object)
+    shapes = shapes[~shapely.is_missing(shapes)]
+    wkb = shapely.to_wkb(shapes[~shapely.is_empty(shapes)])
+    feature_count = len(wkb)
+    if feature_count and hasattr(layer, "WriteArrow"):
+        # Every feature in one call (GDAL 3.8 and later), not a Python call or three each; the extension name
+        # makes the column the features' geometry
+        geometry = pa.field("geometry", pa.binary(), metadata={b"ARROW:extension:name": b"geoarrow.wkb"})
+        layer.WriteArrow(pa.Table.from_arrays([pa.array(wkb, type=pa.binary())], schema=pa.schema([geometry])))
+    else:
+        for geom in wkb:
+            feature = ogr.Feature(layer_defn)
+            feature.SetGeometry(ogr.CreateGeometryFromWkb(geom))
+            layer.CreateFeature(feature)
+            feature = None
 
     if feature_count > 0:
         err = gdal.RasterizeLayer(raster_ds, [1], layer, burn_values=[1])
@@ -645,20 +658,23 @@ def create_fhs_points_from_scenario_dataframe(
     extra_types = []
     extra_slope = []
 
-    for _, row in results_df.iterrows():
+    # The columns' values, row by row: every one is taken as a Python float or int, as a row of iterrows was
+    has_slope = "Slope" in results_df.columns
+    columns = [results_df[c].to_numpy() for c in ("XS_Angle", "TopWidth_m", "WaterSurfaceElev_m", "Row", "Col", "COMID")]
+    columns.append(results_df["Slope"].to_numpy() if has_slope else np.full(len(results_df), np.nan))
+    for xs_angle, topwidth_value, scenario_wse, row_index, col_index, comid, slope_value in zip(*columns):
         # March outward from the centerline along the cross section until the
         # DEM blocks the water surface or the half-top-width is exhausted.
-        xs_angle = row["XS_Angle"]
-        topwidth_value = row["TopWidth_m"]
-        scenario_wse = row["WaterSurfaceElev_m"]
         if not np.isfinite(xs_angle) or not np.isfinite(topwidth_value) or not np.isfinite(scenario_wse):
             continue
         if float(topwidth_value) <= float(topwidth_threshold_m):
             continue
+        comid = int(comid)
+        point_slope = float(slope_value) if has_slope and np.isfinite(slope_value) else np.nan
 
         center_x, center_y = _grid_xy_from_rc(
-            np.asarray([int(row["Row"])], dtype=np.int32),
-            np.asarray([int(row["Col"])], dtype=np.int32),
+            np.asarray([int(row_index)], dtype=np.int32),
+            np.asarray([int(col_index)], dtype=np.int32),
             dx,
             dy,
         )
@@ -683,7 +699,7 @@ def create_fhs_points_from_scenario_dataframe(
                     continue
                 if float(scenario_wse) - float(point_elev) > 20.0:
                     LOG.warning(
-                        f"Large depth ({float(scenario_wse) - float(point_elev):.2f} m) at COMID {int(row['COMID'])}, "
+                        f"Large depth ({float(scenario_wse) - float(point_elev):.2f} m) at COMID {comid}, "
                         f"{side_label} side, offset {offset_m:.2f} m."
                     )
 
@@ -694,9 +710,9 @@ def create_fhs_points_from_scenario_dataframe(
                 extra_wse.append(float(scenario_wse))
                 extra_topwidth.append(float(topwidth_value))
                 extra_dem.append(float(point_elev))
-                extra_ids.append(int(row["COMID"]))
+                extra_ids.append(comid)
                 extra_types.append("XS_Extension")
-                extra_slope.append(float(row["Slope"]) if "Slope" in row and np.isfinite(row["Slope"]) else np.nan)
+                extra_slope.append(point_slope)
 
             if all(side_blocked.values()):
                 break
@@ -841,15 +857,17 @@ def build_variable_buffer_masks_from_points(
         empty = np.zeros(dem_shape, dtype=bool)
         return empty, empty
 
-    points = [Point(float(px), float(py)) for px, py in zip(x, y)]
+    # Every point's buffer at once, as Point.buffer makes it (16 segments a quarter circle)
+    points = shapely.points(np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64))
     if use_topwidth_buffers:
-        corridor_shapes = (geom.buffer(float(max(width, 0.0) * corridor_topwidth_factor))
-                           for geom, width in zip(points, topwidth))
-        anchor_shapes = (geom.buffer(float(max(width, 0.0) * anchor_topwidth_factor))
-                         for geom, width in zip(points, topwidth))
+        width = np.maximum(np.asarray(topwidth), np.float32(0.0))
+        corridor_shapes = shapely.buffer(points, np.asarray(width * corridor_topwidth_factor, dtype=np.float64),
+                                         quad_segs=16)
+        anchor_shapes = shapely.buffer(points, np.asarray(width * anchor_topwidth_factor, dtype=np.float64),
+                                       quad_segs=16)
     else:
-        corridor_shapes = (geom.buffer(float(fixed_corridor_buffer_m)) for geom in points)
-        anchor_shapes = (geom.buffer(float(fixed_anchor_buffer_m)) for geom in points)
+        corridor_shapes = shapely.buffer(points, float(fixed_corridor_buffer_m), quad_segs=16)
+        anchor_shapes = shapely.buffer(points, float(fixed_anchor_buffer_m), quad_segs=16)
 
     corridor = rasterize_shapes_gdal(corridor_shapes, out_shape=dem_shape, transform=transform).astype(bool)
     anchor = rasterize_shapes_gdal(anchor_shapes, out_shape=dem_shape, transform=transform).astype(bool)
@@ -870,16 +888,20 @@ def precompute_idw_neighbors(
     target_rows: np.ndarray,
     target_cols: np.ndarray,
     k: int,
+    tree: cKDTree | None = None,
+    workers: int = 1,
 ) -> dict[str, np.ndarray | tuple[int, int]]:
     """The ``k`` nearest points of each target cell, for ``idw_from_precomputed``.
 
     A point is usable for a cell only within its own ``point_max_distance``.
+    ``tree``, a KD-tree of the points, may be made once for many calls, and
+    ``workers`` threads query it: each cell's points are its own.
     """
-    pts = np.column_stack((x, y))
-    tree = cKDTree(pts)
+    if tree is None:
+        tree = cKDTree(np.column_stack((x, y)))
     xy = np.column_stack((target_x, target_y))
     global_max_dist = float(np.nanmax(point_max_distance))
-    dist, idx = tree.query(xy, k=k, distance_upper_bound=global_max_dist)
+    dist, idx = tree.query(xy, k=k, distance_upper_bound=global_max_dist, workers=workers)
     if k == 1:
         dist = dist[:, None]
         idx = idx[:, None]
@@ -904,12 +926,15 @@ def idw_from_precomputed(z: np.ndarray, valid_points: np.ndarray, pre: dict, pow
     A cell exactly on a point takes that point's value; cells with no usable
     point are NaN.  ``valid_points`` switches individual points off.
     """
+    out = np.full(pre["shape"], np.nan, dtype=np.float32)
+    out[pre["rows"], pre["cols"]] = idw_values(z, valid_points, pre, power)
+    return out
+
+def idw_values(z: np.ndarray, valid_points: np.ndarray, pre: dict, power: float) -> np.ndarray:
+    """``idw_from_precomputed``'s values of the target cells alone, in their order."""
     dist = pre["dist"]
     idx = pre["idx"]
     usable = pre["usable"].copy()
-    rows = pre["rows"]
-    cols = pre["cols"]
-    out_shape = pre["shape"]
 
     mask_idx = idx < len(z)
     valid_neighbor = np.zeros(idx.shape, dtype=bool)
@@ -939,10 +964,18 @@ def idw_from_precomputed(z: np.ndarray, valid_points: np.ndarray, pre: dict, pow
         vals[good] = (
             np.sum(weights[good] * z_safe[idx[good]], axis=1) / weight_sum[good]
         ).astype(np.float32)
+    return vals
 
-    out = np.full(out_shape, np.nan, dtype=np.float32)
-    out[rows, cols] = vals
-    return out
+def _target_bands(mask: np.ndarray, targets: int):
+    """Bands of rows ``(r0, r1)`` of ``mask`` with about ``targets`` of its cells each."""
+    per_row = np.count_nonzero(mask, axis=1)
+    cumulative = np.cumsum(per_row)
+    r0 = 0
+    while r0 < mask.shape[0]:
+        before = cumulative[r0 - 1] if r0 else 0
+        r1 = max(int(np.searchsorted(cumulative, before + targets, side='right')), r0 + 1)
+        yield r0, min(r1, mask.shape[0])
+        r0 = r1
 
 
 def summarize_sanity_filter(prefix: str, valid_before: np.ndarray, valid_after: np.ndarray, point_types: np.ndarray | None = None) -> str:
@@ -962,7 +995,22 @@ def summarize_sanity_filter(prefix: str, valid_before: np.ndarray, valid_after: 
 
 
 def smooth_nan(arr: np.ndarray, sigma: float) -> np.ndarray:
-    """Gaussian smooth while preserving NaN masks."""
+    """Gaussian smooth while preserving NaN masks.
+
+    SciPy's ``gaussian_filter`` filters down the columns and then along the
+    rows (``correlate1d``, reflecting at the edges), in float64, keeping the
+    first pass in float32; ``_smooth_nan_rows`` does the same arithmetic a
+    row at a time, in parallel, with no raster but the result.
+    """
+    sd = float(sigma)
+    radius = int(4.0 * sd + 0.5)  # gaussian_filter's truncate of 4
+    # gaussian_filter1d's weights, reversed for correlate1d (scipy.ndimage._filters._gaussian_kernel1d)
+    x = np.arange(-radius, radius + 1)
+    weights = np.exp(-0.5 / (sd * sd) * x ** 2)
+    weights = (weights / weights.sum())[::-1]
+    if (arr.ndim == 2 and sd > 1e-15 and radius < min(arr.shape)
+            and np.all(np.abs(weights[radius + 1:] - weights[:radius][::-1]) <= np.finfo(np.float64).eps)):
+        return _smooth_nan_rows(arr, np.ascontiguousarray(weights[radius::-1]))
     # Smooth the values and the valid-data mask separately so NaN gaps do not
     # behave like zero-valued water surface cells.
     valid = np.isfinite(arr)
@@ -973,6 +1021,53 @@ def smooth_nan(arr: np.ndarray, sigma: float) -> np.ndarray:
     mask = den > 1.0e-6
     out[mask] = num[mask] / den[mask]
     return out
+
+@njit(cache=True, inline="always")
+def _reflect(i: int, n: int) -> int:
+    """Index ``i`` of a line of ``n``, reflected at its ends as SciPy's ``mode='reflect'`` extends it (for ``i``
+    less than ``n`` beyond them)."""
+    if i < 0:
+        return -i - 1
+    if i >= n:
+        return 2 * n - i - 1
+    return i
+
+@njit(cache=True, parallel=True)
+def _smooth_nan_rows(arr: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """``smooth_nan`` with a symmetric kernel: ``weights[0]`` its centre's weight and ``weights[j]`` that of the
+    cells ``j`` away.  Each row's first pass (down the columns) is worked out as the row is reached."""
+    nrows, ncols = arr.shape
+    radius = weights.size - 1
+    out = np.empty((nrows, ncols), dtype=np.float32)
+    for r in prange(nrows):
+        down_num = np.empty(ncols, dtype=np.float32)
+        down_den = np.empty(ncols, dtype=np.float32)
+        for c in range(ncols):
+            num = _finite_or_zero(arr[r, c]) * weights[0]
+            den = (1.0 if np.isfinite(arr[r, c]) else 0.0) * weights[0]
+            for j in range(radius, 0, -1):
+                above, below = arr[_reflect(r - j, nrows), c], arr[_reflect(r + j, nrows), c]
+                num += (_finite_or_zero(above) + _finite_or_zero(below)) * weights[j]
+                den += ((1.0 if np.isfinite(above) else 0.0) + (1.0 if np.isfinite(below) else 0.0)) * weights[j]
+            down_num[c] = num
+            down_den[c] = den
+
+        for c in range(ncols):
+            num = np.float64(down_num[c]) * weights[0]
+            den = np.float64(down_den[c]) * weights[0]
+            for j in range(radius, 0, -1):
+                left, right = _reflect(c - j, ncols), _reflect(c + j, ncols)
+                num += (np.float64(down_num[left]) + np.float64(down_num[right])) * weights[j]
+                den += (np.float64(down_den[left]) + np.float64(down_den[right])) * weights[j]
+            num32, den32 = np.float32(num), np.float32(den)
+            out[r, c] = num32 / den32 if den32 > np.float32(1.0e-6) else np.float32(np.nan)
+            
+    return out
+
+@njit(cache=True, inline="always")
+def _finite_or_zero(value) -> float:
+    """``value`` as float32 and then float64, or 0 where it isn't finite, as ``smooth_nan`` fills its gaps."""
+    return np.float64(np.float32(value)) if np.isfinite(value) else 0.0
 
 def compute_fhs_flood_from_wse(
     wse: np.ndarray,
@@ -988,7 +1083,8 @@ def compute_fhs_flood_from_wse(
     above the DEM and it connects (4- or 8-connected) to the anchor cells.
     WSE is NaN wherever the ground is at or above it.
     """
-    if smooth_sigma_pixels > 0:
+    smoothed = smooth_sigma_pixels > 0
+    if smoothed:
         wse = smooth_nan(wse, smooth_sigma_pixels)
 
     # A cell is initially eligible when the interpolated WSE overtops the DEM
@@ -997,15 +1093,17 @@ def compute_fhs_flood_from_wse(
     flood = valid_wse & corridor & (dem < wse)
     flood |= anchor
 
-    structure = ndi.generate_binary_structure(2, 2 if connectivity == 8 else 1)
-    flood = ndi.binary_propagation(anchor, mask=flood, structure=structure)
+    # binary_propagation of the anchors through the flood: the flood's patches that hold an anchor, the anchors
+    # being flooded
+    flood = patches_holding(flood, anchor, connectivity == 8)
 
     dry_cells = dem >= wse
-    wse = wse.copy()
+    if not smoothed:
+        wse = wse.copy()  # the caller's; smooth_nan's is new
     wse[dry_cells] = np.nan
     flood[dry_cells] = False
 
-    return flood.astype(np.uint8), wse.astype(np.float32)
+    return flood.astype(np.uint8), wse.astype(np.float32, copy=False)
 
 def create_fhs_flood_map_from_points(
     dem: np.ndarray,
@@ -1218,13 +1316,16 @@ def create_fhs_flood_map_from_points(
     else:
         point_max_distance = np.full(len(z_valid), max_distance_m, dtype=np.float32)
 
-    # Interpolate only within the buffered corridor; cells outside it stay NaN
+    # Interpolate only within the buffered corridor; cells outside it stay NaN.  A band of rows at a time: a cell's
+    # k nearest points take 8 k bytes, too many to keep for a whole corridor at once.
     interp_mask = corridor & np.isfinite(dem)
-    target_x, target_y, target_rows, target_cols = build_target_coordinates(xs, ys, interp_mask)
-    if len(target_x) == 0:
-        wse = np.full(dem.shape, np.nan, dtype=np.float32)
-        slope_interp = np.full(dem.shape, np.nan, dtype=np.float32) if point_slope is not None else None
-    else:
+    wse = np.full(dem.shape, np.nan, dtype=np.float32)
+    slope_interp = np.full(dem.shape, np.nan, dtype=np.float32) if point_slope is not None else None
+    tree = cKDTree(np.column_stack((x_valid, y_valid))) if interp_mask.any() else None
+    valid_points = np.ones(len(z_valid), dtype=bool)
+    for r0, r1 in (_target_bands(interp_mask, _IDW_TARGETS) if tree is not None else ()):
+        target_x, target_y, target_rows, target_cols = build_target_coordinates(xs, ys[r0:r1], interp_mask[r0:r1])
+        target_rows += r0
         pre = precompute_idw_neighbors(
             x=x_valid,
             y=y_valid,
@@ -1235,13 +1336,14 @@ def create_fhs_flood_map_from_points(
             target_rows=target_rows,
             target_cols=target_cols,
             k=k,
+            tree=tree,
+            workers=numba.get_num_threads(),
         )
-        valid_points = np.ones(len(z_valid), dtype=bool)
-        wse = idw_from_precomputed(z_valid, valid_points, pre, power)
+        wse[target_rows, target_cols] = idw_values(z_valid, valid_points, pre, power)
         if point_slope is not None:
-            slope_interp = idw_from_precomputed(point_slope[valid].astype(np.float32), valid_points, pre, power)
-        else:
-            slope_interp = None
+            slope_interp[target_rows, target_cols] = idw_values(point_slope[valid].astype(np.float32), valid_points,
+                                                                pre, power)
+        del pre
 
     flood, wse = compute_fhs_flood_from_wse(
         wse=wse,
@@ -1251,13 +1353,15 @@ def create_fhs_flood_map_from_points(
         connectivity=connectivity,
         smooth_sigma_pixels=smooth_sigma_pixels,
     )
-    depth = np.where(np.isfinite(wse), np.maximum(wse - dem, 0.0), np.nan).astype(np.float32)
-
-    if slope_interp is not None:
-        slope = np.where(flood > 0, slope_interp, np.nan).astype(np.float32)
-        slope = np.where(slope <= 0.0, 0.0002, slope).astype(np.float32)
-    else:
-        slope = None
+    # A strip of rows at a time, so that the temporaries are a strip's; the slope in its own raster
+    depth = np.empty(dem.shape, dtype=np.float32)
+    slope = slope_interp
+    for r0 in range(0, dem.shape[0], 256):
+        rows = slice(r0, r0 + 256)
+        depth[rows] = np.where(np.isfinite(wse[rows]), np.maximum(wse[rows] - dem[rows], 0.0), np.nan)
+        if slope is not None:
+            slope[rows] = np.where(flood[rows] > 0, slope[rows], np.nan)
+            slope[rows] = np.where(slope[rows] <= 0.0, 0.0002, slope[rows])
 
     return {
         "flood": flood,

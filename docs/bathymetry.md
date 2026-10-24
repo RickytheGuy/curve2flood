@@ -6,6 +6,8 @@ its bed elevations to a raster (`BATHY_Out_File`; see ARC's
 into the DEM and writes the result to `FSOutBATHY`, a DEM that later ARC and Curve2Flood runs can use. Give both keys
 to turn this on.
 
+![A cross section of a river: the DEM runs flat across the water surface, and FSOutBATHY follows ARC's channel bed below it.](figures/bathymetry.svg)
+
 ## The steps
 
 1. **ARC's bed.** The cells where ARC's raster has a value take ARC's bed elevation, as ARC wrote it.

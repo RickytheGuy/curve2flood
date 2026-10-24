@@ -6,150 +6,31 @@ surface elevation (WSE), velocity and an optional topobathymetric DEM.
 """
 # built-in imports
 import os
-import json
 
 # third-party imports
 import numpy as np
 import pandas as pd
 import polars as pl
-import geopandas as gpd
-import polars.selectors as cs
 from pyproj import CRS, Geod
-from numba import njit
-from osgeo import gdal, osr, ogr
-
-from shapely.geometry import shape
-from scipy.spatial import cKDTree
-from scipy.ndimage import label, generate_binary_structure, distance_transform_edt, uniform_filter
+import polars.selectors as cs
+from numba import njit, prange
+from osgeo import gdal
 
 from curve2flood import LOG
-from curve2flood.config import Config, FLDPLN, KERNEL_WEIGHTED, MULTI_POINT, MAPPERS, is_parquet
+from curve2flood.bathymetry import create_bathymetry
+from curve2flood.streamcell_values import StreamCellValues
+from curve2flood.rating_curves import (
+    calculate_interpolated_vdt,
+    Calculate_Depth_TopWidth_TWMax_Velocity
+)
+from curve2flood._raster import open_raster, read_array, read_into, write_threads, _check_shape, Read_Raster_GDAL
+from curve2flood.config import Config, FLDPLN, KERNEL_WEIGHTED, is_parquet, MULTI_POINT
+from curve2flood.outputs import main_flood_ouputs, accumulate_positive_max, remove_cells_not_connected
 from curve2flood.spreaders import (
-    _make_fldpln_flood_map, create_kernel_weighted_spread_map, filter_outliers, multi_point_interpolation
+    make_fldpln_flood_map, spread_stream_cells, multi_point_interpolation
 )
 
 gdal.UseExceptions()
-
-# GDAL compresses a raster's blocks in parallel with this creation option
-_WRITE_THREADS = "NUM_THREADS=ALL_CPUS"
-
-# The VDT database's column of the slope the overbanks flow at, which ARC writes with Valley_Sections: the valley's
-# slope, the stream's times its sinuosity
-VALLEY_SLOPE = 'Valley_Slope'
-
-def read_manning_table(s_manning_path: str, land_cover: np.ndarray):
-    """Convert a land-cover raster to Manning's n.
-
-    The table is tab separated, with the land-cover code in the first column
-    and Manning's n in the third.  Codes missing from the table get n = 0.
-    """
-    df = pd.read_csv(s_manning_path, sep='\t')
-
-    # A lookup array is the fastest way to reclassify the raster.  It is float32,
-    # as the velocity is, and an integer raster indexes it as it is, so no
-    # 8-byte copy of the raster is made.
-    idx = df.iloc[:, 0].astype(int).values
-    lookup_array = np.zeros(idx.max() + 1)
-    lookup_array[idx] = df.iloc[:, 2].values
-    if land_cover.dtype.kind not in 'iu':
-        land_cover = land_cover.astype(int)
-    return lookup_array.astype(np.float32)[land_cover]
-
-
-def create_velocity(config: Config, OutVEL, Depth_Array, LC_array, Slope_Array,
-                           geotransform, projection, ncols, nrows,
-                           Flood_Ensemble):
-    """Write the velocity raster from Manning's equation, ``V = D^(2/3) S^(1/2) / n``.
-
-    Each cell is treated as a wide rectangular channel: ``D`` is its flood
-    depth, ``S`` the largest positive slope over the flow events
-    (``Slope_Array``, NaN where there is none: the stream's, or outside the
-    channels the valley's, see ``channel_cells``) and ``n`` comes from its
-    land cover.  Flooded cells without a value take their nearest neighbour's.
-    """
-    VEL_Array = 1 / read_manning_table(config.lu_manning_n, LC_array)
-    VEL_Array *= Depth_Array ** (2/3)
-    VEL_Array *= Slope_Array ** (1/2)
-
-    out_band_data = Flood_Flooded_Cells_in_Map(VEL_Array, Flood_Ensemble, eps=0.01)
-    nodata_value = np.nan
-    del VEL_Array
-
-    driver = gdal.GetDriverByName("GTiff")
-    ds: gdal.Dataset = driver.Create(
-        OutVEL, ncols, nrows, 1, gdal.GDT_Float32,
-        options=[f"COMPRESS={config.compression}", "PREDICTOR=2", "TILED=YES", _WRITE_THREADS]
-    )
-    if ds is None:
-        raise RuntimeError(f"Failed to create output raster: {OutVEL}")
-
-    ds.SetGeoTransform(geotransform)
-    ds.SetProjection(projection)
-
-    band = ds.GetRasterBand(1)
-    band.WriteArray(out_band_data)
-    band.SetNoDataValue(nodata_value)
-    band.FlushCache()
-    ds.FlushCache()
-
-    band = None
-    ds = None
-
-def _scan_table(path: str) -> pl.LazyFrame:
-    """A CSV or Parquet table, lazily."""
-    return pl.scan_parquet(path) if is_parquet(path) else pl.scan_csv(path)
-
-def has_valley_slopes(VDTDatabaseFileName: str | None) -> bool:
-    """Whether a VDT database gives its stream cells' valley slopes (``Valley_Slope``, ARC's with Valley_Sections)."""
-    return bool(VDTDatabaseFileName) and VALLEY_SLOPE in _scan_table(VDTDatabaseFileName).collect_schema().names()
-
-def channel_cells(VDTDatabaseFileName: str, nrows: int, ncols: int, dx: float, dy: float) -> np.ndarray:
-    """The channels: the cells within half their reach's baseflow top width of a stream cell of the VDT database, and
-    the stream cells themselves.
-
-    The water in a channel runs along it, at the stream's slope, but over the
-    floodplain of a meandering river it runs straight down the valley, at the
-    valley's slope: the stream's times its sinuosity.  So outside the channels
-    the velocity takes the valley's slope, where the VDT gives it.  On
-    synthetic meanders, against a 2D model (LISFLOOD-FP's local inertial
-    scheme), the velocities over the floodplain were 0.71-0.93 of the 2D
-    model's with the stream's slope, and 0.88-1.02 with the valley's.
-
-    A stream cell's baseflow top width is the VDT's at the first flow at or
-    above its ``QBaseflow``, as in ``Find_TopWidth_at_Baseflow_when_using_VDT``,
-    and a reach's is the median of its cells': on tight synthetic meanders, a
-    few cross sections' rating curves top their banks below that flow, and
-    their own top widths, up to 700 m, made channels six times the channel's
-    area of the floodplain.
-    """
-    vdt = _scan_table(VDTDatabaseFileName).select(
-        'COMID', 'Row', 'Col', 'QBaseflow', cs.starts_with('q_'), cs.starts_with('t_')).collect()
-    flows = vdt.select(cs.starts_with('q_')).to_numpy().astype(np.float32, copy=False)
-    top_widths = vdt.select(cs.starts_with('t_')).to_numpy().astype(np.float32, copy=False)
-    baseflow = vdt['QBaseflow'].to_numpy().astype(np.float32, copy=False)
-    first = np.minimum((flows < baseflow[:, None]).sum(axis=1), flows.shape[1] - 1)
-    cell_width = top_widths[np.arange(len(vdt)), first].astype(np.float64)
-    half_width = pl.DataFrame({'COMID': vdt['COMID'], 'width': cell_width}).select(
-        pl.col('width').median().over('COMID') / 2.0).to_series().to_numpy()
-    channel = np.zeros((nrows, ncols), dtype=np.bool_)
-    _paint_channel(vdt['Row'].to_numpy().astype(np.int64), vdt['Col'].to_numpy().astype(np.int64), half_width,
-                   float(dx), float(dy), channel)
-    return channel
-
-@njit(cache=True)
-def _paint_channel(rows, cols, half_widths, dx, dy, channel):
-    """Mark ``channel`` within ``half_widths[i]`` metres of each cell ``(rows[i], cols[i])``, and at the cell itself."""
-    nrows, ncols = channel.shape
-    for i in range(rows.size):
-        r, c, h = rows[i], cols[i], half_widths[i]
-        channel[r, c] = True
-        if not h > 0.0:
-            continue
-        reach_rows, reach_cols = int(h // dy), int(h // dx)
-        for a in range(max(r - reach_rows, 0), min(r + reach_rows + 1, nrows)):
-            for b in range(max(c - reach_cols, 0), min(c + reach_cols + 1, ncols)):
-                if ((a - r) * dy) ** 2 + ((b - c) * dx) ** 2 <= h * h:
-                    channel[a, b] = True
 
 def convert_cell_size(
     d_dem_cell_size_x: float,
@@ -190,401 +71,6 @@ def convert_cell_size(
 
     return d_x_cell_size, d_y_cell_size
 
-def _count_flow_events(FlowFileName: str) -> int:
-    """Number of flow events (columns after the COMID column) in a flow file."""
-    if is_parquet(FlowFileName):
-        return pd.read_parquet(FlowFileName).shape[1] - 1
-    return pd.read_csv(FlowFileName, nrows=0).shape[1] - 1
-
-def FindFlowRateForEachCOMID_Ensemble(FlowFileName: str, flow_event_num: int) -> dict:
-    """Return ``{COMID: flow}`` for one flow event.
-
-    The flow file (CSV or Parquet) has the COMID in its first column and one
-    column of flows per event.  Missing flows are treated as zero.
-    """
-    if is_parquet(FlowFileName):
-        flow_df = pd.read_parquet(FlowFileName).iloc[:, [0, flow_event_num + 1]]
-    else:
-        flow_df = pd.read_csv(FlowFileName, usecols=[0, flow_event_num + 1])
-
-    if flow_df.iloc[:, 1].isna().any():
-        LOG.warning(f"Warning: NaN values found in flow data for event {flow_event_num}. These will be treated as zero flow.")
-        flow_df.iloc[:, 1] = flow_df.iloc[:, 1].fillna(0)
-
-    comid_q_dict = flow_df.set_index(flow_df.columns[0])[flow_df.columns[1]].to_dict()
-
-    return comid_q_dict
-
-def calculate_interpolated_curvefile(CurveParamFileName: str, COMID_Unique_Flow: dict, TW_MultFact: float) -> pd.DataFrame:
-    """Evaluate the curve file's rating curves at each reach's flow.
-
-    Depth, top width and velocity follow ``a * Q**b`` power laws, and WSE is
-    the depth plus the cell's ``BaseElev``.  Cells more than two standard
-    deviations from their reach's mean are dropped, and top widths are scaled
-    by ``TW_MultFact``.
-    """
-    LOG.debug('\nOpening and Reading ' + CurveParamFileName)
-
-    if is_parquet(CurveParamFileName):
-        curve_df = pd.read_parquet(CurveParamFileName)
-    else:
-        curve_df = pd.read_csv(CurveParamFileName)
-
-    # Add COMID flow information
-    comid_flow_df = pd.DataFrame(COMID_Unique_Flow.items(), columns=['COMID', 'Flow'])
-    curve_df = curve_df.merge(comid_flow_df, on="COMID", how="left")
-
-    curve_df['Depth'] = curve_df['depth_a']*curve_df['Flow']**curve_df['depth_b']
-    curve_df['TopWidth'] = curve_df['tw_a']*curve_df['Flow']**curve_df['tw_b']
-    curve_df['Velocity'] = curve_df['vel_a']*curve_df['Flow']**curve_df['vel_b']
-    curve_df = curve_df[curve_df['Depth']>0]
-    curve_df = curve_df[curve_df['TopWidth']>0]
-    curve_df['WSE'] = curve_df['Depth'] + curve_df['BaseElev']
-
-    curve_df = curve_df.groupby('COMID', group_keys=False)[curve_df.columns].apply(filter_outliers)
-
-    curve_df['TopWidth'] = curve_df['TopWidth'].astype(np.float32) * np.float32(TW_MultFact)
-
-    return curve_df
-
-def Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName: str, COMID_Unique_Flow: dict, COMID_Unique, T_Rast, W_Rast, S_Rast, TW_MultFact):
-    """Fill the top-width, WSE and slope rasters from the curve file for one event.
-
-    Returns ``(COMID_Unique_TW, COMID_Unique_Depth, TopWidthMax, T_Rast,
-    W_Rast, S_Rast)``: each reach's median top width and depth (0 for reaches
-    without curves), and the largest of those top widths.
-    """
-    curve_df = calculate_interpolated_curvefile(CurveParamFileName, COMID_Unique_Flow, TW_MultFact)
-
-    T_Rast[curve_df['Row'], curve_df['Col']] = curve_df['TopWidth']
-    W_Rast[curve_df['Row'], curve_df['Col']] = curve_df['WSE']
-    if S_Rast is not None:
-        S_Rast[curve_df['Row'], curve_df['Col']] = curve_df['Slope']
-
-    median_values = curve_df.groupby('COMID').agg({'TopWidth': 'median', 'Depth': 'median'})
-
-    # Map results back to the unique COMID list
-    comid_result_df = pd.DataFrame({'COMID': COMID_Unique})
-    comid_result_df = comid_result_df.merge(median_values, on='COMID', how='left').fillna(0)
-
-    comid_result_df['COMID'] = comid_result_df['COMID'].astype(np.int32)
-    comid_result_df['TopWidth'] = comid_result_df['TopWidth'].astype(np.float32)
-    comid_result_df['Depth'] = comid_result_df['Depth'].astype(np.float32)
-
-    COMID_Unique_TW = comid_result_df.set_index('COMID')['TopWidth'].to_dict()
-    COMID_Unique_Depth = comid_result_df.set_index('COMID')['Depth'].to_dict()
-
-    TopWidthMax = comid_result_df['TopWidth'].max()
-
-    return (
-        COMID_Unique_TW,
-        COMID_Unique_Depth,
-        TopWidthMax,
-        T_Rast,
-        W_Rast,
-        S_Rast,
-    )
-
-@njit("float32(float32, float32[:], float32[:])", cache=True)
-def Find_TopWidth_at_Baseflow_when_using_VDT(QB, flow_values, top_width_values):
-    """Top width at the first VDT flow that is at least the baseflow ``QB``.
-
-    Returns the last top width when ``QB`` is above every flow.
-    """
-    idx = np.searchsorted(flow_values, QB, side="left")
-    if idx >= len(flow_values):
-        return top_width_values[-1]
-    else:
-        return top_width_values[idx]
-
-@njit("float32(float32[:], float32[:], float32)", cache=True)
-def interp1d_numba(x: np.ndarray, y: np.ndarray, xi: float | int) -> float:
-    """Linearly interpolate ``y(x)`` at ``xi``, extrapolating from the end segments.
-
-    ``x`` must be sorted.  Same as SciPy's ``interp1d(..., fill_value='extrapolate')``.
-    """
-    n = len(x)
-
-    if xi <= x[0]:
-        # extrapolate left
-        return y[0] + (xi - x[0]) * (y[1] - y[0]) / (x[1] - x[0]) if (x[1] - x[0]) != 0 else y[0]
-    elif xi >= x[n - 1]:
-        # extrapolate right
-        return y[n - 2] + (xi - x[n - 2]) * (y[n - 1] - y[n - 2]) / (x[n - 1] - x[n - 2]) if (x[n - 1] - x[n - 2]) != 0 else y[n - 1]
-
-    # binary search for correct interval
-    low = 0
-    high = n - 1
-    while high - low > 1:
-        mid = (high + low) // 2
-        if x[mid] > xi:
-            high = mid
-        else:
-            low = mid
-
-    # linear interpolation
-    x0 = x[low]
-    x1 = x[high]
-    y0 = y[low]
-    y1 = y[high]
-
-    return y0 + (xi - x0) * (y1 - y0) / (x1 - x0) if (x1 - x0) != 0 else y0
-
-@njit(cache=True)
-def vdt_interpolate(flow: np.ndarray,
-                    qb: np.ndarray,
-                    flow_values: np.ndarray,
-                    top_width_values: np.ndarray,
-                    wse_values: np.ndarray,
-                    vel_values: np.ndarray,
-                    elev: np.ndarray,
-                    tw_mult_fact: np.ndarray) -> tuple[np.ndarray, ...]:
-    """Interpolate each VDT row's curves at its flow.
-
-    Returns ``(top_width, depth, wse, velocity)``.  Flows above a row's largest
-    flow take its last values.  Smaller flows are interpolated linearly (and
-    extrapolated below the first flow), with the WSE kept at or above the
-    cell's elevation ``elev`` and the depth at least 1 mm.  Depths are
-    measured from ``elev``.  The top width is at least the top
-    width at baseflow ``qb``, and is then multiplied by ``tw_mult_fact``.
-    """
-    top_width = np.empty_like(flow)
-    depth = np.empty_like(flow)
-    wse = np.empty_like(flow)
-    baseflow_tw = np.empty_like(flow)
-    vel = np.empty_like(flow)
-
-    for i in range(len(flow)):
-        if flow[i] >= flow_values[i][-1]:
-            # Above the maximum flow value
-            top_width[i] = top_width_values[i][-1]
-            wse[i] = wse_values[i][-1]
-            depth[i] = wse[i] - elev[i]
-            vel[i] = vel_values[i][-1]
-        else:
-            # Interpolate
-            wse[i] = interp1d_numba(flow_values[i], wse_values[i], flow[i])
-            top_width[i] = max(interp1d_numba(flow_values[i], top_width_values[i], flow[i]), 0.0)
-            wse[i] = max(wse[i], elev[i])
-            depth[i] = max(wse[i] - elev[i], 0.001)
-            vel[i] = max(interp1d_numba(flow_values[i], vel_values[i], flow[i]), 0.0)
-
-        baseflow_tw[i] = Find_TopWidth_at_Baseflow_when_using_VDT(qb[i], flow_values[i], top_width_values[i])
-
-    # Ensure TopWidth respects baseflow and scale
-    top_width = np.maximum(top_width, baseflow_tw) * tw_mult_fact
-
-    return top_width, depth, wse, vel
-
-def calculate_interpolated_vdt(
-        VDTDatabaseFileName: str,
-        COMID_Unique_Flow: dict,
-        TW_MultFact: float,
-        ) -> pl.DataFrame:
-    """Interpolate the VDT database at each reach's flow.
-
-    Returns one row per stream cell with ``TopWidth``, ``Depth``, ``WSE`` and
-    ``Velocity`` (see ``vdt_interpolate``), measured from the VDT's ``Elev``,
-    the channel bed under the cell.  Within each reach, cells outside the
-    1st-99th percentile of top width or velocity are dropped.  WSE isn't
-    filtered: it falls along a reach, so its extremes are the reach's two
-    ends, and dropping them left gaps at every junction.
-    """
-    LOG.debug('\nOpening and Reading ' + VDTDatabaseFileName)
-
-    if is_parquet(VDTDatabaseFileName):
-        vdt_df = pl.read_parquet(VDTDatabaseFileName)
-    else:
-        vdt_df = pl.read_csv(VDTDatabaseFileName)
-
-    if vdt_df.is_empty():
-        raise ValueError("The VDT Database file is empty or could not be read properly.")
-    if 'Elev' not in vdt_df.columns:
-        raise ValueError(f"The VDT database {VDTDatabaseFileName} has no Elev column.")
-
-    # Add COMID flow information
-    comid_flow_df = pl.DataFrame(data=list(COMID_Unique_Flow.items()), schema=['COMID', 'Flow'], orient='row')
-    vdt_df = vdt_df.join(comid_flow_df, on='COMID', how='inner')
-
-    vdt_df = vdt_df.with_columns([
-        pl.col('Row').cast(pl.Int32),
-        pl.col('Col').cast(pl.Int32)
-    ])
-
-    flow = vdt_df['Flow'].to_numpy().astype(np.float32, copy=False)
-    qb = vdt_df['QBaseflow'].to_numpy().astype(np.float32, copy=False)
-    elev = vdt_df['Elev'].to_numpy().astype(np.float32, copy=False)
-
-    # The flow, top-width, WSE and velocity curves, one row per cell
-    flow_values = vdt_df.select(cs.starts_with('q_')).to_numpy().astype(np.float32, copy=False)
-    top_width_values = vdt_df.select(cs.starts_with('t_')).to_numpy().astype(np.float32, copy=False)
-    wse_values = vdt_df.select(cs.starts_with('wse_')).to_numpy().astype(np.float32, copy=False)
-    vel_values = vdt_df.select(cs.starts_with('v_')).to_numpy().astype(np.float32, copy=False)
-
-    tw_mult_fact = np.full(flow.size, TW_MultFact, dtype=np.float32)
-    top_width, depth, wse, velocity = vdt_interpolate(flow, qb, flow_values, top_width_values, wse_values, vel_values, elev, tw_mult_fact)
-
-    # Add the interpolated values back to the DataFrame.  The ~120 curve columns
-    # they came from are dropped first, or every filter below would copy them.
-    vdt_df = vdt_df.drop(cs.starts_with('q_', 't_', 'wse_', 'v_')).with_columns([
-        pl.Series('TopWidth', top_width),
-        pl.Series('Depth', depth),
-        pl.Series('WSE', wse),
-        pl.Series('Velocity', velocity),
-    ])
-
-    vdt_df = vdt_df.drop_nans(subset=['TopWidth', 'Depth', 'WSE', 'Velocity'])
-
-    vdt_df = vdt_df.with_columns(
-        pl.col('TopWidth').round(2),
-        pl.col('WSE').round(2),
-        pl.col('Velocity').round(2),
-    )
-
-    # Drop each reach's outliers (not by WSE: see above)
-    cols = ['TopWidth', 'Velocity']
-    for col in cols:
-        vdt_df = vdt_df.with_columns(
-            pl.col(col).quantile(0.01).over("COMID").alias("q01"),
-            pl.col(col).quantile(0.99).over("COMID").alias("q99"),
-        ).filter(
-            pl.col(col).is_between(pl.col("q01"), pl.col("q99"))
-        ).drop("q01", "q99")
-
-    return vdt_df
-
-def Calculate_TW_D_V_ForEachCOMID_VDTDatabase(VDTDatabaseFileName: str, COMID_Unique_Flow: dict, COMID_Unique, T_Rast, W_Rast, S_Rast, TW_MultFact, V_Rast=None):
-    """Fill the top-width, WSE and slope rasters from the VDT database for one event.
-
-    ``V_Rast``, when given, gets the VDT's valley slopes (``Valley_Slope``).
-
-    Returns ``(COMID_Unique_TW, COMID_Unique_Depth, TopWidthMax, T_Rast,
-    W_Rast, S_Rast)``: each reach's median top width and depth, and the
-    largest of those top widths.
-    """
-    vdt_df = calculate_interpolated_vdt(VDTDatabaseFileName, COMID_Unique_Flow, TW_MultFact)
-
-    T_Rast[vdt_df['Row'], vdt_df['Col']] = vdt_df['TopWidth']
-    W_Rast[vdt_df['Row'], vdt_df['Col']] = vdt_df['WSE']
-    if S_Rast is not None:
-        S_Rast[vdt_df['Row'], vdt_df['Col']] = vdt_df['Slope']
-    if V_Rast is not None:
-        V_Rast[vdt_df['Row'], vdt_df['Col']] = vdt_df[VALLEY_SLOPE]
-
-    median_values = vdt_df.group_by('COMID').agg([
-        pl.col('TopWidth').median(),
-        pl.col('Depth').median(),
-    ])
-
-    # Map results back to the unique COMID list
-    comid_result_df = pl.DataFrame({'COMID': COMID_Unique})
-    comid_result_df = comid_result_df.join(median_values, on='COMID', how='left').fill_nan(0)
-    comid_result_df = comid_result_df.with_columns(
-        pl.col('COMID').cast(pl.Int32),
-        pl.col('TopWidth').cast(pl.Float32),
-        pl.col('Depth').cast(pl.Float32),
-    )
-
-    COMID_Unique_TW = dict(zip(comid_result_df['COMID'].to_numpy(), comid_result_df['TopWidth'].to_numpy()))
-    COMID_Unique_Depth = dict(zip(comid_result_df['COMID'].to_numpy(), comid_result_df['Depth'].to_numpy()))
-
-    TopWidthMax = comid_result_df['TopWidth'].max()
-
-    return (
-        COMID_Unique_TW,
-        COMID_Unique_Depth,
-        TopWidthMax,
-        T_Rast,
-        W_Rast,
-        S_Rast
-    )
-
-def Read_Raster_GDAL(InRAST_Name):
-    """Read band 1 of a raster as ``(array, geotransform, projection)``.
-
-    South-up rasters (positive pixel height) are flipped to north-up.
-    """
-    dataset = gdal.Open(InRAST_Name, gdal.GA_ReadOnly)
-    geotransform = dataset.GetGeoTransform()
-    RastArray = dataset.GetRasterBand(1).ReadAsArray()
-    nrows = RastArray.shape[0]
-
-    if geotransform[5] > 0:
-        LOG.warning('Raster appears south-up (positive pixel height); flipping to north-up: ' + str(InRAST_Name))
-        RastArray = np.flipud(RastArray)
-        geotransform = (
-            geotransform[0],
-            geotransform[1],
-            geotransform[2],
-            geotransform[3] + geotransform[5] * nrows,
-            geotransform[4],
-            -geotransform[5],
-        )
-
-    Rast_Projection = dataset.GetProjectionRef()
-    dataset = None
-    return RastArray, geotransform, Rast_Projection
-
-def Write_Output_Raster(s_output_filename, raster_data, ncols, nrows, dem_geotransform, dem_projection, s_file_format, s_output_type, compression, creation_options: list[str] = None):
-    """Write a single-band raster.  ``creation_options`` replaces the default compression options."""
-    o_driver = gdal.GetDriverByName(s_file_format)  #Typically will be a GeoTIFF "GTiff"
-
-    if creation_options is None:
-        creation_options = [f"COMPRESS={compression}", 'PREDICTOR=2', _WRITE_THREADS]
-
-    o_output_file = o_driver.Create(s_output_filename, xsize=ncols, ysize=nrows, bands=1, eType=s_output_type, options=creation_options)
-    o_output_file.SetGeoTransform(dem_geotransform)
-    o_output_file.SetProjection(dem_projection)
-    o_output_file.GetRasterBand(1).WriteArray(raster_data)
-
-    # Closing the dataset writes it to disk
-    o_output_file = None
-
-
-def Write_Output_Raster_As_GeoDataFrame(raster_data, ncols, nrows, dem_geotransform, dem_projection, s_output_type):
-    """Polygonise a raster and return the polygons of its positive cells as a GeoDataFrame."""
-    driver = gdal.GetDriverByName('MEM')
-    raster_ds = driver.Create('', xsize=ncols, ysize=nrows, bands=1, eType=s_output_type)
-    raster_ds.SetGeoTransform(dem_geotransform)
-    raster_ds.SetProjection(dem_projection)
-    raster_ds.GetRasterBand(1).WriteArray(raster_data)
-
-    # Set NoData value to NaN, and auto-generate a mask band that respects it
-    nodata_value = np.nan
-    raster_ds.GetRasterBand(1).SetNoDataValue(nodata_value)
-    mask_band = raster_ds.GetRasterBand(1).GetMaskBand()
-
-    # Create an in-memory vector layer for the polygonized data
-    memory_driver = (ogr.GetDriverByName('MEM') or ogr.GetDriverByName('Memory'))
-    vector_ds = memory_driver.CreateDataSource('')
-    srs = osr.SpatialReference()
-    srs.ImportFromWkt(dem_projection)
-    layer = vector_ds.CreateLayer('polygons', srs=srs)
-
-    field = ogr.FieldDefn("Value", ogr.OFTInteger)
-    layer.CreateField(field)
-
-    gdal.Polygonize(raster_ds.GetRasterBand(1), mask_band, layer, 0, [], callback=None)
-
-    polygons = []
-    values = []
-    for feature in layer:
-        geom = feature.GetGeometryRef()
-        geom_dict = json.loads(geom.ExportToJson())
-        polygons.append(shape(geom_dict))
-        values.append(feature.GetField("Value"))
-
-    flood_gdf = gpd.GeoDataFrame({'Value': values, 'geometry': polygons})
-    flood_gdf.set_crs(dem_projection, inplace=True)
-
-    # filter to only the flooded area
-    flood_gdf = flood_gdf[flood_gdf['Value']>0]
-
-    raster_ds = None
-    vector_ds = None
-
-    return flood_gdf
-
 @njit("float32[:,:](int32, float32, float32)", cache=True)
 def create_weightbox(tw: int, dx: float, dy: float):
     """Inverse squared distance weights for a ``(2*tw + 1)`` square window.
@@ -605,6 +91,12 @@ def create_weightbox(tw: int, dx: float, dy: float):
 
     return (WeightBox).astype(np.float32)
 
+def _at_stream_cells(raster, RR, CC):
+    """A raster's values at the stream cells ``(RR, CC)`` of the padded grid; None for None."""
+    if raster is None or isinstance(raster, StreamCellValues):
+        return None if raster is None else raster.values
+    return raster[RR - 1, CC - 1]
+
 def CreateSimpleKernelFloodMap(config: Config, RR, CC, T_Rast, W_Rast, S_Rast, E,
                          nrows, ncols, TW_m, dx, dy,
                          WeightBox, TW_for_WeightBox_ElipseMask, flood_vdt_cells, V_Rast=None, channel=None):
@@ -618,12 +110,12 @@ def CreateSimpleKernelFloodMap(config: Config, RR, CC, T_Rast, W_Rast, S_Rast, E
     weights, or, given the valley slopes ``V_Rast``, theirs outside the
     ``channel`` (see ``channel_cells``).
     """
-    WSE_array, Total_Weight, Slope_Times_Weight = create_kernel_weighted_spread_map(
+    WSE_array, Total_Weight, Slope_Times_Weight = spread_stream_cells(
         RR,
         CC,
-        T_Rast,
-        W_Rast,
-        S_Rast,
+        _at_stream_cells(T_Rast, RR, CC),
+        _at_stream_cells(W_Rast, RR, CC),
+        _at_stream_cells(S_Rast, RR, CC),
         E,
         nrows,
         ncols,
@@ -635,112 +127,46 @@ def CreateSimpleKernelFloodMap(config: Config, RR, CC, T_Rast, W_Rast, S_Rast, E
         TW_for_WeightBox_ElipseMask,
         config.topwidthplausiblelimit,
         config.set_depth,
-        V_Rast,
+        _at_stream_cells(V_Rast, RR, CC),
         channel,
     )
 
-    # Do not flood cells where WSE is below E and E/WSE are nan values
-    mask = (WSE_array > E) & (E > -9998.0)
-    Flooded_array = mask.astype(np.uint8, copy=False)
+    with_depth = bool(config.outdep or config.outwse or S_Rast is not None)
+    with_slope = S_Rast is not None
+    Flooded_array = _kernel_maps(WSE_array, E, Total_Weight, Slope_Times_Weight, with_depth, with_slope)
+    del Total_Weight
 
     # Also make sure all the Cells that have Stream are counted as flooded.
     if flood_vdt_cells:
-        Flooded_array[RR, CC] = 1
+        Flooded_array[RR - 1, CC - 1] = 1
 
-    Depth_array = None
-    if config.outdep or config.outwse or S_Rast is not None:
-        Depth_array = np.where(mask, WSE_array - E, np.nan).astype(np.float32, copy=False)[1:-1, 1:-1]
+    # The depth and slope are written over the sums they came from
+    return (Flooded_array, WSE_array[1:-1, 1:-1] if with_depth else None,
+            Slope_Times_Weight[1:-1, 1:-1] if with_slope else None)
 
-    Slope_array = None
-    if S_Rast is not None:
-        # Cells no stream cell reached have no weight, hence 0 / 0
-        with np.errstate(divide='ignore', invalid='ignore'):
-            Slope_divided_by_weight = Slope_Times_Weight / Total_Weight
-        Slope_array = np.where(mask, Slope_divided_by_weight, np.nan).astype(np.float32, copy=False)
-        Slope_array = np.where((Slope_array <= 0), 0.0002, Slope_array).astype(np.float32, copy=False)[1:-1, 1:-1]
+@njit(cache=True, parallel=True, error_model='numpy')
+def _kernel_maps(WSE_array, E, Total_Weight, Slope_Times_Weight, with_depth, with_slope):
+    """The kernel-weighted mapper's flood, unpadded, from its padded sums (see ``create_kernel_weighted_spread_map``):
+    a cell floods where the weighted WSE is above a valid DEM.  With ``with_depth``, ``WSE_array`` gets the depth
+    there, and with ``with_slope`` ``Slope_Times_Weight`` the weighted slope (at least 0.0002), each NaN elsewhere.
+    Cells no stream cell reached have no weight, hence 0 / 0."""
+    nrows, ncols = E.shape[0] - 2, E.shape[1] - 2
+    flooded = np.empty((nrows, ncols), dtype=np.uint8)
+    nan = np.float32(np.nan)
+    for r in prange(nrows):
+        for c in range(ncols):
+            water, ground = WSE_array[r + 1, c + 1], E[r + 1, c + 1]
+            wet = water > ground and ground > -9998.0
+            flooded[r, c] = 1 if wet else 0
+            if with_depth:
+                WSE_array[r + 1, c + 1] = water - ground if wet else nan
+            if with_slope:
+                value = Slope_Times_Weight[r + 1, c + 1] / Total_Weight[r + 1, c + 1] if wet else nan
+                Slope_Times_Weight[r + 1, c + 1] = np.float32(0.0002) if value <= 0 else value
 
-    return Flooded_array[1:-1, 1:-1], Depth_array, Slope_array
+    return flooded
 
-def uniform_smoothing(mask: np.ndarray, values: np.ndarray):
-    """Replace ``values``, in place, by their 3x3 mean over the cells where ``mask`` is True.
-
-    Cells with no masked cell in their 3x3 window keep their value.
-    """
-    window_size = 3
-    weighted = np.where(mask, values, 0)
-    value_sum = uniform_filter(weighted, size=window_size, mode='nearest') * window_size
-    count = uniform_filter(mask.astype(np.float32, copy=False), size=window_size, mode='nearest') * window_size
-    np.divide(value_sum, count, out=values, where=count > 0)
-
-def spread_stream_slopes(slopes: np.ndarray, Flood_Ensemble: np.ndarray) -> np.ndarray:
-    """The FLDPLN mapper's slopes for velocity: each flooded cell takes its nearest stream cell's (``slopes``, NaN off
-    the stream; see ``Flood_Flooded_Cells_in_Map``), averaged over the flooded cells of its 3x3 neighbourhood, which a
-    dry cell beside the flood gets too.  NaN elsewhere.
-    """
-    Slope_array = Flood_Flooded_Cells_in_Map(slopes, Flood_Ensemble.astype(np.uint8), eps=0.0002)
-    valid = Slope_array > 0
-    Slope_array[~valid] = np.nan
-    uniform_smoothing(valid, Slope_array)
-    return Slope_array
-
-
-def Create_Topobathy_Dataset(E: np.ndarray, Bathy: np.ndarray, Bathy_Use_Banks: bool) -> np.ndarray:
-    """The DEM ``E`` with ARC's bathymetry ``Bathy`` burned in: ARC's bed
-    elevation wherever it has one (finite), and the DEM elsewhere.  Unless
-    ``Bathy_Use_Banks`` is set, the result is never above the DEM.
-
-    ARC has already decided where its channel goes and filled the small gaps
-    between its cross sections, so its raster is taken as it is: each rating
-    curve's cell keeps the bed its curve was worked out on (the VDT's
-    ``Elev``), and the channel keeps the banks its cross sections were carved
-    with.
-    """
-    burned = np.where(np.isfinite(Bathy), Bathy, E).astype(np.float32, copy=False)
-    if not Bathy_Use_Banks:
-        np.minimum(burned, E, out=burned)
-    return burned
-
-def Calculate_Depth_TopWidth_TWMax_Velocity(config: Config, COMID_Unique_Flow, COMID_Unique, T_Rast, W_Rast, S_Rast, quiet,
-                                            V_Rast=None):
-    """Fill the per-cell rasters for one flow event and summarise each reach.
-
-    Returns ``(COMID_Unique_TW, COMID_Unique_Depth, TopWidthMax, T_Rast,
-    W_Rast, S_Rast)``: the median top width and depth of each reach, and the
-    largest top width, capped at ``TopWidthPlausibleLimit``.  With
-    ``Set_Depth`` every reach gets that depth and the plausible-limit top
-    width instead, and the rasters are left untouched.  ``V_Rast``, when
-    given, gets the VDT's valley slopes.
-    """
-    Set_Depth = config.set_depth
-    TopWidthPlausibleLimit = config.topwidthplausiblelimit
-    if Set_Depth > 0.0:
-        top_width = TopWidthPlausibleLimit if TopWidthPlausibleLimit > 0 else -9999.0
-        COMID_Unique_TW = {comid: top_width for comid in COMID_Unique}
-        COMID_Unique_Depth = {comid: Set_Depth for comid in COMID_Unique}
-        TopWidthMax = TopWidthPlausibleLimit
-    elif config.print_vdt_database:
-        # The VDT database is preferred over the curve file when both are given
-        (COMID_Unique_TW, COMID_Unique_Depth, TopWidthMax, T_Rast, W_Rast, S_Rast) = Calculate_TW_D_V_ForEachCOMID_VDTDatabase(
-            config.print_vdt_database, COMID_Unique_Flow, COMID_Unique, T_Rast, W_Rast, S_Rast, config.tw_multfact,
-            V_Rast)
-    else:
-        (COMID_Unique_TW, COMID_Unique_Depth, TopWidthMax, T_Rast, W_Rast, S_Rast) = Calculate_TW_D_V_ForEachCOMID_CurveFile(
-            config.print_curve_file, COMID_Unique_Flow, COMID_Unique, T_Rast, W_Rast, S_Rast, config.tw_multfact)
-
-    LOG.info('Maximum Top Width = ' + str(TopWidthMax))
-
-    if not quiet:
-        for comid in COMID_Unique:
-            if COMID_Unique_TW[comid]>TopWidthPlausibleLimit:
-                LOG.warning(f"Reach {comid} (flow {COMID_Unique_Flow.get(comid)}, depth {COMID_Unique_Depth[comid]}) has a "
-                            f"median top width of {COMID_Unique_TW[comid]}, above TopWidthPlausibleLimit; it is capped there.")
-
-    if TopWidthPlausibleLimit < TopWidthMax:
-        TopWidthMax = TopWidthPlausibleLimit
-
-    return COMID_Unique_TW, COMID_Unique_Depth, TopWidthMax, T_Rast, W_Rast, S_Rast
-
-def make_fldpln_flood_map(
+def _make_fldpln_flood_map(
         config: Config,
         COMID_Unique_Flow,
         S_Rast,
@@ -768,9 +194,9 @@ def make_fldpln_flood_map(
     if S_Rast is not None:
         S_Rast[vdt_df['Row'].to_numpy(), vdt_df['Col'].to_numpy()] = vdt_df['Slope'].to_numpy()
     if V_Rast is not None:
-        V_Rast[vdt_df['Row'].to_numpy(), vdt_df['Col'].to_numpy()] = vdt_df[VALLEY_SLOPE].to_numpy()
+        V_Rast[vdt_df['Row'].to_numpy(), vdt_df['Col'].to_numpy()] = vdt_df['Valley_Slope'].to_numpy()
 
-    depth = _make_fldpln_flood_map(
+    depth = make_fldpln_flood_map(
         vdt_df,
         flow_dir,
         fldpln_library,
@@ -779,11 +205,21 @@ def make_fldpln_flood_map(
         min_depth=config.fldpln_min_flood_depth,
     )
 
-    Flood_array = (depth > 0).astype(np.uint8)
+    Flood_array = _wet(depth)
     # Depths are only used to write depth, WSE or velocity rasters
     Depth_array = depth if config.outdep or config.outwse or config.outvel else None
 
     return Flood_array, Depth_array, None  # Slopes are spread after all events are mapped
+
+@njit(cache=True, parallel=True)
+def _wet(depth: np.ndarray) -> np.ndarray:
+    """1 where ``depth`` is above 0, else 0, as uint8."""
+    wet = np.empty(depth.shape, dtype=np.uint8)
+    for r in prange(depth.shape[0]):
+        for c in range(depth.shape[1]):
+            wet[r, c] = 1 if depth[r, c] > 0 else 0
+
+    return wet
 
 def Curve2Flood(config: Config, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
                 COMID_Unique_Flow, WeightBox,
@@ -805,7 +241,7 @@ def Curve2Flood(config: Config, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique
     is theirs (see ``channel_cells``).
     """
     if config.mapper == FLDPLN:
-        return make_fldpln_flood_map(
+        return _make_fldpln_flood_map(
             config,
             COMID_Unique_Flow,
             S_Rast,
@@ -858,193 +294,6 @@ def Curve2Flood(config: Config, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique
 
     return Flood_array, Depth_array, Slope_array
 
-
-def Set_Stream_Locations(nrows: int, ncols: int, infilename: str):
-    """Stream raster built from the ``Row``, ``Col`` and ``COMID`` columns of a VDT or curve file.
-
-    Cells without a stream are -9999.
-    """
-    S = np.full((nrows, ncols), -9999, dtype=np.int32)
-    if is_parquet(infilename):
-        df = pd.read_parquet(infilename, columns=['Row', 'Col', 'COMID'])
-    else:
-        df = pd.read_csv(infilename, usecols=['Row', 'Col', 'COMID'])
-
-    S[df['Row'].values, df['Col'].values] = df['COMID'].values
-
-    return S
-
-def Flood_WaterLC_and_STRM_Cells_in_Flood_Map(Flood_Ensemble, S, LC_array, watervalue):
-    """Mark stream cells and water land-cover cells as flooded (100) in ``Flood_Ensemble``."""
-    # One boolean mask: int64 copies of three rasters made this the memory peak of a whole run
-    F = (S > 0) | (LC_array == watervalue)
-    Flood_Ensemble[F] = 100
-
-    return Flood_Ensemble
-
-def Flood_Bathy_Mask_in_Flood_Map(Flood_Ensemble, mask):
-    """Mark the water mask's cells (above 0) as flooded (100) in ``Flood_Ensemble``."""
-    Flood_Ensemble[mask > 0] = 100
-
-    return Flood_Ensemble
-
-def _nearest_sources(source_mask: np.ndarray, target_mask: np.ndarray, k: int = 8,
-                     chunk: int = 1 << 16) -> tuple[np.ndarray, np.ndarray]:
-    """The row and column of the nearest source cell to each target cell, the targets in ``np.nonzero`` order.
-
-    Of two sources equally near, the one in the lower column wins, then the
-    lower row: the way ``distance_transform_edt`` breaks ties.  Its feature
-    transform sweeps the whole raster, so while the sources and targets are
-    few (a flood covers a few percent of a tile) a KD-tree over the sources
-    finds the same cells several times faster; it queries each target's ``k``
-    nearest sources, a ``chunk`` of targets at a time.
-    """
-    tr, tc = np.nonzero(target_mask)
-    sr, sc = np.nonzero(source_mask)
-    if 10 * (sr.size + tr.size) > source_mask.size:
-        # EDT returns indices of the nearest ZERO in the input,
-        # so pass the inverse to point toward TRUE source cells.
-        ny, nx = distance_transform_edt(~source_mask, return_distances=False, return_indices=True)
-        return ny[tr, tc], nx[tr, tc]
-
-    tree = cKDTree(np.column_stack((sr, sc)))
-    k = min(k, sr.size)
-    nearest = np.empty(tr.size, dtype=np.int64)
-    for start in range(0, tr.size, chunk):
-        rows, cols = tr[start:start + chunk], tc[start:start + chunk]
-        _, index = tree.query(np.column_stack((rows, cols)), k=k)
-        index = index.reshape(rows.size, k)
-        # Exact squared distances, to find the ties
-        d2 = (sr[index] - rows[:, None]) ** 2 + (sc[index] - cols[:, None]) ** 2
-        least = d2.min(axis=1)
-        tied = d2 == least[:, None]
-        order = np.where(tied, (sc[index] << 32) + sr[index], np.iinfo(np.int64).max)
-        nearest[start:start + rows.size] = index[np.arange(rows.size), order.argmin(axis=1)]
-        # All k equally near: more sources may be as near, beyond the k
-        if k < sr.size:
-            for i in np.flatnonzero(tied.all(axis=1)):
-                candidates = np.asarray(tree.query_ball_point((rows[i], cols[i]), np.sqrt(least[i]) + 1e-6))
-                candidates = candidates[(sr[candidates] - rows[i]) ** 2 + (sc[candidates] - cols[i]) ** 2 == least[i]]
-                nearest[start + i] = candidates[np.lexsort((sr[candidates], sc[candidates]))[0]]
-    return sr[nearest], sc[nearest]
-
-def Flood_Flooded_Cells_in_Map(Array_Ensemble: np.ndarray, Flood_Ensemble: np.ndarray, eps=0.01):
-    """Match a value raster (depth, WSE, velocity, slope) to the flood extent.
-
-    Flooded cells that are NaN take the value of the nearest flooded cell that
-    has one (see ``_nearest_sources``); flooded cells with no such cell get
-    ``eps``.  Cells outside the flood become NaN.  Returns a new float32 array.
-    """
-    flood_mask = Flood_Ensemble > 0
-    nan_mask = np.isnan(Array_Ensemble)
-    source_mask =  (flood_mask) & (~nan_mask)
-
-    # targets are flooded cells that are currently NaN
-    target_mask = (flood_mask) & (nan_mask)
-
-    filled = Array_Ensemble.astype(np.float32, copy=True)
-
-    if np.any(source_mask) and np.any(target_mask):
-        filled[target_mask] = Array_Ensemble[_nearest_sources(source_mask, target_mask)]
-
-    # A flooded blob with no source anywhere is still NaN
-    still_nan = (flood_mask) & np.isnan(filled)
-    if np.any(still_nan):
-        filled[still_nan] = eps
-
-    filled[Flood_Ensemble <= 0] = np.nan
-
-    return filled
-
-def remove_cells_not_connected(flood_array: np.ndarray, streams_array: np.ndarray) -> np.ndarray:
-    """Remove flooded patches that do not touch a stream.
-
-    A patch is a group of cells with ``flood_array > 0`` connected through any
-    of their 8 neighbours.  Patches containing a cell with ``streams_array > 0``
-    are kept; the rest are set to 0.
-    """
-    structure = generate_binary_structure(2, 2)
-
-    labeled_array, num_features = label(flood_array, structure)
-    touching_labels = np.unique(labeled_array[(streams_array > 0) & (labeled_array > 0)])
-    mask = np.isin(labeled_array, touching_labels)
-
-    return flood_array * mask
-
-def accumulate_positive_max(maximum: np.ndarray | None, array: np.ndarray | None) -> np.ndarray | None:
-    """Raise ``maximum`` (float32, -inf where nothing is positive yet) to ``array``'s positive values, in place.
-
-    Starts a new maximum when ``maximum`` is None; an ``array`` of None
-    changes nothing.  Each flow event's raster is folded in as it is mapped,
-    so the events' rasters are never all held at once.
-    """
-    if array is None:
-        return maximum
-    array = np.asarray(array, dtype=np.float32)
-    positive = np.where(array > 0, array, np.float32(-np.inf))
-    if maximum is None:
-        return positive
-    return np.maximum(maximum, positive, out=maximum)
-
-def finish_positive_max(maximum: np.ndarray) -> np.ndarray:
-    """``accumulate_positive_max``'s result with NaN, in place, where no value was positive."""
-    maximum[maximum == -np.inf] = np.nan
-    return maximum
-
-def create_positive_max_array(array_list: list[np.ndarray]) -> np.ndarray:
-    """Cell-wise maximum of the positive values in ``array_list``; NaN where there are none."""
-    maximum = None
-    for array in array_list:
-        maximum = accumulate_positive_max(maximum, array)
-    return finish_positive_max(maximum)
-
-def create_depth(max_depth: np.ndarray, Flood_Ensemble: np.ndarray):
-    """The maximum depth over the flow events (``create_positive_max_array``), matched to the flood extent (see
-    ``Flood_Flooded_Cells_in_Map``)."""
-    return Flood_Flooded_Cells_in_Map(max_depth, Flood_Ensemble, eps=0.01)
-
-
-def water_surface(depth: np.ndarray, dem: np.ndarray, fill_below_dem: np.ndarray | None = None) -> np.ndarray:
-    """The water surface elevation where the depth is above 0 and the DEM has a value, NaN elsewhere.
-
-    The depth is measured from the DEM, except with the FLDPLN mapper, which measures it from the lower of the DEM
-    and the filled DEM: where bathymetry raises the DEM above the filled DEM, the water was routed across the filled
-    surface and its depth taken from there (see ``_make_fldpln_flood_map``), and the water surface must be too, or it
-    would stand above its neighbours by the raise.  ``fill_below_dem`` is how far the filled DEM sits below the DEM
-    there (0, or negative where raised; NaN where the library doesn't say), as the mapper writes it from the
-    library's fill.  Only the flooded cells are worked out.
-    """
-    wse = np.full(depth.shape, np.nan, dtype=np.float32)
-    flooded = np.nonzero((depth > 0) & (dem > -9998.0))
-    ground = dem[flooded]
-    if fill_below_dem is not None:
-        below = fill_below_dem[flooded]
-        ground = np.where(np.isnan(below), ground, ground + below)
-    wse[flooded] = depth[flooded] + ground
-    return wse
-
-
-def create_bathymetry(config: Config, E: np.ndarray, nrows: int, ncols: int, dem_geotransform: tuple, dem_projection: str,
-                      bathymetry_creation_options: list[str] = None):
-    """Write the topobathymetric DEM (``FSOutBATHY``): the DEM with ARC's
-    bathymetry (``BATHY_Out_File``) burned in (see ``Create_Topobathy_Dataset``).
-    ``E`` is the DEM padded by one cell.
-    """
-    LOG.info('Working on Bathymetry')
-    ds: gdal.Dataset = gdal.Open(config.bathy_out_file)
-    band = ds.GetRasterBand(1)
-    bathy = band.ReadAsArray().astype(np.float32, copy=False)
-    nodata = band.GetNoDataValue()
-    ds = None
-    if bathy.shape != (nrows, ncols):
-        raise ValueError(f"The bathymetry raster {config.bathy_out_file} is {bathy.shape[0]} by {bathy.shape[1]} "
-                         f"cells, and the DEM {nrows} by {ncols}.")
-    if nodata is not None:
-        bathy[bathy == nodata] = np.nan
-
-    burned = Create_Topobathy_Dataset(E[1:-1, 1:-1], bathy, config.bathy_use_banks)
-    Write_Output_Raster(config.fsoutbathy, burned, ncols, nrows, dem_geotransform, dem_projection, "GTiff", gdal.GDT_Float32, config.compression, bathymetry_creation_options)
-
 def _check_dem_units(dem_projection: str):
     """Raise a ValueError unless the DEM's coordinate system is in metres or degrees."""
     try:
@@ -1061,12 +310,137 @@ def _check_dem_units(dem_projection: str):
     if invalid_units:
         raise ValueError(f'The DEM coordinate system must be in metres or degrees, not {", ".join(invalid_units)}.')
 
-def _check_shape(array: np.ndarray, shape: tuple, name: str):
-    """Raise a ValueError if a raster's shape differs from the DEM's."""
-    if array.shape != shape:
-        raise ValueError(f"{name} dimensions ({array.shape[1]}x{array.shape[0]}) do not match the DEM ({shape[1]}x{shape[0]}).")
+def Set_Stream_Locations(nrows: int, ncols: int, infilename: str):
+    """Stream raster built from the ``Row``, ``Col`` and ``COMID`` columns of a VDT or curve file.
 
-def main_flood_ouputs(
+    Cells without a stream are -9999.
+    """
+    S = np.full((nrows, ncols), -9999, dtype=np.int32)
+    if is_parquet(infilename):
+        df = pd.read_parquet(infilename, columns=['Row', 'Col', 'COMID'])
+    else:
+        df = pd.read_csv(infilename, usecols=['Row', 'Col', 'COMID'])
+
+    S[df['Row'].values, df['Col'].values] = df['COMID'].values
+
+    return S
+
+@njit(cache=True, parallel=True)
+def _positive_cells(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``np.nonzero(values > 0)``, row by row in parallel."""
+    nrows, ncols = values.shape
+    counts = np.zeros(nrows + 1, dtype=np.int64)
+    for r in prange(nrows):
+        n = 0
+        for c in range(ncols):
+            if values[r, c] > 0:
+                n += 1
+        counts[r + 1] = n
+
+    starts = np.cumsum(counts)
+    rows = np.empty(starts[-1], dtype=np.int64)
+    cols = np.empty(starts[-1], dtype=np.int64)
+    for r in prange(nrows):
+        k = starts[r]
+        for c in range(ncols):
+            if values[r, c] > 0:
+                rows[k] = r
+                cols[k] = c
+                k += 1
+
+    return rows, cols
+
+def _count_flow_events(FlowFileName: str) -> int:
+    """Number of flow events (columns after the COMID column) in a flow file."""
+    if is_parquet(FlowFileName):
+        return pd.read_parquet(FlowFileName).shape[1] - 1
+    return pd.read_csv(FlowFileName, nrows=0).shape[1] - 1
+
+def FindFlowRateForEachCOMID_Ensemble(FlowFileName: str, flow_event_num: int) -> dict:
+    """Return ``{COMID: flow}`` for one flow event.
+
+    The flow file (CSV or Parquet) has the COMID in its first column and one
+    column of flows per event.  Missing flows are treated as zero.
+    """
+    if is_parquet(FlowFileName):
+        flow_df = pd.read_parquet(FlowFileName).iloc[:, [0, flow_event_num + 1]]
+    else:
+        flow_df = pd.read_csv(FlowFileName, usecols=[0, flow_event_num + 1])
+
+    if flow_df.iloc[:, 1].isna().any():
+        LOG.warning(f"Warning: NaN values found in flow data for event {flow_event_num}. These will be treated as zero flow.")
+        flow_df.iloc[:, 1] = flow_df.iloc[:, 1].fillna(0)
+
+    comid_q_dict = flow_df.set_index(flow_df.columns[0])[flow_df.columns[1]].to_dict()
+
+    return comid_q_dict
+
+def _scan_table(path: str) -> pl.LazyFrame:
+    """A CSV or Parquet table, lazily."""
+    return pl.scan_parquet(path) if is_parquet(path) else pl.scan_csv(path)
+
+def has_valley_slopes(VDTDatabaseFileName: str | None) -> bool:
+    """Whether a VDT database gives its stream cells' valley slopes (``Valley_Slope``, ARC's with Valley_Sections)."""
+    return bool(VDTDatabaseFileName) and "Valley_Slope" in _scan_table(VDTDatabaseFileName).collect_schema().names()
+
+def channel_cells(VDTDatabaseFileName: str, nrows: int, ncols: int, dx: float, dy: float) -> np.ndarray:
+    """The channels: the cells within half their reach's baseflow top width of a stream cell of the VDT database, and
+    the stream cells themselves.
+
+    The water in a channel runs along it, at the stream's slope, but over the
+    floodplain of a meandering river it runs straight down the valley, at the
+    valley's slope: the stream's times its sinuosity.  So outside the channels
+    the velocity takes the valley's slope, where the VDT gives it.  On
+    synthetic meanders, against a 2D model (LISFLOOD-FP's local inertial
+    scheme), the velocities over the floodplain were 0.71-0.93 of the 2D
+    model's with the stream's slope, and 0.88-1.02 with the valley's.
+
+    A stream cell's baseflow top width is the VDT's at the first flow at or
+    above its ``QBaseflow``, as in ``Find_TopWidth_at_Baseflow_when_using_VDT``,
+    and a reach's is the median of its cells': on tight synthetic meanders, a
+    few cross sections' rating curves top their banks below that flow, and
+    their own top widths, up to 700 m, made channels six times the channel's
+    area of the floodplain.
+    """
+    vdt = _scan_table(VDTDatabaseFileName).select(
+        'COMID', 'Row', 'Col', 'QBaseflow', cs.starts_with('q_'), cs.starts_with('t_')).collect()
+    flows = vdt.select(cs.starts_with('q_')).to_numpy().astype(np.float32, copy=False)
+    top_widths = vdt.select(cs.starts_with('t_')).to_numpy().astype(np.float32, copy=False)
+    baseflow = vdt['QBaseflow'].to_numpy().astype(np.float32, copy=False)
+    first = np.minimum((flows < baseflow[:, None]).sum(axis=1), flows.shape[1] - 1)
+    cell_width = top_widths[np.arange(len(vdt)), first].astype(np.float64)
+    half_width = pl.DataFrame({'COMID': vdt['COMID'], 'width': cell_width}).select(
+        pl.col('width').median().over('COMID') / 2.0).to_series().to_numpy()
+    channel = np.zeros((nrows, ncols), dtype=np.bool_)
+    _paint_channel(vdt['Row'].to_numpy().astype(np.int64), vdt['Col'].to_numpy().astype(np.int64), half_width,
+                   float(dx), float(dy), channel)
+    return channel
+
+@njit(cache=True)
+def _paint_channel(rows, cols, half_widths, dx, dy, channel):
+    """Mark ``channel`` within ``half_widths[i]`` metres of each cell ``(rows[i], cols[i])``, and at the cell itself."""
+    nrows, ncols = channel.shape
+    for i in range(rows.size):
+        r, c, h = rows[i], cols[i], half_widths[i]
+        channel[r, c] = True
+        if not h > 0.0:
+            continue
+
+        reach_rows, reach_cols = int(h // dy), int(h // dx)
+        for a in range(max(r - reach_rows, 0), min(r + reach_rows + 1, nrows)):
+            for b in range(max(c - reach_cols, 0), min(c + reach_cols + 1, ncols)):
+                if ((a - r) * dy) ** 2 + ((b - c) * dx) ** 2 <= h * h:
+                    channel[a, b] = True
+
+def _vdt_cells(VDTDatabaseFileName: str, ncols: int) -> np.ndarray:
+    """The flat indices, ``row * ncols + col``, of a VDT database's cells, ascending."""
+    if is_parquet(VDTDatabaseFileName):
+        df = pd.read_parquet(VDTDatabaseFileName, columns=['Row', 'Col'])
+    else:
+        df = pd.read_csv(VDTDatabaseFileName, usecols=['Row', 'Col'])
+    return np.unique(df['Row'].to_numpy(np.int64) * ncols + df['Col'].to_numpy(np.int64))
+
+def spread_flood(
         config: Config,
         E: np.ndarray | None,
         nrows: int,
@@ -1076,20 +450,20 @@ def main_flood_ouputs(
         dx: float,
         dy: float,
         dem_projection: str,
-        dem_geotransform: tuple,
         quiet: bool = False,
         flood_vdt_cells: bool = False):
     """Map every flow event and write the flood, depth, WSE and velocity rasters.
 
     Returns the flood raster: 0 is dry, and 1-100 the percentage of flow events
     that flooded the cell (100 with a single event).  ``E`` is the DEM padded
-    by one cell; the FLDPLN mapper needs it only for ``OutWSE``.
+    by one cell; the FLDPLN mapper doesn't need it, and reads the DEM for
+    ``OutWSE`` a strip at a time when it is None.
     """
     set_depth = config.uses_set_depth
     _check_dem_units(dem_projection)
 
     if config.mapper == FLDPLN:
-        FlowDir = gdal.Open(config.flow_direction_file).ReadAsArray().astype(np.uint8, copy=False)
+        FlowDir = read_array(config.flow_direction_file, np.uint8)
         _check_shape(FlowDir, (nrows, ncols), "Flow direction raster")
 
         if is_parquet(config.stream_info_file):
@@ -1121,16 +495,22 @@ def main_flood_ouputs(
     else:
         S = Set_Stream_Locations(nrows, ncols, config.print_curve_file)
 
-    # Stream ids padded by one cell, and where the stream cells are
-    B = np.zeros((nrows+2,ncols+2), dtype=np.int32)
-    B[1:-1, 1:-1] = S
+    # Where the stream cells are, as indices of the rasters padded by one cell, and their ids as int32.  After this
+    # only whether a cell is a stream cell is needed (S > 0), but for the multi-point mapper's padded stream ids.
+    ids = S if S.dtype == np.int32 else S.astype(np.int32)
+    rows, cols = _positive_cells(ids)
+    RR, CC = rows + 1, cols + 1
 
-    (RR,CC) = np.where(B > 0)
-
-    COMID_Unique = np.unique(B[RR, CC]) # Always sorted
+    COMID_Unique = np.unique(ids[rows, cols]) # Always sorted
     COMID_Unique = COMID_Unique.astype(int)
-    if config.mapper == FLDPLN:
-        B = None  # Only the curve-based mappers read it
+    B = None
+    if config.mapper == MULTI_POINT:
+        # It reads them only at the stream cells (see StreamCellValues)
+        B = StreamCellValues(RR * (ncols + 2) + CC, ncols + 2, 0, dtype=np.int32)
+        B.values[:] = ids[rows, cols]
+
+    del ids, rows, cols
+    S = S > 0
 
     if set_depth:
         # Every stream cell gets the same depth, so there is a single event
@@ -1139,23 +519,36 @@ def main_flood_ouputs(
     else:
         LOG.info('Opening and Reading ' + config.comid_flow_file)
         num_flows = _count_flow_events(config.comid_flow_file)
+
     LOG.info('Evaluating ' + str(num_flows) + ' Flow Events')
 
-    # Create initial rasters once, outside the loop
+    # Create initial rasters once, outside the loop.  The curve-based mappers read them only at the stream cells,
+    # and the FLDPLN mapper writes its slopes only at the VDT's cells, so they keep only those cells' values.
+    cells = None
+    if config.mapper in (KERNEL_WEIGHTED, MULTI_POINT):
+        cells = (RR - 1) * ncols + (CC - 1)
+    elif config.mapper == FLDPLN and config.outvel:
+        cells = _vdt_cells(config.print_vdt_database, ncols)
+
+    def raster(value):
+        if cells is not None:
+            return StreamCellValues(cells, ncols, value)
+        return np.full((nrows, ncols), value, np.float32)
+
     if config.mapper == FLDPLN:
         T_Rast = None
         W_Rast = None
     else:
-        T_Rast = np.empty((nrows,ncols), np.float32)
-        W_Rast = np.empty((nrows,ncols), np.float32)
+        T_Rast = raster(-1.0)
+        W_Rast = raster(np.nan)
 
     # Stream-cell slopes, only needed for velocity
-    S_Rast = np.full((nrows,ncols), np.nan, np.float32) if config.outvel else None
+    S_Rast = raster(np.nan) if config.outvel else None
     # With the VDT's valley slopes (ARC's Valley_Sections), the velocity outside the channels takes the valley's slope
     # rather than the stream's
     V_Rast = channel = None
     if S_Rast is not None and config.mapper != MULTI_POINT and has_valley_slopes(config.print_vdt_database):
-        V_Rast = np.full((nrows, ncols), np.nan, np.float32)
+        V_Rast = raster(np.nan)
         channel = channel_cells(config.print_vdt_database, nrows, ncols, dx, dy)
 
     Flood_Ensemble = np.zeros((nrows, ncols), dtype=np.float16 if num_flows > 1 else np.uint8)  # use uint8 if only one flow, otherwise float16 for percentage calculation
@@ -1180,128 +573,17 @@ def main_flood_ouputs(
             )
         Flood_array_this_flow = remove_cells_not_connected(Flood_array_this_flow, S)
         Flood_Ensemble += Flood_array_this_flow
-        Depth_Max = accumulate_positive_max(Depth_Max, Depth_array)
-        Slope_Max = accumulate_positive_max(Slope_Max, Slope_array)
+        # Neither is read again
+        Depth_Max = accumulate_positive_max(Depth_Max, Depth_array, in_place=True)
+        Slope_Max = accumulate_positive_max(Slope_Max, Slope_array, in_place=True)
         del Flood_array_this_flow, Depth_array, Slope_array
 
     # clear some memory by deleting large arrays that are no longer needed
     del T_Rast
     del W_Rast
+    del FlowDir
 
-    # Turn the count of flooding events into a percentage
-    Flood_Ensemble *= 100
-    if num_flows > 1:
-        Flood_Ensemble /= num_flows
-        Flood_Ensemble = Flood_Ensemble.astype(np.uint8)
-
-    OutVEL = config.outvel
-    Flood_WaterLC_and_STRM_Cells = config.flood_waterlc_and_strm_cells
-    OutDEP = config.outdep
-    OutWSE = config.outwse
-    Flood_File = config.outfld
-
-    if Flood_WaterLC_and_STRM_Cells or OutVEL:
-        LC_array, _, _ = Read_Raster_GDAL(config.lu_raster_sameres)
-        _check_shape(LC_array, (nrows, ncols), "Land cover raster")
-
-    if Flood_WaterLC_and_STRM_Cells:
-        LOG.info('Flooding the Water-Related Land Cover and STRM cells')
-        Flood_Ensemble = Flood_WaterLC_and_STRM_Cells_in_Flood_Map(Flood_Ensemble, S, LC_array, config.land_watervalue)
-
-    if config.flood_bathy_mask:
-        LOG.info('Flooding the bathymetry water mask cells')
-        mask, _, _ = Read_Raster_GDAL(config.bathywatermask)
-        _check_shape(mask, (nrows, ncols), "Bathymetry water mask")
-        Flood_Ensemble = Flood_Bathy_Mask_in_Flood_Map(Flood_Ensemble, mask)
-        del mask
-
-    # Remove crop circles and other disconnected cells
-    Flood_Ensemble = remove_cells_not_connected(Flood_Ensemble, S)
-
-    if Flood_File:
-        LOG.info('Creating Ensemble Flood Map...' + str(Flood_File))
-        out_ds: gdal.Dataset = gdal.GetDriverByName("GTiff").Create(Flood_File, ncols, nrows, 1, gdal.GDT_Byte, options=[f"COMPRESS={config.compression}", "PREDICTOR=2", _WRITE_THREADS])
-        out_ds.SetGeoTransform(dem_geotransform)
-        out_ds.SetProjection(dem_projection)
-        out_ds.WriteArray(Flood_Ensemble)
-        out_ds.FlushCache()
-        out_ds = None  # Close the dataset to ensure it's written to disk
-
-
-    if OutDEP or OutWSE or OutVEL:
-        Depth_Array = create_depth(finish_positive_max(Depth_Max), Flood_Ensemble)
-        del Depth_Max
-
-        if OutDEP:
-            out_band_data = np.where(np.isnan(Depth_Array), -9999.0, Depth_Array).astype(np.float32, copy=False)
-
-            ds: gdal.Dataset = gdal.GetDriverByName("GTiff").Create(
-                OutDEP, ncols, nrows, 1, gdal.GDT_Float32,
-                options=[f"COMPRESS={config.compression}", "PREDICTOR=2", "TILED=YES", _WRITE_THREADS]
-            )
-            if ds is None:
-                raise RuntimeError(f"Failed to create output raster: {OutDEP}")
-
-            ds.SetGeoTransform(dem_geotransform)
-            ds.SetProjection(dem_projection)
-
-            band: gdal.Band = ds.GetRasterBand(1)
-            band.WriteArray(out_band_data)
-            band.SetNoDataValue(-9999.0)
-            band.FlushCache()
-            ds.FlushCache()
-
-            band = None
-            ds = None
-            del out_band_data
-
-    if OutWSE:
-        WSE_Array = water_surface(Depth_Array, E[1:-1, 1:-1], fill_below_dem)
-
-        driver = gdal.GetDriverByName("GTiff")
-        ds: gdal.Dataset = driver.Create(
-            OutWSE, ncols, nrows, 1, gdal.GDT_Float32,
-            options=[f"COMPRESS={config.compression}", "PREDICTOR=2", "TILED=YES", _WRITE_THREADS]
-        )
-        if ds is None:
-            raise RuntimeError(f"Failed to create output raster: {OutWSE}")
-
-        ds.SetGeoTransform(dem_geotransform)
-        ds.SetProjection(dem_projection)
-
-        band = ds.GetRasterBand(1)
-        band.WriteArray(WSE_Array)
-        band.SetNoDataValue(np.nan)
-        band.FlushCache()
-        ds.FlushCache()
-
-        band = None
-        ds = None
-        del WSE_Array
-
-    # The FLDPLN mapper gives no slopes: each flooded cell takes its nearest
-    # stream cell's slope, averaged over its 3x3 neighbourhood, and outside
-    # the channels its valley slope, if there are valley slopes
-    if config.mapper == FLDPLN and S_Rast is not None:
-        Slope_array = spread_stream_slopes(S_Rast, Flood_Ensemble)
-        if V_Rast is not None:
-            Slope_array = np.where(channel, Slope_array, spread_stream_slopes(V_Rast, Flood_Ensemble))
-        Slope_Max = accumulate_positive_max(None, Slope_array)
-        del Slope_array
-    del V_Rast, channel
-
-    if OutVEL:
-        create_velocity(config, OutVEL, Depth_Array, LC_array, finish_positive_max(Slope_Max), dem_geotransform,
-                        dem_projection, ncols, nrows, Flood_Ensemble)
-
-    if config.make_output_gpkg and Flood_File:
-        flood_gdf = Write_Output_Raster_As_GeoDataFrame(Flood_Ensemble, ncols, nrows, dem_geotransform, dem_projection, gdal.GDT_Byte)
-
-        # The driver is inferred from the file extension
-        shp_output_filename = f"{Flood_File[:-4]}.gpkg"
-        flood_gdf.to_file(shp_output_filename)
-
-    return Flood_Ensemble
+    return Flood_Ensemble, S, fill_below_dem, channel, S_Rast, V_Rast, Depth_Max, Slope_Max
 
 def Curve2Flood_MainFunction(input_file: str | os.PathLike | Config = None,
                              args: dict = None,
@@ -1337,7 +619,7 @@ def Curve2Flood_MainFunction(input_file: str | os.PathLike | Config = None,
         raise ValueError("Provide an input file, a dict of settings or a Config.")
 
     LOG.info('Opening ' + config.dem_file)
-    ds: gdal.Dataset = gdal.Open(config.dem_file)
+    ds: gdal.Dataset = open_raster(config.dem_file)
     dem_geotransform = ds.GetGeoTransform()
     dem_projection = ds.GetProjection()
     nrows = ds.RasterYSize
@@ -1345,13 +627,14 @@ def Curve2Flood_MainFunction(input_file: str | os.PathLike | Config = None,
     yll = dem_geotransform[3] - nrows * abs(dem_geotransform[5])
     yur = dem_geotransform[3]
 
-    # The FLDPLN mapper needs the DEM's values only for a WSE raster or the bathymetry
+    # Only the curve-based mappers need the whole DEM at once: the FLDPLN mapper's WSE raster and the bathymetry
+    # read it a strip of rows at a time
     bathymetry = config.makes_bathymetry
     E = None
-    if config.mapper != FLDPLN or config.outwse or bathymetry:
+    if config.needs_flood_map and config.mapper != FLDPLN:
         # The DEM padded by one cell of -9999, so neighbour lookups need no bounds checks
         E = np.full((nrows+2, ncols+2), -9999.0, dtype=np.float32)
-        E[1:-1, 1:-1] = ds.ReadAsArray()
+        read_into(ds, E[1:-1, 1:-1])
     ds = None
 
     # Cell size from the geotransform; the vector magnitudes also handle rotated grids
@@ -1369,8 +652,9 @@ def Curve2Flood_MainFunction(input_file: str | os.PathLike | Config = None,
         WeightBox = create_weightbox(TW_for_WeightBox_ElipseMask, dx, dy)
 
     if config.needs_flood_map:
-        main_flood_ouputs(config, E, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, dx, dy,
-                          dem_projection, dem_geotransform, quiet=quiet, flood_vdt_cells=flood_vdt_cells)
+        flood_ensemble, S, fill_below_dem, channel, S_Rast, V_Rast, Depth_Max, Slope_Max = spread_flood(config, E, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, dx, dy,
+                               dem_projection, quiet=quiet, flood_vdt_cells=flood_vdt_cells)
+        main_flood_ouputs(flood_ensemble, fill_below_dem, S, S_Rast, V_Rast, Depth_Max, Slope_Max, channel, config, E, nrows, ncols, dem_projection, dem_geotransform)
 
     if bathymetry:
         create_bathymetry(config, E, nrows, ncols, dem_geotransform, dem_projection, bathymetry_creation_options)

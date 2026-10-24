@@ -53,6 +53,18 @@ print(config.mapper, config.tw_multfact)
 Curve2Flood_MainFunction(config)
 ```
 
+## Threads
+
+Curve2Flood uses every CPU by default, in two ways:
+
+- GDAL compresses and decompresses the rasters Curve2Flood reads and writes with `GDAL_NUM_THREADS` threads when that
+  environment variable (or GDAL configuration option) is set, and with every CPU otherwise.
+- The mappers' heavy loops run in parallel with numba, on `NUMBA_NUM_THREADS` threads (every CPU by default; numba
+  reads it when it is first imported). The multi-point mapper's nearest-point search uses as many.
+
+Set both lower when several Curve2Flood runs share a machine, as when nencarta maps several sites at once: for
+example `GDAL_NUM_THREADS=4` and `NUMBA_NUM_THREADS=4`. The outputs are the same whatever the number of threads.
+
 ## Next
 
 - [Input File](input_file.md): every setting and what it does.

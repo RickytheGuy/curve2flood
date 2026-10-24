@@ -15,6 +15,17 @@ For each flow event, Curve2Flood:
 
 It then combines the events and writes the outputs the input file asks for.
 
+```mermaid
+flowchart TB
+    inputs[/"DEM, ARC's rating curves and the flows"/] --> wse
+    subgraph event ["For each flow event"]
+        wse["Each stream cell's water surface at its reach's flow"] --> spread["Spread it over the land with one of three mappers"]
+        spread --> keep["Keep the flooded patches that touch a stream"]
+    end
+    keep --> combine["Combine the events"]
+    combine --> outputs[/"Flood extent, depth, water surface and velocity rasters"/]
+```
+
 ## Authors
 
 Mike Follum leads the project. Other contributors include Joseph Gutenson and L. Ricardo Rosas.

@@ -25,6 +25,8 @@ $$
 and the cell floods where $\text{WSE}(x)$ is above its elevation. So near a stream cell its own water surface
 dominates, and between two stream cells the surface blends from one to the other.
 
+![Left: a cross section of a valley; one stream cell's water surface floods the cells below it within one top width each way, but not a dip beyond. Right: two stream cells' water surfaces, 103 m and 101 m, blend between them.](figures/kernel_weighted.svg)
+
 Details:
 
 - A top width is the rating curve's times `TW_MultFact`, capped at the widest reach's median top width, and at

@@ -44,3 +44,17 @@ mkdocs serve
 ```
 
 Read the Docs builds it from `docs/` (see `.readthedocs.yaml`).
+
+The diagrams are [Mermaid](https://mermaid.js.org/) flowcharts, written in the pages as `mermaid` code blocks and
+drawn by the browser. The figures in `docs/figures` are small made-up cross sections drawn by
+`docs/figures/make_figures.py`; run it again after changing it:
+
+```bash
+python docs/figures/make_figures.py
+```
+
+## Benchmarks
+
+`benchmarks/fldpln_matlab/run_benchmark.py` times the FLDPLN library build, and measures its memory, against the
+University of Kansas's MATLAB model, and writes the table on the [FLDPLN page](fldpln.md#speed-and-memory). The
+script's docstring says how it measures.

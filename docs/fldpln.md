@@ -6,6 +6,11 @@ pixel can reach, and how deep the water at the stream pixel must be to get there
 land upstream of a stream pixel against the flow directions (backfill), spills over low divides into the next valley
 (spillover), and fills depressions to the level of their rim.
 
+![A cross section from a stream pixel over a divide into the next valley. With the water 2 m deep at the stream, cell A, 1 m above it, floods 1 m deep; cell B, lower than the stream but beyond a divide 2.5 m above it, stays dry.](figures/fldpln_dtf.svg)
+
+A cell's DTF is the climb the water must make to reach it, not its height above the stream: B is lower than the
+stream, but the water must first rise 2.5 m to cross the divide.
+
 The DTFs are measured on a DEM with its depressions filled, so water can always flow downhill to the stream. They are
 saved in a **floodplain library**, built once for a DEM and stream network, with a row for each pair of a stream pixel
 (the flood source pixel, `FSP`) and a cell it can flood (the floodplain pixel, `FPP`), its `DTF`, the `segment` of
@@ -16,6 +21,24 @@ A segment's stream pixels all start at the same depth, so each cell keeps the on
 at the smallest depth. The library is therefore exact for **one water depth per segment**. One depth suits a short stretch of river better than a
 long one, so reaches are first cut where the filled DEM under the stream bends or steps by more than
 `max_profile_deviation` (1 m), and into pieces no longer than `max_reach_length` (5 km).
+
+The library is built once; each flow event is then mapped from it:
+
+```mermaid
+flowchart LR
+    subgraph build ["Once: build_fldpln_library"]
+        direction TB
+        grids[/"Filled DEM, flow directions and stream segments"/] --> solve["Each stream pixel: the cells its water reaches, and their DTFs"]
+        solve --> library[("Floodplain library")]
+    end
+    subgraph map ["For each flow event"]
+        direction TB
+        vdt[/"Water surface at the stream pixels, from the VDT database"/] --> depth["One depth D per segment: the median stage"]
+        depth --> cells["Each cell of the library: depth D - DTF + fill"]
+        cells --> flood["Flooded where the depth is at least FLDPLN_Min_Flood_Depth"]
+    end
+    build --> map
+```
 
 ## Inputs
 
@@ -75,8 +98,9 @@ it decides where a spill stops.
 - **`spill_decay`.** Head (m) water spilling over a divide loses per pixel down its path: a minimum slope of its water
   surface. The path's `j`-th pixel floods from `j * spill_decay` more DTF than its first, it backfills with that much
   less water, and the path ends where the water runs out. Without it a spill keeps its whole depth however far it
-  runs, so on flat ground it floods everything below its source's water surface as a level pool. The exact solver adds
-  it on each step to a pixel's D8 successor, so its other downhill steps stay free and it trims little. 
+  runs, so on flat ground it floods everything below its source's water surface as a level pool. The exact solver
+  takes it off the water's head on every step down, to lower ground whichever way or along the flow directions, as a
+  spill loses it down its path (and from the first step down, which the depth-stepped spill takes for free). 
 - **`max_reach_length`.** Reaches longer than this (m) are cut into `ceil(length / max_reach_length)` segments of
   about equal length, each solved and flooded on its own. The length is measured along the flow directions with the
   filled DEM's cell size. 5000 m by default; None keeps every reach whole. 
@@ -108,9 +132,6 @@ map the same.
 Each segment's rows are written to the library as soon as the segment is solved, sorted by `FSP` and then `FPP`, so
 the build holds only a few segments' rows at a time, however big the library grows. A flat floodplain makes a very big
 library. 
-
-The exact solver still solves in windows. The zstd level could be lowered for faster writes: level 3 wrote the
-Karnali's library in 2.5 s rather than 4 s, and 4.5% bigger.
 
 ## Mapping a flood
 
@@ -147,6 +168,26 @@ For each flow event:
     water covers it wherever it reaches that surface: such a fill counts as 0, and the depth and the water surface
     (`OutWSE`) are measured from the filled DEM.
 5. **Flood.** A cell floods where its depth is at least `FLDPLN_Min_Flood_Depth` (1 cm by default) and above 0.
+
+## Speed and memory
+
+Curve2Flood's iterative solver gives the same library as the University of Kansas's MATLAB model,
+`fldpln_model_v5ram.m` (see [Development](development.md#tests)), and so does `tests/fldpln_model_v5ram.py`, a
+line-for-line Python port of the MATLAB model. Here the three build the same rows for the same segments:
+
+--8<-- "benchmarks/fldpln_matlab/results.md"
+
+Each ran in a new process, warmed up on one short segment first, so neither starting MATLAB or Python nor compiling
+is timed. Memory used is the most each process held while it warmed up and built the segments, less what it held
+once it had loaded its inputs; the peak also counts what MATLAB or Python itself takes. To run the benchmark again
+(it needs MATLAB on the `PATH`, and takes about a quarter of an hour):
+
+```bash
+python benchmarks/fldpln_matlab/run_benchmark.py
+```
+
+It checks that every implementation gives the MATLAB model's rows, and rewrites the table above
+(`benchmarks/fldpln_matlab/results.md`, with every figure in `results.json`).
 
 ## Reference
 
