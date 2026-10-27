@@ -23,13 +23,13 @@ import pandas as pd
 import pytest
 
 from curve2flood.spreaders import fldpln as F
-from curve2flood.spreaders.fldpln import solvers as S
-from curve2flood.spreaders.fldpln.solvers import solver_iterative as SI
-from curve2flood.spreaders.fldpln.solvers import solver_exact as SE
 from curve2flood.spreaders.fldpln import library as L
 from curve2flood.spreaders.fldpln import library_writer as LW
 from curve2flood.spreaders.fldpln import mapping as M
+from curve2flood.spreaders.fldpln import solvers as S
 from curve2flood.spreaders.fldpln import workspace as W
+from curve2flood.spreaders.fldpln.solvers import solver_exact as SE
+from curve2flood.spreaders.fldpln.solvers import solver_iterative as SI
 
 DATA_DIR = Path(__file__).parent / "data" / "scottsbluff"
 REFERENCE_MODEL = Path(__file__).parent / "fldpln_model_v5ram.py"
@@ -292,7 +292,7 @@ def matlab_tables(rasters, tmp_path_factory):
         "fldmn": fldmn, "fldmx": fldmx, "dh": dh, "ssflgs": np.array([1.0, 0.0]), "bg": BG})
 
     command = f"addpath('{MATLAB_MODEL.as_posix()}'); run_segments('{work.as_posix()}')"
-    run = subprocess.run([matlab, "-batch", command], capture_output=True, text=True, timeout=600)
+    run = subprocess.run([matlab, "-batch", command], capture_output=True, text=True, timeout=600, check=False)
     if run.returncode != 0:
         pytest.fail(f"MATLAB failed:\n{run.stdout[-3000:]}\n{run.stderr[-3000:]}")
     return {(stream_id, ssflg): loadmat(work / f"matlab_{row}_ss{int(ssflg)}.mat")["fldpln"]
@@ -729,7 +729,7 @@ def test_split_reach_keeps_a_short_reach_whole(max_length):
 def test_library_splits_long_reaches_into_segments(tmp_path):
     """The slope's 11-pixel stream (1 m cells: its rasters have no coordinate system) cut at 4 m makes 3 segments.
     Every stream pixel belongs to one, and each cell's smallest DTF over the segments is its DTF in the whole reach."""
-    fil, _, info = _slope()
+    _, _, _ = _slope()
     whole = _slope_library(tmp_path, "whole", max_reach_length=None)
     split = _slope_library(tmp_path, "split", max_reach_length=4.0)
     assert whole["segment"].unique().tolist() == [0]
@@ -1034,8 +1034,7 @@ def test_a_background_writer_writes_what_a_plain_one_does(tmp_path, monkeypatch)
 def test_a_failure_in_the_writer_thread_is_raised_and_leaves_no_library(tmp_path):
     def fail():
         raise ValueError("bad rows")
-    with pytest.raises(ValueError, match="bad rows"):
-        with LW.LibraryWriter(tmp_path / "library.parquet", background=True) as writer:
+    with pytest.raises(ValueError, match="bad rows"), LW.LibraryWriter(tmp_path / "library.parquet", background=True) as writer:
             writer.write_later(lambda: _toy_library())
             writer.write_later(fail)
     assert not (tmp_path / "library.parquet").exists() and not (tmp_path / "library.parquet.partial").exists()
@@ -1124,8 +1123,8 @@ def test_library_parts_read_a_file_as_a_lazy_frame_would(tmp_path, monkeypatch):
 def test_hundredths_are_polars_decimal_casts():
     """float32(integer / 100) is what polars' cast of a decimal32(7, 2) gives, over the whole of its range (every
     seventh value, and its ends)."""
-    import pyarrow as pa
     import polars as pl
+    import pyarrow as pa
     integers = np.r_[np.arange(-9_999_999, 10_000_000, 7), 9_999_999, -1, 0, 1].astype(np.int32)
     column = pa.Array.from_buffers(pa.decimal32(7, 2), integers.size, [None, pa.py_buffer(integers.tobytes())])
     assert np.array_equal(M._column_values(column), pl.from_arrow(column).cast(pl.Float32).to_numpy())

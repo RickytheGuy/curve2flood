@@ -2,11 +2,12 @@ import numpy as np
 from osgeo import gdal
 
 from curve2flood._log import LOG
+from curve2flood._raster import _STRIP_ROWS, _read_rows, open_raster, write_threads
 from curve2flood.config import Config
-from curve2flood._raster import open_raster, write_threads, _STRIP_ROWS, _read_rows
+
 
 def create_bathymetry(config: Config, E: np.ndarray | None, nrows: int, ncols: int, dem_geotransform: tuple,
-                      dem_projection: str, bathymetry_creation_options: list[str] = None):
+                      dem_projection: str, bathymetry_creation_options: list[str] | None = None):
     """Write the topobathymetric DEM (``FSOutBATHY``): the DEM with ARC's
     bathymetry (``BATHY_Out_File``) burned in (see ``Create_Topobathy_Dataset``).
     ``E`` is the DEM padded by one cell, or None to read it from ``DEM_File``.

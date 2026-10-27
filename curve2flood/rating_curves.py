@@ -5,8 +5,9 @@ import polars.selectors as cs
 from numba import njit
 
 from curve2flood._log import LOG
-from curve2flood.config import is_parquet, Config
+from curve2flood.config import Config, is_parquet
 from curve2flood.spreaders import filter_outliers
+
 
 def calculate_interpolated_curvefile(CurveParamFileName: str, COMID_Unique_Flow: dict, TW_MultFact: float) -> pd.DataFrame:
     """Evaluate the curve file's rating curves at each reach's flow.
@@ -91,7 +92,7 @@ def Find_TopWidth_at_Baseflow_when_using_VDT(QB, flow_values, top_width_values):
         return top_width_values[idx]
 
 @njit("float32(float32[:], float32[:], float32)", cache=True)
-def interp1d_numba(x: np.ndarray, y: np.ndarray, xi: float | int) -> float:
+def interp1d_numba(x: np.ndarray, y: np.ndarray, xi: float) -> float:
     """Linearly interpolate ``y(x)`` at ``xi``, extrapolating from the end segments.
 
     ``x`` must be sorted.  Same as SciPy's ``interp1d(..., fill_value='extrapolate')``.
@@ -328,7 +329,6 @@ def Calculate_Depth_TopWidth_TWMax_Velocity(config: Config, COMID_Unique_Flow, C
                 LOG.warning(f"Reach {comid} (flow {COMID_Unique_Flow.get(comid)}, depth {COMID_Unique_Depth[comid]}) has a "
                             f"median top width of {COMID_Unique_TW[comid]}, above TopWidthPlausibleLimit; it is capped there.")
 
-    if TopWidthPlausibleLimit < TopWidthMax:
-        TopWidthMax = TopWidthPlausibleLimit
+    TopWidthMax = min(TopWidthMax, TopWidthPlausibleLimit)
 
     return COMID_Unique_TW, COMID_Unique_Depth, TopWidthMax, T_Rast, W_Rast, S_Rast

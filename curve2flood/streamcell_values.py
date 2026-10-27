@@ -1,5 +1,6 @@
 import numpy as np
 
+
 class StreamCellValues:
     """A raster's values at the stream cells alone: the curve-based mappers read their top widths, WSEs, slopes and
     stream ids nowhere else, so a value per stream cell takes the place of a raster of every cell.

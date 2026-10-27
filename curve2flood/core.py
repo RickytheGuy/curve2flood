@@ -11,24 +11,36 @@ import os
 import numpy as np
 import pandas as pd
 import polars as pl
-from pyproj import CRS, Geod
 import polars.selectors as cs
 from numba import njit, prange
 from osgeo import gdal
+from pyproj import CRS, Geod
 
 from curve2flood import LOG
+from curve2flood._raster import (
+    Read_Raster_GDAL,
+    _check_shape,
+    open_raster,
+    read_array,
+    read_into,
+)
 from curve2flood.bathymetry import create_bathymetry
-from curve2flood.streamcell_values import StreamCellValues
+from curve2flood.config import FLDPLN, KERNEL_WEIGHTED, MULTI_POINT, Config, is_parquet
+from curve2flood.outputs import (
+    accumulate_positive_max,
+    main_flood_ouputs,
+    remove_cells_not_connected,
+)
 from curve2flood.rating_curves import (
+    Calculate_Depth_TopWidth_TWMax_Velocity,
     calculate_interpolated_vdt,
-    Calculate_Depth_TopWidth_TWMax_Velocity
 )
-from curve2flood._raster import open_raster, read_array, read_into, write_threads, _check_shape, Read_Raster_GDAL
-from curve2flood.config import Config, FLDPLN, KERNEL_WEIGHTED, is_parquet, MULTI_POINT
-from curve2flood.outputs import main_flood_ouputs, accumulate_positive_max, remove_cells_not_connected
 from curve2flood.spreaders import (
-    make_fldpln_flood_map, spread_stream_cells, multi_point_interpolation
+    make_fldpln_flood_map,
+    multi_point_interpolation,
+    spread_stream_cells,
 )
+from curve2flood.streamcell_values import StreamCellValues
 
 gdal.UseExceptions()
 
@@ -156,7 +168,7 @@ def _kernel_maps(WSE_array, E, Total_Weight, Slope_Times_Weight, with_depth, wit
     for r in prange(nrows):
         for c in range(ncols):
             water, ground = WSE_array[r + 1, c + 1], E[r + 1, c + 1]
-            wet = water > ground and ground > -9998.0
+            wet = water > ground > -9998.0
             flooded[r, c] = 1 if wet else 0
             if with_depth:
                 WSE_array[r + 1, c + 1] = water - ground if wet else nan
@@ -586,10 +598,10 @@ def spread_flood(
     return Flood_Ensemble, S, fill_below_dem, channel, S_Rast, V_Rast, Depth_Max, Slope_Max
 
 def Curve2Flood_MainFunction(input_file: str | os.PathLike | Config = None,
-                             args: dict = None,
+                             args: dict | None = None,
                              quiet: bool = False,
                              flood_vdt_cells: bool = True,
-                             bathymetry_creation_options: list[str] = None,
+                             bathymetry_creation_options: list[str] | None = None,
                              **kwargs):
     """Run Curve2Flood: map the flood events and write the requested outputs.
 

@@ -1,7 +1,7 @@
 import numpy as np
 from numba import njit
 
-from .common import _neighbour_bits_of_row, OUTFLOW, _iterative_arrays
+from .common import OUTFLOW, _iterative_arrays, _neighbour_bits_of_row
 
 # ---------------------------------------------------------------------------
 # Depth-stepped solver -- algorithm steps 1-8

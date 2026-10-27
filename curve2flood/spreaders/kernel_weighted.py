@@ -154,8 +154,7 @@ def _spread(RR, CC, T_cells, W_cells, S_cells, E, nrows, ncols, TW_m, dx, dy, Lo
         if has_valley:
             VALLEY_SLOPE = float(V_cells[i])
 
-        if COMID_TW_m > TW_m:
-            COMID_TW_m = TW_m
+        COMID_TW_m = min(COMID_TW_m, TW_m)
 
         # How many cells the top width reaches from the stream cell
         COMID_TW = int(max(np.round(COMID_TW_m / dx), np.round(COMID_TW_m / dy)))
@@ -233,9 +232,8 @@ def _spread(RR, CC, T_cells, W_cells, S_cells, E, nrows, ncols, TW_m, dx, dy, Lo
                             for b in range(width):
                                 reached = 1.0 if state_row[b] == _REACHED else 0.0
                                 slope = SLOPE
-                                if has_channel:
-                                    if not channel[rr - 1, c_min + b - 1]:
-                                        slope = VALLEY_SLOPE
+                                if has_channel and not channel[rr - 1, c_min + b - 1]:
+                                    slope = VALLEY_SLOPE
                                 slope_sums[b] = np.float32(np.float64(slope_sums[b])
                                                            + np.float64(np.float32(slope) * weights[b]) * reached)
             first = last
@@ -265,8 +263,7 @@ def _spread(RR, CC, T_cells, W_cells, S_cells, E, nrows, ncols, TW_m, dx, dy, Lo
                         slope_sums = Slope_Times_Weight[rr, c_min:c_max]
                         for b in range(width):
                             slope = SLOPE
-                            if has_channel:
-                                if not channel[rr - 1, c_min + b - 1]:
+                            if has_channel and not channel[rr - 1, c_min + b - 1]:
                                     slope = VALLEY_SLOPE
                             slope_sums[b] += np.float32(slope) * weights[b]
 

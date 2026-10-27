@@ -9,10 +9,10 @@ local grid whose origin is the DEM's top-left corner.
 from pathlib import Path
 
 import numba
-import shapely
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import shapely
 from numba import njit, prange
 from osgeo import gdal, ogr
 from scipy import ndimage as ndi
@@ -1061,7 +1061,7 @@ def _smooth_nan_rows(arr: np.ndarray, weights: np.ndarray) -> np.ndarray:
                 den += (np.float64(down_den[left]) + np.float64(down_den[right])) * weights[j]
             num32, den32 = np.float32(num), np.float32(den)
             out[r, c] = num32 / den32 if den32 > np.float32(1.0e-6) else np.float32(np.nan)
-            
+
     return out
 
 @njit(cache=True, inline="always")
@@ -1460,7 +1460,7 @@ def multi_point_interpolation(
                         one_based_rc=bool(options["one_based_vdt_rc"]),
                     )
                 )
-            except Exception as ex:
+            except Exception as ex:  # noqa: BLE001
                 scenario_builder_errors.append(f"VDT metadata unavailable: {ex}")
         if CurveParamFileName:
             try:
@@ -1471,7 +1471,7 @@ def multi_point_interpolation(
                         one_based_rc=bool(options["one_based_vdt_rc"]),
                     )
                 )
-            except Exception as ex:
+            except Exception as ex:  # noqa: BLE001
                 scenario_builder_errors.append(f"Curve metadata unavailable: {ex}")
 
         scenario_builders = []
@@ -1521,7 +1521,7 @@ def multi_point_interpolation(
                     xs_point_spacing_m=float(options["xs_point_spacing_m"]),
                 )
                 break
-            except Exception as ex:
+            except Exception as ex:  # noqa: BLE001
                 scenario_builder_errors.append(f"{source_name} scenario generation failed: {ex}")
 
         if point_data is None and scenario_builder_errors:

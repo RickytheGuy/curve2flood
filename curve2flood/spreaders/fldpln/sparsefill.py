@@ -1,6 +1,7 @@
 import numpy as np
 from numba import njit
 
+
 class SparseFill:
     """A raster of mostly zeros, as its other cells by row: row ``r``'s are columns ``cols[starts[r]:starts[r + 1]]``,
     ascending, with ``values``.  ``[pixels]`` gives the values at flat pixel ids, as a raster indexed so would."""

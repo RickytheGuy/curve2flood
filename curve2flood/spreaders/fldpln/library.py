@@ -1,25 +1,32 @@
-import os
-import math
-import itertools
-import threading
 import contextlib
+import itertools
+import math
+import os
+import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
-import tqdm
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-from osgeo import gdal
+import tqdm
 from numba import njit, prange
+from osgeo import gdal
 
 from curve2flood._log import LOG
-from .workspace import Workspace
-from .sparsefill import SparseFill
+from curve2flood._raster import decoding_threads, open_raster, read_array
 from curve2flood.config import is_parquet
+
 from .library_writer import LibraryWriter
-from curve2flood._raster import read_array, open_raster, decoding_threads
-from .solvers import _next_downstream, SOLVERS, _solve_exact, _solve_iterative, _neighbour_bits_of_row
+from .solvers import (
+    SOLVERS,
+    _neighbour_bits_of_row,
+    _next_downstream,
+    _solve_exact,
+    _solve_iterative,
+)
+from .sparsefill import SparseFill
+from .workspace import Workspace
 
 # The most threads a parallel build takes by default: each holds a copy of the
 # solver's arrays of the whole raster, and more than two hardly build faster
@@ -38,7 +45,7 @@ def build_fldpln_library(
     fldmn: float = 0.1,
     fldmx: float = 25.0,
     iterative_spill: bool = False,
-    vdt_file: str = None,
+    vdt_file: str | None = None,
     bg_mask: np.ndarray | None = None,
     stream_ids: list[int] | None = None,
     global_max_wse: float = 0.0,
@@ -934,7 +941,7 @@ def _split_reach(row: np.ndarray, pixels: np.ndarray, steps: np.ndarray, max_len
     if max_deviation is not None:
         cuts = _profile_cuts(np.cumsum(steps) - steps, elevation, max_deviation).tolist()
     bounds = [0, *cuts, len(pixels)]
-    parts = [p for a, b in zip(bounds[:-1], bounds[1:]) for p in _equal_lengths(pixels[a:b], steps[a:b], max_length)]
+    parts = [p for a, b in itertools.pairwise(bounds) for p in _equal_lengths(pixels[a:b], steps[a:b], max_length)]
     if len(parts) == 1:
         return [(start, end, length, pixels)]
     return [(int(p[0]), end if i == len(parts) - 1 else int(p[-1]), len(p), p) for i, p in enumerate(parts)]

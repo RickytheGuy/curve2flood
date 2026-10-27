@@ -38,5 +38,7 @@ Flow directions use WhiteboxTools D8 codes, and the stream table has columns
 ``start_pixel, end_pixel, length, stream_id``.  Pixels are flat row-major
 indices, ``row * ncols + col``.
 """
-from .mapping import make_fldpln_flood_map
 from .library import build_fldpln_library
+from .mapping import make_fldpln_flood_map
+
+__all__ = ["build_fldpln_library", "make_fldpln_flood_map"]

@@ -1,16 +1,22 @@
 """Small tests of the Curve2Flood driver: running it, input files and raster helpers."""
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 from osgeo import gdal, osr
-from scipy.ndimage import distance_transform_edt, generate_binary_structure, label, uniform_filter
+from scipy.ndimage import generate_binary_structure, label, uniform_filter
 
-from curve2flood import Config, Curve2Flood_MainFunction, remove_cells_not_connected
-from curve2flood import core, outputs, rating_curves, _raster, bathymetry
+from curve2flood import (
+    Config,
+    Curve2Flood_MainFunction,
+    _raster,
+    bathymetry,
+    core,
+    outputs,
+    rating_curves,
+    remove_cells_not_connected,
+)
 from curve2flood.spreaders import fldpln
-from curve2flood import _raster
 
 gdal.UseExceptions()
 
@@ -85,7 +91,7 @@ def test_curve_file_fills_the_rasters(tmp_path):
     T = np.full((3, 2), -1.0, np.float32)
     W = np.full((3, 2), np.nan, np.float32)
     S = np.full((3, 2), np.nan, np.float32)
-    tw, depth, tw_max, T, W, S = rating_curves.Calculate_TW_D_V_ForEachCOMID_CurveFile(
+    _, depth, tw_max, T, W, S = rating_curves.Calculate_TW_D_V_ForEachCOMID_CurveFile(
         str(path), {1: 4.0, 2: 16.0}, np.array([1, 2]), T, W, S, 1.5)
     # Depth and top width are a * Q**b; WSE adds the base elevation; top widths are scaled by TW_MultFact
     assert W[0, 0] == pytest.approx(101.0) and W[2, 1] == pytest.approx(54.0)
@@ -470,9 +476,9 @@ def test_gdal_threads_follow_gdal_num_threads(monkeypatch):
     """GDAL_NUM_THREADS, when set, and every CPU otherwise."""
     monkeypatch.delenv("GDAL_NUM_THREADS", raising=False)
     with gdal.config_option("GDAL_NUM_THREADS", None):
-        assert core.write_threads() == "NUM_THREADS=ALL_CPUS"
+        assert _raster.write_threads() == "NUM_THREADS=ALL_CPUS"
     with gdal.config_option("GDAL_NUM_THREADS", "3"):
-        assert core.write_threads() == "NUM_THREADS=3"
+        assert _raster.write_threads() == "NUM_THREADS=3"
 
 
 def test_a_vdt_database_has_valley_slopes_with_their_column(tmp_path):
@@ -560,7 +566,7 @@ def test_the_kernel_s_velocity_takes_the_valley_s_slope_outside_the_channel(tmp_
     """A stream along row 10 of a valley whose sides rise 0.5 m a 30 m cell, its water 1.5 m deep, so rows 8 to 12
     flood: the baseflow top width, 70 m, makes rows 9 to 11 the channel, at the stream's slope (0.001), and rows 8
     and 12 take the valley's (0.004). Without the VDT's Valley_Slope, every cell takes the stream's."""
-    rows, cols = np.mgrid[0:21, 0:20]
+    rows, _ = np.mgrid[0:21, 0:20]
     _write(tmp_path / "dem.tif", (100.0 + 0.5 * np.abs(rows - 10)).astype(np.float32), gdal.GDT_Float32)
     vdt = pd.DataFrame({"COMID": 1, "Row": 10, "Col": range(2, 18), "Elev": 100.0, "QBaseflow": 5.0, "Slope": 0.001,
                         "q_1": 10.0, "q_2": 20.0, "t_1": 70.0, "t_2": 200.0, "wse_1": 101.0, "wse_2": 102.0,

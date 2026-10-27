@@ -1,11 +1,11 @@
 """Curve2Flood's inputs: the input file, as YAML, as text, or as a dictionary."""
-import os
-import math
 import difflib
+import math
+import os
+from dataclasses import dataclass, fields
 from pathlib import Path
 from types import UnionType
 from typing import Literal, Union, get_args, get_origin, get_type_hints
-from dataclasses import dataclass, fields
 
 import yaml
 
@@ -27,7 +27,7 @@ _ARC_KEYS = {'dem_file', 'stream_file', 'strmshp_file', 'flow_file', 'lu_raster_
              'shallow_factor', 'deep_factor', 'bathy_trap_h', 'bathy_use_banks', 'bathy_bed_cap',
              'bathy_smooth_banks', 'bathy_smooth_bed', 'bathy_bankless_max_baseflow', 'findbanksbasedonlandcover', 'vdt_database_numiterations',
              'standard_step', 'standard_step_eddy_length', 'valley_sections', 'valley_dir_widths', 'valley_dir_dist',
-             'drop_edge_sections', 'edge_margin',
+             'drop_edge_sections', 'edge_margin', 'outlet_wse_file',
              'print_vdt_database', 'print_ap_database', 'print_curve_file', 'xs_out_file',
              'reach_average_curve_file',
              'build_representative_cross_section', 'representative_cross_section_file', 'bathy_out_file', 'aroutflood',

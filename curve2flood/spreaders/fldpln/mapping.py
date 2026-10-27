@@ -4,14 +4,15 @@ import os
 
 import numba
 import numpy as np
-import polars as pl
 import pandas as pd
+import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 from numba import njit, prange
 
-from .solvers import _next_downstream
 from . import library_writer
+from .solvers import _next_downstream
+
 
 @njit(cache=True, nogil=True)
 def _walk_reaches(starts: np.ndarray, lengths: np.ndarray, fdr: np.ndarray, nrows: int,
@@ -69,23 +70,28 @@ def _deepest_row(best, key, fpp, dtf, fill, dof, below, i):
     zero = np.float32(0.0)
     if below.size > 0:
         f = fill[i]
-        below[fpp[i]] = f if f < zero else zero
+        below[fpp[i]] = min(zero, f)
+        
     k = key[i]
     if k < 0 or k >= dof.size:
         return
+    
     water = dof[k]
-    if water != water:
+    if water != water:  # noqa: PLR0124
         return
+    
     head = water - dtf[i]
     if not head > zero:
         return
+    
     f = fill[i]
-    depth = np.float32(head + (f if (f > zero or f != f) else zero))
+    depth = np.float32(head + (f if (f > zero or f != f) else zero)) # noqa: PLR0124
     p = fpp[i]
     current = best[p]
-    if current != current:
+    if current != current: # noqa: PLR0124
         return
-    if depth != depth or depth > current:
+    
+    if depth != depth or depth > current: # noqa: PLR0124
         best[p] = depth
 
 def make_fldpln_flood_map(

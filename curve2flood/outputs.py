@@ -1,16 +1,22 @@
-import shapely
+import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-import geopandas as gpd
+import shapely
 from numba import njit, prange
 from osgeo import gdal, ogr, osr
 
 from curve2flood._log import LOG
-from curve2flood.config import Config
-from curve2flood.config import Config, FLDPLN
 from curve2flood._patches import patches_holding
-from curve2flood._raster import open_raster, _check_shape, _read_rows, write_threads, _STRIP_ROWS, Read_Raster_GDAL
+from curve2flood._raster import (
+    _STRIP_ROWS,
+    Read_Raster_GDAL,
+    _check_shape,
+    _read_rows,
+    open_raster,
+    write_threads,
+)
+from curve2flood.config import FLDPLN, Config
 
 # Rows of _smooth_3x3's band
 _SMOOTH_BAND = 64
@@ -96,9 +102,11 @@ def main_flood_ouputs(
             dem_ds = open_raster(config.dem_file)  # kept, or its band would outlive it
             dem_band = dem_ds.GetRasterBand(1)
             dem_rows = lambda r0, r1: _read_rows(dem_band, r0, r1 - r0, ncols)
+            
+        fill_rows = fill_below_dem
         _write_strips(OutWSE, ncols, nrows, dem_geotransform, dem_projection, config.compression, np.nan,
                       lambda r0, r1: water_surface(Depth_Array[r0:r1], dem_rows(r0, r1),
-                                                   None if fill_below_dem is None else fill_below_dem[r0:r1]))
+                                                   None if fill_rows is None else fill_rows[r0:r1]))
     del fill_below_dem
 
     # The FLDPLN mapper gives no slopes: each flooded cell takes its nearest
