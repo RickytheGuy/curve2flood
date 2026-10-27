@@ -27,6 +27,7 @@ _ARC_KEYS = {'dem_file', 'stream_file', 'strmshp_file', 'flow_file', 'lu_raster_
              'shallow_factor', 'deep_factor', 'bathy_trap_h', 'bathy_use_banks', 'bathy_bed_cap',
              'bathy_smooth_banks', 'bathy_smooth_bed', 'bathy_bankless_max_baseflow', 'findbanksbasedonlandcover', 'vdt_database_numiterations',
              'standard_step', 'standard_step_eddy_length', 'valley_sections', 'valley_dir_widths', 'valley_dir_dist',
+             'drop_edge_sections', 'edge_margin',
              'print_vdt_database', 'print_ap_database', 'print_curve_file', 'xs_out_file',
              'reach_average_curve_file',
              'build_representative_cross_section', 'representative_cross_section_file', 'bathy_out_file', 'aroutflood',
@@ -160,6 +161,7 @@ class Config:
 
     @classmethod
     def from_yaml(cls, yaml_name: str | os.PathLike):
+        """The inputs from a YAML input file."""
         with open(yaml_name, 'r') as o_input_file:
             params = yaml.load(o_input_file, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader))
         return cls.from_mapping(params or {})
