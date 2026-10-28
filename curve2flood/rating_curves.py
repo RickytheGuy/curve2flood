@@ -35,7 +35,7 @@ def calculate_interpolated_curvefile(CurveParamFileName: str, COMID_Unique_Flow:
     curve_df = curve_df[curve_df['TopWidth']>0]
     curve_df['WSE'] = curve_df['Depth'] + curve_df['BaseElev']
 
-    curve_df = curve_df.groupby('COMID', group_keys=False)[curve_df.columns].apply(filter_outliers)
+    curve_df = filter_outliers(curve_df)
 
     curve_df['TopWidth'] = curve_df['TopWidth'].astype(np.float32) * np.float32(TW_MultFact)
 
@@ -61,7 +61,6 @@ def Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName: str, COMID_Uniqu
     comid_result_df = pd.DataFrame({'COMID': COMID_Unique})
     comid_result_df = comid_result_df.merge(median_values, on='COMID', how='left').fillna(0)
 
-    comid_result_df['COMID'] = comid_result_df['COMID'].astype(np.int32)
     comid_result_df['TopWidth'] = comid_result_df['TopWidth'].astype(np.float32)
     comid_result_df['Depth'] = comid_result_df['Depth'].astype(np.float32)
 
@@ -274,7 +273,6 @@ def Calculate_TW_D_V_ForEachCOMID_VDTDatabase(VDTDatabaseFileName: str, COMID_Un
     comid_result_df = pl.DataFrame({'COMID': COMID_Unique})
     comid_result_df = comid_result_df.join(median_values, on='COMID', how='left').fill_nan(0)
     comid_result_df = comid_result_df.with_columns(
-        pl.col('COMID').cast(pl.Int32),
         pl.col('TopWidth').cast(pl.Float32),
         pl.col('Depth').cast(pl.Float32),
     )

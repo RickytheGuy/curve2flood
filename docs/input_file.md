@@ -26,12 +26,14 @@ DEM_File	/path/to/dem.tif
 mapper	Curve2Flood-Kernel Weighted
 ```
 
-Keys are case-insensitive, so `DEM_File` and `dem_file` are the same. ARC's keys are allowed and ignored, so one file can drive both models. Any other key Curve2Flood doesn't know stops the run with an error. Booleans are `True` or `False` (`yes` and `no`, or `1` and `0`,
+Keys are case-insensitive, so `DEM_File` and `dem_file` are the same. Any key Curve2Flood doesn't know, stops the run with an error that suggests the closest key: give ARC its own input file. FloodSpreader's `OutSHP` and `FS_ADJUST_FLOW_BY_FRACTION` are allowed and ignored. Booleans are `True` or `False` (`yes` and `no`, or `1` and `0`,
 work too). A key with no value, or `null` in YAML, takes its default. Leave an output out to skip it.
 
 ## What a run needs
 
-`DEM_File` is always needed. Mapping a flood (for any of `OutFLD`, `OutDEP`, `OutWSE` and `OutVEL`) also needs:
+`DEM_File` is needed but for an FLDPLN flood map without `OutWSE` or the bathymetry, which takes its grid from its
+library (see [FLDPLN Mapper](fldpln.md#inputs)). Mapping a flood (for any of `OutFLD`, `OutDEP`, `OutWSE` and
+`OutVEL`) also needs:
 
 - `COMID_Flow_File`, and `Print_VDT_Database` or `Print_Curve_File`;
 - or, with `Set_Depth`, `Stream_File` instead.
@@ -43,6 +45,10 @@ work too). A key with no value, or `null` in YAML, takes its default. Leave an o
 | `Flood_WaterLC_and_STRM_Cells` | `LU_Raster_SameRes`. |
 | `Flood_Bathy_Mask` | `BathyWaterMask`, which has to exist. |
 
+Before it reads anything, a run checks that every file it reads exists, and that the folder of every file it
+writes exists and can be written to, and stops naming all that don't. It also stops if the flow file has more
+than 655 flow events or a negative flow.
+
 ## Input files
 
 Every raster must match the DEM's size and extent. Tables can be CSV or Parquet.
@@ -52,10 +58,10 @@ Every raster must match the DEM's size and extent. Tables can be CSV or Parquet.
 | `DEM_File` | The DEM, in metres, with coordinates in metres or degrees. Cells at or below -9998 are no-data and never flood. |
 | `Print_VDT_Database` | The VDT database produced by ARC. Contains rating curves for velocity, top width, and depth for every stream cell (see [Key Concepts](key_concepts.md#rating-curves)). Used rather than the curve file when both are given. |
 | `Print_Curve_File` | The curve file produced by ARC. Similar to the VDT, but contains each rating curve as coefficients in a power law equation. |
-| `COMID_Flow_File` | The flows to map, in m³/s: the reach ID in the first column, then one column per flow event. An empty flow counts as zero, and a reach missing from the file isn't mapped. |
+| `COMID_Flow_File` | The flows to map, in m³/s: the reach ID in the first column, then one column per flow event, 655 at most. An empty flow counts as zero, and a reach missing from the file isn't mapped (a warning names them). |
 | `Stream_File` | A stream raster, each stream cell holding its reach ID, with nodata being 0. Read only with `Set_Depth`; otherwise the stream cells come frome the VDT's or curve file's. |
 | `LU_Raster_SameRes` | The land cover raster. |
-| `LU_Manning_n` | A tab-separated table of Manning's n for each land cover class, with a header row: the class in the first column and its n in the third, as ARC reads it. |
+| `LU_Manning_n` | A tab-separated table of Manning's n for each land cover class, with a header row: the class in the first column and its n in the third, as ARC reads it. Land cover the table doesn't list, its no-data among it, takes n = 0.035, with a warning naming the classes. |
 
 ## Outputs
 
@@ -67,7 +73,7 @@ See [Outputs](outputs.md) for what each one contains.
 | `OutDEP` | | The flood depth raster. |
 | `OutWSE` | | The water surface elevation raster. |
 | `OutVEL` | | The velocity raster. |
-| `Make_Output_GPKG` | True | Also write the flood extent as polygons, next to `OutFLD` with a `.gpkg` extension. |
+| `Make_Output_GPKG` | True | Also write the flood extent as polygons, beside `OutFLD`: its name with a `.gpkg` extension instead of its own. |
 | `compression` | LZW | The output rasters' GeoTIFF compression, such as LZW, DEFLATE or ZSTD. |
 
 ## Mapping
@@ -75,7 +81,7 @@ See [Outputs](outputs.md) for what each one contains.
 | Key | Default | Description |
 | --- | --- | --- |
 | `mapper` | Curve2Flood-Kernel Weighted | How the water spreads from the stream: `Curve2Flood-Kernel Weighted` (see [Kernel-Weighted Mapper](kernel_weighted.md)), `Curve2Flood-Multi-Point Interpolation` (see [Multi-Point Interpolation Mapper](multi_point.md)) or `Curve2Flood-FLDPLNpy` (see [FLDPLN Mapper](fldpln.md)). |
-| `TW_MultFact` | 3.0 | Multiplies every top width from the rating curves. Affects the kernel-weighted and multi-point interpolation mappers. |
+| `TW_MultFact` | 3.0 | Multiplies every top width from the rating curves. Kernel-weighted mapper only: the multi-point mapper scales top widths with its own `MPI_Corridor_TopWidth_Factor`, `MPI_Anchor_TopWidth_Factor` and `MPI_MaxDist_TopWidth_Factor`. |
 | `TopWidthPlausibleLimit` | 1000 | The widest top width (m) allowed. The kernel-weighted mapper caps top widths here, and a reach whose median top width is wider gets a warning. |
 | `LocalFloodOption` | False | Kernel-weighted mapper: a stream cell's water reaches only the cells below its water surface that connect to it. `FloodLocalOnly` is the same key; either one turns it on. |
 | `Flood_WaterLC_and_STRM_Cells` | False | Always flood the stream cells and the land cover's water cells. |
@@ -101,7 +107,7 @@ See [Multi-Point Interpolation Mapper](multi_point.md) for how these are used.
 | Key | Default | Description |
 | --- | --- | --- |
 | `MPI_TopWidth_Threshold_m` | 200 | Rivers wider than this (m) also get points across the channel. |
-| `MPI_XS_Point_Spacing_m` | 100 | The spacing of those points (m). |
+| `MPI_XS_Point_Spacing_m` | 100 | The spacing of those points (m), more than 0. |
 | `MPI_Remove_HWM_Outliers` | True | Drop the points whose depth is an outlier. |
 | `MPI_HWM_Outlier_Method` | mad | The outlier test: robust z-score (`mad`) or interquartile range (`iqr`). |
 | `MPI_HWM_Outlier_Threshold` | 3.5 | The test's threshold. |

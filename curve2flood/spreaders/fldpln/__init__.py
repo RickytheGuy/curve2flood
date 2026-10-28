@@ -36,9 +36,11 @@ segment twice.
 
 Flow directions use WhiteboxTools D8 codes, and the stream table has columns
 ``start_pixel, end_pixel, length, stream_id``.  Pixels are flat row-major
-indices, ``row * ncols + col``.
+indices, ``row * ncols + col``, of the grid a Parquet library records in its
+metadata (``library_metadata``), so a flood map needs no DEM to place them.
 """
 from .library import build_fldpln_library
+from .library_writer import library_metadata
 from .mapping import make_fldpln_flood_map
 
-__all__ = ["build_fldpln_library", "make_fldpln_flood_map"]
+__all__ = ["build_fldpln_library", "library_metadata", "make_fldpln_flood_map"]

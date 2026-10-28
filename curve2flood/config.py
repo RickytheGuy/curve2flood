@@ -17,23 +17,9 @@ KERNEL_WEIGHTED, MULTI_POINT, FLDPLN = MAPPERS
 
 # Other names for some keys, from FloodSpreader and ARC (see Config._normalize_keys)
 _ALIASES = {'floodspreader_specifydepth', 'floodlocalonly', 'aroutbathy'}
-# ARC's keys (arc.config.Configs): one input file often drives both models, so they are allowed and ignored
-_ARC_KEYS = {'dem_file', 'stream_file', 'strmshp_file', 'flow_file', 'lu_raster_sameres', 'lu_manning_n',
-             'manual_cross_sections_file', 'bathywatermask', 'reach_id', 'downstream_reach_id', 'flow_file_id',
-             'flow_file_bf', 'flow_file_qmax', 'lc_water_value', 'drainage_area_field', 'coefficient_depth',
-             'exponent_depth', 'coefficient_width', 'exponent_width', 'x_section_dist', 'degree_manip',
-             'degree_interval', 'low_spot_range', 'gen_dir_dist', 'gen_slope_dist', 'stream_slope_method',
-             'slope_low_percentile', 'slope_high_percentile', 'slope_adjustment_factor', 'depth_varying_n', 'k_decay',
-             'shallow_factor', 'deep_factor', 'bathy_trap_h', 'bathy_use_banks', 'bathy_bed_cap',
-             'bathy_smooth_banks', 'bathy_smooth_bed', 'bathy_bankless_max_baseflow', 'findbanksbasedonlandcover', 'vdt_database_numiterations',
-             'standard_step', 'standard_step_eddy_length', 'valley_sections', 'valley_dir_widths', 'valley_dir_dist',
-             'drop_edge_sections', 'edge_margin', 'outlet_wse_file',
-             'print_vdt_database', 'print_ap_database', 'print_curve_file', 'xs_out_file',
-             'reach_average_curve_file',
-             'build_representative_cross_section', 'representative_cross_section_file', 'bathy_out_file', 'aroutflood',
-             'compression'}
-# Keys that input files often carry (nencarta writes OutSHP and FS_ADJUST_FLOW_BY_FRACTION) but neither model uses
-_IGNORED_KEYS = {'spatial_units', 'str_limit_val', 'print_vdt', 'outshp', 'fs_adjust_flow_by_fraction'}
+# FloodSpreader's keys that Curve2Flood doesn't use, beside those it reads under other names (_ALIASES): its input
+# files still run
+_IGNORED_KEYS = {'outshp', 'fs_adjust_flow_by_fraction'}
 # Curve2Flood's retired keys, with why: ignored with a warning, so that older input files still run
 _REMOVED_KEYS = {
     'max_wse_rise': "the FLDPLN mapper no longer caps how fast the water surface rises",
@@ -47,6 +33,25 @@ _REMOVED_KEYS = {
 
 _TRUE = {'true', 'yes', 'y', 'on', '1'}
 _FALSE = {'false', 'no', 'n', 'off', '0'}
+
+# The multi-point mapper's numeric settings, by input-file key: the least each may be, and whether it may be that
+_MPI_LOWER_BOUNDS = {
+    'MPI_TopWidth_Threshold_m': (0.0, True),
+    'MPI_XS_Point_Spacing_m': (0.0, False),
+    'MPI_HWM_Outlier_Threshold': (0.0, False),
+    'MPI_HWM_Outlier_Min_Samples': (1, True),
+    'MPI_Corridor_Buffer_m': (0.0, True),
+    'MPI_Anchor_Buffer_m': (0.0, True),
+    'MPI_Corridor_TopWidth_Factor': (0.0, True),
+    'MPI_Anchor_TopWidth_Factor': (0.0, True),
+    'MPI_K': (1, True),
+    'MPI_Power': (0.0, True),
+    'MPI_Max_Distance_m': (0.0, False),
+    'MPI_MaxDist_TopWidth_Factor': (0.0, False),
+    'MPI_Min_TopWidth_m': (0.0, False),
+    'MPI_Fallback_TopWidth_m': (0.0, False),
+    'MPI_Smooth_Sigma_Pixels': (0.0, True),
+}
 
 
 def path_exists(path: str | os.PathLike | None) -> bool:
@@ -65,8 +70,7 @@ class Config:
 
     Make one with `from_file` (YAML, or text with a key and its value on each line) or `from_mapping` (a dictionary).
     Each field is its input-file key in lower case, and keys are case-insensitive, so DEM_File and dem_file are the
-    same. A key set to nothing (an empty value, or null in YAML) takes its default. ARC's keys are allowed and
-    ignored, so that one file can drive both models.
+    same. A key set to nothing (an empty value, or null in YAML) takes its default.
     """
     # Input files
     dem_file: str | None = None
@@ -187,7 +191,7 @@ class Config:
         params = {str(k).lower(): v for k, v in params.items()}
 
         own = {f.name for f in fields(cls) if f.init} | _ALIASES
-        unknown = sorted(set(params) - own - _ARC_KEYS - _IGNORED_KEYS - set(_REMOVED_KEYS))
+        unknown = sorted(set(params) - own - _IGNORED_KEYS - set(_REMOVED_KEYS))
         if unknown:
             described = []
             for key in unknown:
@@ -214,9 +218,18 @@ class Config:
         if aroutbathy is not None:
             params['bathy_out_file'] = aroutbathy
 
-        # ARC's keys and the ignored ones are allowed in the inputs, but aren't fields
+        # The ignored and removed keys are allowed in the inputs, but aren't fields
         known = {f.name for f in fields(cls) if f.init}
         return {key: value for key, value in params.items() if key in known}
+
+    @classmethod
+    def check_keys(cls, params: dict) -> dict:
+        """Check some of an input file's keys and values without the rest of a run's: each key must be Curve2Flood's
+        and each value of its type. Returns them by field name, typed. For programs that write Curve2Flood's input
+        files, to check the settings a user gives them before the inputs exist; `from_mapping` checks a whole run."""
+        params = cls._normalize_keys(params)
+        hints = get_type_hints(cls)
+        return {key: _coerce(key, value, hints[key]) for key, value in params.items()}
 
     def _coerce_types(self) -> None:
         # Text input files give every value as a string, so convert each one to its field's type
@@ -227,14 +240,27 @@ class Config:
 
     def validate_options(self) -> None:
         """Check the run has every input it needs and that no two settings conflict. The messages name the
-        input-file keys."""
-        if not self.dem_file:
+        input-file keys. Whether the files exist is `check_paths`'s to check, when the run starts."""
+        if self.needs_dem and not self.dem_file:
             raise ValueError("Missing required parameters: DEM_File")
         for key, value in (('TW_MultFact', self.tw_multfact), ('TopWidthPlausibleLimit', self.topwidthplausiblelimit)):
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f'{key} must be finite and positive, not {value!r}.')
         if not math.isfinite(self.fldpln_min_flood_depth) or self.fldpln_min_flood_depth < 0.0:
             raise ValueError(f'FLDPLN_Min_Flood_Depth must be finite and 0 or more, not {self.fldpln_min_flood_depth!r}.')
+        for key, (lowest, inclusive) in _MPI_LOWER_BOUNDS.items():
+            value = getattr(self, key.lower())
+            if not math.isfinite(value) or value < lowest or (value == lowest and not inclusive):
+                least = f'{lowest} or more' if inclusive else f'more than {lowest}'
+                raise ValueError(f'{key} must be {least}, not {value!r}.')
+            
+        if self.mpi_max_topwidth_m < self.mpi_min_topwidth_m:
+            raise ValueError(f'MPI_Max_TopWidth_m ({self.mpi_max_topwidth_m}) is less than MPI_Min_TopWidth_m '
+                             f'({self.mpi_min_topwidth_m}).')
+        
+        if not math.isfinite(self.mpi_wse_sanity_tolerance_m):
+            raise ValueError(f'MPI_WSE_Sanity_Tolerance_m must be finite, not {self.mpi_wse_sanity_tolerance_m!r}.')
+        
         if not self.needs_flood_map:
             return
 
@@ -288,6 +314,77 @@ class Config:
     def needs_flood_map(self) -> bool:
         """Whether a flood map is needed, for an output raster."""
         return bool(self.outfld or self.outdep or self.outwse or self.outvel)
+
+    @property
+    def needs_dem(self) -> bool:
+        """Whether the run needs the DEM: all but an FLDPLN flood map without OutWSE or bathymetry, which takes its
+        grid from the library (or the flow directions) and its depths from the library."""
+        return self.makes_bathymetry or not (self.mapper == FLDPLN and self.needs_flood_map and not self.outwse)
+
+    @property
+    def gpkg_file(self) -> str | None:
+        """Where the flood's polygons are written: OutFLD's folder and name, as a GeoPackage; None without them."""
+        if not (self.make_output_gpkg and self.outfld):
+            return None
+        flood = Path(self.outfld)
+        return str(flood.with_name(f'{flood.stem}.gpkg'))
+
+    def input_paths(self) -> dict[str, str]:
+        """The files the run reads, by input-file key."""
+        paths = {'DEM_File': self.dem_file}
+        if self.needs_flood_map:
+            if self.uses_set_depth:
+                paths['Stream_File'] = self.stream_file
+            else:
+                paths['COMID_Flow_File'] = self.comid_flow_file
+                paths['Print_VDT_Database'] = self.print_vdt_database
+                # The VDT database is used instead of the curve file, but the multi-point mapper borrows from it
+                if not self.print_vdt_database or self.mapper == MULTI_POINT:
+                    paths['Print_Curve_File'] = self.print_curve_file
+
+            if self.mapper == FLDPLN:
+                paths['Flow_Direction_File'] = self.flow_direction_file
+                paths['Stream_Info_File'] = self.stream_info_file
+                paths['FLDPLN_Library'] = self.fldpln_library
+
+            if self.outvel or self.flood_waterlc_and_strm_cells:
+                paths['LU_Raster_SameRes'] = self.lu_raster_sameres
+            if self.outvel:
+                paths['LU_Manning_n'] = self.lu_manning_n
+            if self.flood_bathy_mask:
+                paths['BathyWaterMask'] = self.bathywatermask
+
+        if self.makes_bathymetry:
+            paths['BATHY_Out_File'] = self.bathy_out_file
+
+        return {key: path for key, path in paths.items() if path}
+
+    def output_paths(self) -> dict[str, str]:
+        """The files the run writes, by input-file key."""
+        paths = {}
+        if self.needs_flood_map:
+            paths = {'OutFLD': self.outfld, 'OutDEP': self.outdep, 'OutWSE': self.outwse, 'OutVEL': self.outvel,
+                     'Make_Output_GPKG': self.gpkg_file}
+        if self.makes_bathymetry:
+            paths['FSOutBATHY'] = self.fsoutbathy
+            
+        return {key: path for key, path in paths.items() if path}
+
+    def check_paths(self) -> None:
+        """Check, before the run does anything, that every file it reads exists and that every file it writes can
+        be: its folder exists and can be written to. Raises FileNotFoundError naming every one that fails."""
+        problems = [f"{key} {path} doesn't exist" for key, path in self.input_paths().items() if not path_exists(path)]
+        for key, path in self.output_paths().items():
+            path = Path(path)
+            folder = path.parent
+            if path.is_dir():
+                problems.append(f"{key} {path} is a folder")
+            elif not folder.is_dir():
+                problems.append(f"{key}'s folder {folder} doesn't exist")
+            elif not os.access(folder, os.W_OK):
+                problems.append(f"{key}'s folder {folder} can't be written to")
+        if problems:
+            raise FileNotFoundError("; ".join(problems) + ".")
 
     @property
     def multi_point_options(self) -> dict:

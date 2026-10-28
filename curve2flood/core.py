@@ -17,7 +17,9 @@ from osgeo import gdal
 from pyproj import CRS, Geod
 
 from curve2flood import LOG
+from curve2flood._ids import as_ids, id_dtype
 from curve2flood._raster import (
+    Grid,
     Read_Raster_GDAL,
     _check_shape,
     open_raster,
@@ -40,9 +42,13 @@ from curve2flood.spreaders import (
     multi_point_interpolation,
     spread_stream_cells,
 )
+from curve2flood.spreaders.fldpln import library_metadata
 from curve2flood.streamcell_values import StreamCellValues
 
 gdal.UseExceptions()
+
+# The most flow events one run maps
+MAX_FLOW_EVENTS = 655
 
 def convert_cell_size(
     d_dem_cell_size_x: float,
@@ -264,47 +270,42 @@ def Curve2Flood(config: Config, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique
             V_Rast,
         )
 
-    (COMID_Unique_TW, COMID_Unique_Depth, TopWidthMax,
-     T_Rast, W_Rast, S_Rast) = Calculate_Depth_TopWidth_TWMax_Velocity(
+    if config.mapper == MULTI_POINT:
+        # It reads its rating curves itself, at its points
+        Flood_array, Depth_array, Slope_array, stats_message = multi_point_interpolation(
+            E=E,
+            B=B,
+            RR=RR,
+            CC=CC,
+            COMID_Unique_Flow=COMID_Unique_Flow,
+            CurveParamFileName=config.print_curve_file,
+            VDTDatabaseFileName=config.print_vdt_database,
+            dx=dx,
+            dy=dy,
+            TopWidthPlausibleLimit=config.topwidthplausiblelimit,
+            Set_Depth=config.set_depth,
+            flood_vdt_cells=flood_vdt_cells,
+            mapper_options=config.multi_point_options,
+            with_depth=bool(config.outdep or config.outwse or config.outvel),
+            with_slope=bool(config.outvel),
+        )
+        LOG.info(stats_message)
+        return Flood_array, Depth_array, Slope_array
+
+    (_, _, TopWidthMax, T_Rast, W_Rast, S_Rast) = Calculate_Depth_TopWidth_TWMax_Velocity(
          config, COMID_Unique_Flow, COMID_Unique,
          T_Rast, W_Rast, S_Rast, quiet, V_Rast)
 
     LOG.info('Creating Rough Flood Map Data...')
 
-    if config.mapper == KERNEL_WEIGHTED:
-        return CreateSimpleKernelFloodMap(config, RR, CC, T_Rast, W_Rast, S_Rast,
-                                          E, nrows, ncols,
-                                          TopWidthMax, dx, dy,
-                                          WeightBox,
-                                          TW_for_WeightBox_ElipseMask,
-                                          flood_vdt_cells,
-                                          V_Rast,
-                                          channel)
-
-    Flood_array, Depth_array, Slope_array, stats_message = multi_point_interpolation(
-        E=E,
-        B=B,
-        RR=RR,
-        CC=CC,
-        T_Rast=T_Rast,
-        W_Rast=W_Rast,
-        S_Rast=S_Rast,
-        COMID_Unique_TW=COMID_Unique_TW,
-        COMID_Unique_Depth=COMID_Unique_Depth,
-        COMID_Unique_Flow=COMID_Unique_Flow,
-        CurveParamFileName=config.print_curve_file,
-        VDTDatabaseFileName=config.print_vdt_database,
-        TW_MultFact=config.tw_multfact,
-        dx=dx,
-        dy=dy,
-        TopWidthPlausibleLimit=config.topwidthplausiblelimit,
-        Set_Depth=config.set_depth,
-        flood_vdt_cells=flood_vdt_cells,
-        mapper_options=config.multi_point_options,
-    )
-    LOG.info(stats_message)
-
-    return Flood_array, Depth_array, Slope_array
+    return CreateSimpleKernelFloodMap(config, RR, CC, T_Rast, W_Rast, S_Rast,
+                                      E, nrows, ncols,
+                                      TopWidthMax, dx, dy,
+                                      WeightBox,
+                                      TW_for_WeightBox_ElipseMask,
+                                      flood_vdt_cells,
+                                      V_Rast,
+                                      channel)
 
 def _check_dem_units(dem_projection: str):
     """Raise a ValueError unless the DEM's coordinate system is in metres or degrees."""
@@ -322,20 +323,36 @@ def _check_dem_units(dem_projection: str):
     if invalid_units:
         raise ValueError(f'The DEM coordinate system must be in metres or degrees, not {", ".join(invalid_units)}.')
 
-def Set_Stream_Locations(nrows: int, ncols: int, infilename: str):
+def Set_Stream_Locations(nrows: int, ncols: int, infilename: str, one_based: bool = False):
     """Stream raster built from the ``Row``, ``Col`` and ``COMID`` columns of a VDT or curve file.
 
-    Cells without a stream are -9999.
+    Cells without a stream are -9999.  The raster is int32 when every COMID
+    fits, and int64 otherwise (see ``id_dtype``).  With ``one_based`` the
+    rows and columns count from 1.  A cell outside the ``nrows`` by
+    ``ncols`` grid raises a ValueError: the table is another DEM's.
     """
-    S = np.full((nrows, ncols), -9999, dtype=np.int32)
     if is_parquet(infilename):
         df = pd.read_parquet(infilename, columns=['Row', 'Col', 'COMID'])
     else:
         df = pd.read_csv(infilename, usecols=['Row', 'Col', 'COMID'])
 
-    S[df['Row'].values, df['Col'].values] = df['COMID'].values
+    rows = df['Row'].to_numpy(np.int64) - int(one_based)
+    cols = df['Col'].to_numpy(np.int64) - int(one_based)
+    check_cells_inside(rows, cols, nrows, ncols, infilename)
+    ids = df['COMID'].to_numpy()
+    S = np.full((nrows, ncols), -9999, dtype=id_dtype(ids))
+    S[rows, cols] = ids
 
     return S
+
+def check_cells_inside(rows: np.ndarray, cols: np.ndarray, nrows: int, ncols: int, table: str):
+    """Raise a ValueError if any of a table's cells ``(rows, cols)`` lies outside the ``nrows`` by ``ncols`` grid."""
+    outside = (rows < 0) | (rows >= nrows) | (cols < 0) | (cols >= ncols)
+    if outside.any():
+        first = int(np.flatnonzero(outside)[0])
+        raise ValueError(f"{int(outside.sum())} of the {rows.size} cells of {table} lie outside the DEM's {nrows} by "
+                         f"{ncols} cells, the first at row {rows[first]}, column {cols[first]}: is it another DEM's, "
+                         f"or do its rows and columns count from 1?")
 
 @njit(cache=True, parallel=True)
 def _positive_cells(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -362,11 +379,38 @@ def _positive_cells(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
     return rows, cols
 
-def _count_flow_events(FlowFileName: str) -> int:
-    """Number of flow events (columns after the COMID column) in a flow file."""
-    if is_parquet(FlowFileName):
-        return pd.read_parquet(FlowFileName).shape[1] - 1
-    return pd.read_csv(FlowFileName, nrows=0).shape[1] - 1
+def check_flow_file(FlowFileName: str) -> int:
+    """The number of flow events in a flow file, after checking it has at least one and at most
+    ``MAX_FLOW_EVENTS``, and no negative flow.  Raises a ValueError otherwise."""
+    table = _scan_table(FlowFileName)
+    events = table.collect_schema().names()[1:]
+    if not events:
+        raise ValueError(f"The flow file {FlowFileName} has no flow events: a column of flows for each after its "
+                         f"COMID column.")
+    
+    if len(events) > MAX_FLOW_EVENTS:
+        raise ValueError(f"The flow file {FlowFileName} has {len(events)} flow events; a run maps at most "
+                         f"{MAX_FLOW_EVENTS}. Split the events between runs.")
+    
+    lowest = table.select(pl.col(events).cast(pl.Float64, strict=False).min()).collect().row(0)
+    negative = [name for name, value in zip(events, lowest) if value is not None and value < 0]
+    if negative:
+        raise ValueError(f"The flow file {FlowFileName} has negative flows in event(s) {', '.join(negative)}.")
+    
+    return len(events)
+
+def _warn_reaches_without_flows(FlowFileName: str, stream_ids: np.ndarray):
+    """Say which reaches with stream cells have no flow in the flow file, and how many of its reaches have no
+    stream cell: the ones without a flow don't flood."""
+    flow_ids = _scan_table(FlowFileName).select(pl.first()).collect().to_series().to_numpy()
+    no_flow = np.setdiff1d(stream_ids, flow_ids)
+    if no_flow.size:
+        LOG.warning(f"{no_flow.size} of the {stream_ids.size} reaches with stream cells have no flow in "
+                    f"{FlowFileName} (such as {', '.join(map(str, no_flow[:5]))}): they don't flood.")
+    no_cells = np.setdiff1d(flow_ids, stream_ids)
+    if no_cells.size:
+        LOG.info(f"{no_cells.size} of the {np.unique(flow_ids).size} reaches of {FlowFileName} have no stream cell "
+                 f"here.")
 
 def FindFlowRateForEachCOMID_Ensemble(FlowFileName: str, flow_event_num: int) -> dict:
     """Return ``{COMID: flow}`` for one flow event.
@@ -375,7 +419,8 @@ def FindFlowRateForEachCOMID_Ensemble(FlowFileName: str, flow_event_num: int) ->
     column of flows per event.  Missing flows are treated as zero.
     """
     if is_parquet(FlowFileName):
-        flow_df = pd.read_parquet(FlowFileName).iloc[:, [0, flow_event_num + 1]]
+        names = _scan_table(FlowFileName).collect_schema().names()
+        flow_df = pd.read_parquet(FlowFileName, columns=[names[0], names[flow_event_num + 1]])
     else:
         flow_df = pd.read_csv(FlowFileName, usecols=[0, flow_event_num + 1])
 
@@ -463,13 +508,15 @@ def spread_flood(
         dy: float,
         dem_projection: str,
         quiet: bool = False,
-        flood_vdt_cells: bool = False):
+        flood_vdt_cells: bool = False,
+        num_flows: int | None = None):
     """Map every flow event and write the flood, depth, WSE and velocity rasters.
 
     Returns the flood raster: 0 is dry, and 1-100 the percentage of flow events
-    that flooded the cell (100 with a single event).  ``E`` is the DEM padded
-    by one cell; the FLDPLN mapper doesn't need it, and reads the DEM for
-    ``OutWSE`` a strip at a time when it is None.
+    that flooded the cell, rounded down (100 with a single event).  ``E`` is
+    the DEM padded by one cell; the FLDPLN mapper doesn't need it, and reads
+    the DEM for ``OutWSE`` a strip at a time when it is None.  ``num_flows``
+    is the flow file's number of events, counted when None.
     """
     set_depth = config.uses_set_depth
     _check_dem_units(dem_projection)
@@ -498,27 +545,29 @@ def spread_flood(
 
     LOG.info("Executing flood mapping logic...")
 
-    # Stream cells come from the stream raster with Set_Depth, otherwise from the VDT or curve file
+    # Stream cells come from the stream raster with Set_Depth, otherwise from the VDT or curve file, whose rows and
+    # columns the multi-point mapper may count from 1
+    one_based = config.mapper == MULTI_POINT and config.mpi_one_based_vdt_rc
     if set_depth:
         S, _, _ = Read_Raster_GDAL(config.stream_file)
         _check_shape(S, (nrows, ncols), "Stream raster")
     elif config.print_vdt_database:
-        S = Set_Stream_Locations(nrows, ncols, config.print_vdt_database)
+        S = Set_Stream_Locations(nrows, ncols, config.print_vdt_database, one_based)
     else:
-        S = Set_Stream_Locations(nrows, ncols, config.print_curve_file)
+        S = Set_Stream_Locations(nrows, ncols, config.print_curve_file, one_based)
 
-    # Where the stream cells are, as indices of the rasters padded by one cell, and their ids as int32.  After this
-    # only whether a cell is a stream cell is needed (S > 0), but for the multi-point mapper's padded stream ids.
-    ids = S if S.dtype == np.int32 else S.astype(np.int32)
+    # Where the stream cells are, as indices of the rasters padded by one cell, and their ids, int32 when they all
+    # fit (see id_dtype).  After this only whether a cell is a stream cell is needed (S > 0), but for the
+    # multi-point mapper's padded stream ids.
+    ids = as_ids(S)
     rows, cols = _positive_cells(ids)
     RR, CC = rows + 1, cols + 1
 
-    COMID_Unique = np.unique(ids[rows, cols]) # Always sorted
-    COMID_Unique = COMID_Unique.astype(int)
+    COMID_Unique = np.unique(ids[rows, cols]).astype(np.int64)  # Always sorted
     B = None
     if config.mapper == MULTI_POINT:
         # It reads them only at the stream cells (see StreamCellValues)
-        B = StreamCellValues(RR * (ncols + 2) + CC, ncols + 2, 0, dtype=np.int32)
+        B = StreamCellValues(RR * (ncols + 2) + CC, ncols + 2, 0, dtype=ids.dtype)
         B.values[:] = ids[rows, cols]
 
     del ids, rows, cols
@@ -530,14 +579,17 @@ def spread_flood(
         COMID_Unique_Flow = {}
     else:
         LOG.info('Opening and Reading ' + config.comid_flow_file)
-        num_flows = _count_flow_events(config.comid_flow_file)
+        if num_flows is None:
+            num_flows = check_flow_file(config.comid_flow_file)
+        _warn_reaches_without_flows(config.comid_flow_file, COMID_Unique)
 
     LOG.info('Evaluating ' + str(num_flows) + ' Flow Events')
 
-    # Create initial rasters once, outside the loop.  The curve-based mappers read them only at the stream cells,
-    # and the FLDPLN mapper writes its slopes only at the VDT's cells, so they keep only those cells' values.
+    # Create initial rasters once, outside the loop.  The kernel-weighted mapper reads them only at the stream
+    # cells, and the FLDPLN mapper writes its slopes only at the VDT's cells, so they keep only those cells' values.
+    # The multi-point mapper reads its rating curves at its own points.
     cells = None
-    if config.mapper in (KERNEL_WEIGHTED, MULTI_POINT):
+    if config.mapper == KERNEL_WEIGHTED:
         cells = (RR - 1) * ncols + (CC - 1)
     elif config.mapper == FLDPLN and config.outvel:
         cells = _vdt_cells(config.print_vdt_database, ncols)
@@ -547,23 +599,22 @@ def spread_flood(
             return StreamCellValues(cells, ncols, value)
         return np.full((nrows, ncols), value, np.float32)
 
-    if config.mapper == FLDPLN:
-        T_Rast = None
-        W_Rast = None
-    else:
+    T_Rast = W_Rast = S_Rast = V_Rast = channel = None
+    if config.mapper == KERNEL_WEIGHTED:
         T_Rast = raster(-1.0)
         W_Rast = raster(np.nan)
 
-    # Stream-cell slopes, only needed for velocity
-    S_Rast = raster(np.nan) if config.outvel else None
-    # With the VDT's valley slopes (ARC's Valley_Sections), the velocity outside the channels takes the valley's slope
-    # rather than the stream's
-    V_Rast = channel = None
-    if S_Rast is not None and config.mapper != MULTI_POINT and has_valley_slopes(config.print_vdt_database):
-        V_Rast = raster(np.nan)
-        channel = channel_cells(config.print_vdt_database, nrows, ncols, dx, dy)
+    if config.outvel and config.mapper != MULTI_POINT:
+        # Stream-cell slopes, only needed for velocity
+        S_Rast = raster(np.nan)
+        # With the VDT's valley slopes (ARC's Valley_Sections), the velocity outside the channels takes the valley's
+        # slope rather than the stream's
+        if has_valley_slopes(config.print_vdt_database):
+            V_Rast = raster(np.nan)
+            channel = channel_cells(config.print_vdt_database, nrows, ncols, dx, dy)
 
-    Flood_Ensemble = np.zeros((nrows, ncols), dtype=np.float16 if num_flows > 1 else np.uint8)  # use uint8 if only one flow, otherwise float16 for percentage calculation
+    # How many events flooded each cell: uint16 holds MAX_FLOW_EVENTS
+    Flood_Ensemble = np.zeros((nrows, ncols), dtype=np.uint16 if num_flows > 1 else np.uint8)
     # The largest depth and slope over the events so far (see accumulate_positive_max)
     Depth_Max = None
     Slope_Max = None
@@ -595,15 +646,47 @@ def spread_flood(
     del W_Rast
     del FlowDir
 
-    return Flood_Ensemble, S, fill_below_dem, channel, S_Rast, V_Rast, Depth_Max, Slope_Max
+    return (_percent_of_events(Flood_Ensemble, num_flows), S, fill_below_dem, channel, S_Rast, V_Rast, Depth_Max,
+            Slope_Max)
+
+@njit(cache=True, parallel=True)
+def _percent_of_events(counts: np.ndarray, num_flows: int) -> np.ndarray:
+    """The percentage of the ``num_flows`` flow events that flooded each cell, from how many did (``counts``),
+    rounded down, as uint8."""
+    percent = np.empty(counts.shape, dtype=np.uint8)
+    for r in prange(counts.shape[0]):
+        for c in range(counts.shape[1]):
+            percent[r, c] = np.int64(counts[r, c]) * 100 // num_flows
+
+    return percent
+
+def run_grid(config: Config) -> Grid:
+    """The grid a run maps on: the DEM's, or for an FLDPLN flood map its library's (see ``library_metadata``) or,
+    for a library that doesn't say, its flow directions'.  The rasters given must all share it."""
+    if not (config.mapper == FLDPLN and config.needs_flood_map):
+        return Grid.of(config.dem_file)
+
+    flow_directions = Grid.of(config.flow_direction_file)
+    metadata = library_metadata(config.fldpln_library)
+    if metadata is None:
+        grid = flow_directions
+    else:
+        grid = Grid(tuple(metadata["geotransform"]), metadata["crs"], metadata["nrows"], metadata["ncols"])
+        grid.check_matches(flow_directions, "The FLDPLN library's grid", "Flow_Direction_File")
+    if config.dem_file:
+        grid.check_matches(Grid.of(config.dem_file), "The FLDPLN grid", "DEM_File")
+    return grid
 
 def Curve2Flood_MainFunction(input_file: str | os.PathLike | Config = None,
                              args: dict | None = None,
                              quiet: bool = False,
                              flood_vdt_cells: bool = True,
-                             bathymetry_creation_options: list[str] | None = None,
-                             **kwargs):
+                             bathymetry_creation_options: list[str] | None = None):
     """Run Curve2Flood: map the flood events and write the requested outputs.
+
+    Before anything is read, every input file must exist and every output's
+    folder must (see ``Config.check_paths``), and the flow file must have at
+    most ``MAX_FLOW_EVENTS`` events and no negative flow.
 
     Parameters
     ----------
@@ -630,12 +713,15 @@ def Curve2Flood_MainFunction(input_file: str | os.PathLike | Config = None,
     else:
         raise ValueError("Provide an input file, a dict of settings or a Config.")
 
-    LOG.info('Opening ' + config.dem_file)
-    ds: gdal.Dataset = open_raster(config.dem_file)
-    dem_geotransform = ds.GetGeoTransform()
-    dem_projection = ds.GetProjection()
-    nrows = ds.RasterYSize
-    ncols = ds.RasterXSize
+    # Everything the run reads and writes, before any of it
+    config.check_paths()
+    num_flows = None
+    if config.needs_flood_map and not config.uses_set_depth:
+        num_flows = check_flow_file(config.comid_flow_file)
+
+    grid = run_grid(config)
+    dem_geotransform, dem_projection = grid.geotransform, grid.projection
+    nrows, ncols = grid.nrows, grid.ncols
     yll = dem_geotransform[3] - nrows * abs(dem_geotransform[5])
     yur = dem_geotransform[3]
 
@@ -644,10 +730,10 @@ def Curve2Flood_MainFunction(input_file: str | os.PathLike | Config = None,
     bathymetry = config.makes_bathymetry
     E = None
     if config.needs_flood_map and config.mapper != FLDPLN:
+        LOG.info('Opening ' + config.dem_file)
         # The DEM padded by one cell of -9999, so neighbour lookups need no bounds checks
         E = np.full((nrows+2, ncols+2), -9999.0, dtype=np.float32)
-        read_into(ds, E[1:-1, 1:-1])
-    ds = None
+        read_into(open_raster(config.dem_file), E[1:-1, 1:-1])
 
     # Cell size from the geotransform; the vector magnitudes also handle rotated grids
     dem_cell_size_x = np.hypot(dem_geotransform[1], dem_geotransform[2])
@@ -656,16 +742,17 @@ def Curve2Flood_MainFunction(input_file: str | os.PathLike | Config = None,
     LOG.info('Cellsize X = ' + str(dx))
     LOG.info('Cellsize Y = ' + str(dy))
 
-    LOG.info('Creating the Weight Box')
     TW_for_WeightBox_ElipseMask = int( max( np.round(config.topwidthplausiblelimit/dx,0), np.round(config.topwidthplausiblelimit/dy,0) ) )  # Half width of the weight box, in cells
-    # Only the kernel-weighted and multi-point mappers spread with it
+    # Only the kernel-weighted mapper spreads with it
     WeightBox = None
-    if config.needs_flood_map and config.mapper != FLDPLN:
+    if config.needs_flood_map and config.mapper == KERNEL_WEIGHTED:
+        LOG.info('Creating the Weight Box')
         WeightBox = create_weightbox(TW_for_WeightBox_ElipseMask, dx, dy)
 
     if config.needs_flood_map:
-        flood_ensemble, S, fill_below_dem, channel, S_Rast, V_Rast, Depth_Max, Slope_Max = spread_flood(config, E, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, dx, dy,
-                               dem_projection, quiet=quiet, flood_vdt_cells=flood_vdt_cells)
+        flood_ensemble, S, fill_below_dem, channel, S_Rast, V_Rast, Depth_Max, Slope_Max = spread_flood(
+            config, E, nrows, ncols, WeightBox, TW_for_WeightBox_ElipseMask, dx, dy, dem_projection, quiet=quiet,
+            flood_vdt_cells=flood_vdt_cells, num_flows=num_flows)
         main_flood_ouputs(flood_ensemble, fill_below_dem, S, S_Rast, V_Rast, Depth_Max, Slope_Max, channel, config, E, nrows, ncols, dem_projection, dem_geotransform)
 
     if bathymetry:

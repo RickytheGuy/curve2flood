@@ -8,15 +8,15 @@ periods. Curve2Flood maps each event, then combines them.
 
 ## Flood extent
 
-`OutFLD`: 8-bit whole numbers. 0 is dry. With one flow event a flooded cell is 100; with several, a cell holds the rounded percentage of the events that flooded it.
+`OutFLD`: 8-bit whole numbers. 0 is dry. With one flow event a flooded cell is 100; with several, a cell holds the percentage of the events that flooded it, rounded down. A run maps at most 655 events.
 
 Each event's map, and the combined map, keeps only the flooded patches that touch a stream cell. A patch is a group of
 flooded cells joined through any of their 8 neighbours. With `Flood_WaterLC_and_STRM_Cells`, the stream cells and the
 land cover's water cells are flooded in the combined map, and with `Flood_Bathy_Mask`, the cells of
 `BathyWaterMask`.
 
-With `Make_Output_GPKG`, the extent is also written as polygons, to a GeoPackage named like
-`OutFLD` with a `.gpkg` extension. Each polygon's `Value` is the extent raster's value.
+With `Make_Output_GPKG`, the extent is also written as polygons, to a GeoPackage beside `OutFLD`, its name with a
+`.gpkg` extension instead of its own (`flood.tif` gives `flood.gpkg`). Each polygon's `Value` is the extent raster's value.
 
 ## Depth
 
@@ -37,7 +37,8 @@ $$
 V = \frac{1}{n} \, D^{2/3} \, S^{1/2}
 $$
 
-where $n$ is the cell's Manning's n from its land cover (`LU_Manning_n`), and $S$ the stream's slope from the rating
+where $n$ is the cell's Manning's n from its land cover (`LU_Manning_n`; 0.035 for land cover the table doesn't
+list, no-data among it), and $S$ the stream's slope from the rating
 curves. Each mapper spreads the stream cells' slopes over the flood as it spreads their water: the kernel-weighted
 mapper with the same weights, the multi-point mapper by interpolation, and the FLDPLN mapper by giving each flooded
 cell its nearest stream cell's slope, averaged over the 3 x 3 cells around it. A cell takes the steepest slope of the

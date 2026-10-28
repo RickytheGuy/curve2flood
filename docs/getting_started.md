@@ -1,6 +1,6 @@
 # Getting Started
 
-Curve2Flood typically reads its settings from an input file: a YAML file, or a text file with a key and its value on each line. ARC's model input file works too: Curve2Flood ignores ARC's keys, so one file can drive both. [Input File](input_file.md) describes all the keys.
+Curve2Flood typically reads its settings from an input file: a YAML file, or a text file with a key and its value on each line. [Input File](input_file.md) describes all the keys.
 
 A minimal input file maps one or more flow events with the default mapper:
 

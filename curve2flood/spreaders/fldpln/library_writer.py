@@ -1,7 +1,8 @@
+import json
 import os
-from pathlib import Path
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -22,6 +23,30 @@ DECIMAL_COLS = {"DTF": pa.decimal32(5, 2), "fill": pa.decimal32(7, 2)}
 # save_library.
 _LIBRARY_SLICE_ROWS = 1 << 20
 
+# The key of a Parquet library's metadata (see library_metadata)
+METADATA_KEY = b"curve2flood:fldpln_library"
+# The version of that metadata's layout
+METADATA_VERSION = 1
+
+
+def library_metadata(path: str | os.PathLike) -> dict | None:
+    """What a Parquet library says about itself, or None for a CSV library or one built before it said anything.
+
+    ``nrows``, ``ncols``, ``geotransform`` and ``crs`` (WKT) are the grid
+    its pixel ids number, so a flood map needs no DEM to know where it is;
+    ``cell_size_m`` is its cells' size in metres, ``build`` the build's
+    settings and ``curve2flood`` the version that built it.
+    """
+    if not is_parquet(path):
+        return None
+    
+    metadata = pq.read_schema(path).metadata or {}
+    if METADATA_KEY not in metadata:
+        return None
+    
+    return json.loads(metadata[METADATA_KEY])
+
+
 class LibraryWriter:
     """Writes a library a part at a time: Parquet as ``save_library`` saves it, in row groups of
     ``_LIBRARY_SLICE_ROWS`` rows whatever the parts' sizes, or CSV.
@@ -31,13 +56,17 @@ class LibraryWriter:
     library that looks finished.  ``parquet`` is from ``path``'s suffix when
     None.  With ``background``, ``write_later`` makes and writes the rows in
     a thread of the writer's own, at most ``_WRITES_AHEAD`` parts behind.
+    ``metadata`` (see ``library_metadata``) is stored in a Parquet library;
+    a CSV library has nowhere to keep it.
     """
 
-    def __init__(self, path: str | os.PathLike, parquet: bool | None = None, background: bool = False):
+    def __init__(self, path: str | os.PathLike, parquet: bool | None = None, background: bool = False,
+                 metadata: dict | None = None):
         self.path = Path(path)
         self._thread = ThreadPoolExecutor(1) if background else None
         self._queued = deque()
         self.parquet = is_parquet(self.path) if parquet is None else parquet
+        self._metadata = None if metadata is None else {METADATA_KEY: json.dumps(metadata).encode()}
         self._partial = self.path.with_name(self.path.name + ".partial")
         self._begun = False
         self._writer = None
@@ -123,6 +152,9 @@ class LibraryWriter:
             else:
                 arrays[c] = pa.array(values)
         table = pa.table(arrays)
+        if self._metadata is not None:
+            table = table.replace_schema_metadata(self._metadata)
+            
         if not self._begun:
             encoding = {"FPP": "DELTA_BINARY_PACKED"} | {c: "BYTE_STREAM_SPLIT" for c in DECIMAL_COLS if c in part}
             self._writer = pq.ParquetWriter(

@@ -1,5 +1,6 @@
 """Reading rasters with GDAL, and the threads it compresses and decompresses them with."""
 import contextlib
+from dataclasses import dataclass
 
 import numpy as np
 from osgeo import gdal
@@ -73,6 +74,31 @@ def _check_shape(array: np.ndarray, shape: tuple, name: str):
     """Raise a ValueError if a raster's shape differs from the DEM's."""
     if array.shape != shape:
         raise ValueError(f"{name} dimensions ({array.shape[1]}x{array.shape[0]}) do not match the DEM ({shape[1]}x{shape[0]}).")
+
+
+@dataclass(frozen=True)
+class Grid:
+    """Where a raster's cells are: its geotransform, its coordinate system (WKT) and its size."""
+    geotransform: tuple[float, float, float, float, float, float]
+    projection: str
+    nrows: int
+    ncols: int
+
+    @classmethod
+    def of(cls, path: str) -> "Grid":
+        """A raster's grid, from its header alone."""
+        ds = open_raster(path)
+        return cls(tuple(ds.GetGeoTransform()), ds.GetProjection(), ds.RasterYSize, ds.RasterXSize)
+
+    def check_matches(self, other: "Grid", name: str, other_name: str):
+        """Raise a ValueError unless ``other`` has the same size and geotransform, to a millionth of a cell."""
+        if (self.nrows, self.ncols) != (other.nrows, other.ncols):
+            raise ValueError(f"{name} is {self.nrows} by {self.ncols} cells, but {other_name} is {other.nrows} by "
+                             f"{other.ncols}.")
+        tolerance = 1e-6 * max(abs(v) for v in self.geotransform[1:3] + self.geotransform[4:6])
+        if not np.allclose(self.geotransform, other.geotransform, rtol=0.0, atol=tolerance):
+            raise ValueError(f"{name}'s geotransform {self.geotransform} isn't {other_name}'s {other.geotransform}: "
+                             f"they cover different ground.")
 
 
 def Read_Raster_GDAL(InRAST_Name):

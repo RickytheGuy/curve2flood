@@ -25,7 +25,9 @@
 ## Rasters
 
 - Every raster must be on the DEM's grid: the same rows and columns. The VDT database's and curve file's `Row` and
-  `Col` are rows and columns of that grid, counted from 0.
+  `Col` are rows and columns of that grid, counted from 0; a cell outside it stops the run.
+- Reach IDs are kept as 32-bit integers when every one fits, which halves the rasters of them, and as 64-bit ones
+  otherwise.
 - The DEM's coordinates must be in metres or degrees, and its elevations in metres. Other units stop the run.
 - DEM cells at or below -9998 are no-data. They never flood.
 - The mappers work on a copy of the DEM with a one-cell border of no-data around it, so that a stream cell's
@@ -45,7 +47,9 @@ cell's values are:
   The WSE is kept at or above `Elev`, and the depth, the WSE less `Elev`, at least 1 mm;
 - the largest flow's values, when $Q$ is above every flow in the table.
 
-The top width is then raised to at least the top width at baseflow, and multiplied by `TW_MultFact`. Within each
+The top width is then raised to at least the top width at baseflow, and multiplied by `TW_MultFact` (for the
+kernel-weighted mapper; the multi-point mapper reads the rating curves at its own points, see
+[Multi-Point Interpolation Mapper](multi_point.md)). Within each
 reach, the cells below the 1st or above the 99th percentile of top width or velocity are left
 out as outliers.
 
@@ -67,6 +71,6 @@ When both are given, the VDT database is used. The FLDPLN mapper needs it.
 
 `COMID_Flow_File` has the reach ID in its first column and one column of flows (m³/s) per event. Each event is mapped
 on its own, and the maps are combined (step 5). An empty flow counts as zero, and a reach missing from the file isn't
-mapped.
+mapped. A run maps at most 655 events, and a negative flow stops it.
 
 With `Set_Depth`, there are no flows: every stream cell floods to that depth above the DEM, once.

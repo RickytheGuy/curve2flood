@@ -663,8 +663,21 @@ def test_library_fill_is_the_filled_dem_above_the_dem(tmp_path):
 
 
 def test_library_needs_the_dem_on_the_same_grid(tmp_path):
-    with pytest.raises(ValueError, match="The DEM has shape"):
+    with pytest.raises(ValueError, match="The filled DEM is .* cells, but the DEM is 5 by 5"):
         _slope_library(tmp_path, "bad", dem=np.zeros((5, 5), np.float32))
+
+
+def test_library_says_where_its_grid_is(tmp_path):
+    """A library records its grid, so that a flood map needs no DEM to place it, and how it was built."""
+    _slope_library(tmp_path, "described")
+    metadata = F.library_metadata(tmp_path / "described.parquet")
+    fil = _slope()[0]
+    assert (metadata["nrows"], metadata["ncols"]) == fil.shape
+    assert metadata["geotransform"] == [0.0, 1.0, 0.0, 0.0, 0.0, 1.0]  # GDAL's for a raster without one
+    assert metadata["cell_size_m"] == [1.0, 1.0] and metadata["version"] == 1
+    assert metadata["build"]["fldmx"] == 1.0 and metadata["build"]["solver"] == "iterative"
+    # A CSV library has nowhere to keep it
+    assert F.library_metadata(tmp_path / "library.csv") is None
 
 
 # --------------------------------------------------------------------------

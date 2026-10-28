@@ -1,5 +1,8 @@
 """Small tests of the Curve2Flood driver: running it, input files and raster helpers."""
 
+import logging
+import sys
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -7,16 +10,19 @@ from osgeo import gdal, osr
 from scipy.ndimage import generate_binary_structure, label, uniform_filter
 
 from curve2flood import (
+    LOG,
     Config,
     Curve2Flood_MainFunction,
+    _ids,
     _raster,
+    cli,
     bathymetry,
     core,
     outputs,
     rating_curves,
     remove_cells_not_connected,
 )
-from curve2flood.spreaders import fldpln
+from curve2flood.spreaders import fldpln, multi_point
 
 gdal.UseExceptions()
 
@@ -31,9 +37,9 @@ def test_main_function_needs_settings():
 
 
 def test_main_function_reports_a_missing_dem(tmp_path):
-    with pytest.raises(RuntimeError):
+    with pytest.raises(FileNotFoundError, match="DEM_File .*missing.tif doesn't exist"):
         Curve2Flood_MainFunction(args={"DEM_File": str(tmp_path / "missing.tif")})
-    with pytest.raises(RuntimeError):
+    with pytest.raises(FileNotFoundError, match="DEM_File"):
         Curve2Flood_MainFunction(Config(dem_file=str(tmp_path / "missing.tif")))
 
 
@@ -49,7 +55,7 @@ def test_flow_file_events(tmp_path, suffix):
         flows.to_csv(path, index=False)
     else:
         flows.to_parquet(path)
-    assert core._count_flow_events(str(path)) == 2
+    assert core.check_flow_file(str(path)) == 2
     assert core.FindFlowRateForEachCOMID_Ensemble(str(path), 0) == {11: 5.0, 12: 0.0}  # missing flows are zero
     assert core.FindFlowRateForEachCOMID_Ensemble(str(path), 1) == {11: 7.0, 12: 8.0}
 
@@ -60,13 +66,21 @@ def test_set_stream_locations(tmp_path):
     assert core.Set_Stream_Locations(3, 2, str(path)).tolist() == [[-9999, 7], [-9999, -9999], [8, -9999]]
 
 
+def _manning_n(path, land_cover):
+    """Each cell's Manning's n from the table at ``path``, warning of the land cover it doesn't list."""
+    unlisted = set()
+    n = outputs._manning_n(land_cover, outputs._manning_lookup(str(path)), unlisted)
+    outputs._warn_unlisted_land_cover(unlisted, str(path))
+    return n
+
+
 def test_read_manning_table(tmp_path):
     path = tmp_path / "manning.txt"
     path.write_text("LC_ID\tDescription\tManning_n\n10\tTrees\t0.12\n80\tWater\t0.03\n")
     land_cover = np.array([[10, 80], [80, 10]])
-    assert np.allclose(outputs.read_manning_table(str(path), land_cover), [[0.12, 0.03], [0.03, 0.12]])
+    assert np.allclose(_manning_n(path, land_cover), [[0.12, 0.03], [0.03, 0.12]])
     # A float land cover raster is truncated to its codes, and the values are the float64 table's, in float32
-    n = outputs.read_manning_table(str(path), np.array([[10.0, 80.7]], np.float32))
+    n = _manning_n(path, np.array([[10.0, 80.7]], np.float32))
     assert n.dtype == np.float32 and n.tolist() == [[np.float32(0.12), np.float32(0.03)]]
 
 
@@ -281,7 +295,8 @@ def test_the_patches_kept_are_scipy_s_labels_touching_a_stream(dtype):
 def test_create_positive_max_array():
     a = np.array([[1.0, np.nan, -2.0]], np.float32)
     b = np.array([[3.0, np.nan, 0.0]], np.float32)
-    assert np.allclose(outputs.create_positive_max_array([a, b]), [[3.0, np.nan, np.nan]], equal_nan=True)
+    maximum = outputs.accumulate_positive_max(outputs.accumulate_positive_max(None, a), b)
+    assert np.allclose(outputs.finish_positive_max(maximum), [[3.0, np.nan, np.nan]], equal_nan=True)
 
 
 def test_positive_max_is_folded_in_an_event_at_a_time():
@@ -313,12 +328,16 @@ def test_flood_bathy_mask_cells():
     assert outputs.Flood_Bathy_Mask_in_Flood_Map(flood, mask).tolist() == [[100, 100, 0], [0, 0, 100]]
 
 
+# The grid of every raster _write writes: 30 m cells in UTM zone 15N
+_GEOTRANSFORM = (500000.0, 30.0, 0.0, 4500000.0, 0.0, -30.0)
+_SRS = osr.SpatialReference()
+_SRS.ImportFromEPSG(32615)
+
+
 def _write(path, array, data_type):
-    srs = osr.SpatialReference()
-    srs.ImportFromEPSG(32615)
     ds = gdal.GetDriverByName("GTiff").Create(str(path), array.shape[1], array.shape[0], 1, data_type)
-    ds.SetGeoTransform((500000.0, 30.0, 0.0, 4500000.0, 0.0, -30.0))
-    ds.SetProjection(srs.ExportToWkt())
+    ds.SetGeoTransform(_GEOTRANSFORM)
+    ds.SetProjection(_SRS.ExportToWkt())
     ds.GetRasterBand(1).WriteArray(array)
     ds = None
 
@@ -346,11 +365,12 @@ def test_the_bathymetry_water_mask_is_flooded_with_flood_bathy_mask(tmp_path, fl
     assert (flood[7, 14:17] > 0).all() == flood_mask
 
 
-def _fldpln_depth(tmp_path, vdt_columns=None, **inputs):
+def _fldpln_depth(tmp_path, vdt_columns=None, library_metadata=None, with_dem=True, **inputs):
     """A stream along the middle row of a 3x5 grid, flowing east, 1.5 m deep (WSE 101.5 over a 100 m Elev, with no
     fill), mapped with the FLDPLN mapper and these extra inputs, from tables that all end in .pq; the depth raster.
     Its own cells flood 1.4 m deep, the cell above its first pixel 1.3 m, and the cell below its last, with a DTF of
-    1.8 m, stays dry. ``vdt_columns`` are added to its VDT database."""
+    1.8 m, stays dry. ``vdt_columns`` are added to its VDT database, and ``library_metadata`` to its library.
+    Without ``with_dem`` the run isn't given the DEM."""
     _write(tmp_path / "dem.tif", np.full((3, 5), 100.0, np.float32), gdal.GDT_Float32)
     flow_direction = np.zeros((3, 5), np.uint8)
     flow_direction[1, :4] = 2  # Whitebox east
@@ -364,16 +384,21 @@ def _fldpln_depth(tmp_path, vdt_columns=None, **inputs):
     fsp = np.array([5, 6, 7, 8, 9, 5, 9], np.int32)
     fldpln.library.save_library({"FSP": fsp, "FPP": np.array([5, 6, 7, 8, 9, 0, 14], np.int32),
                          "DTF": np.array([0.1] * 5 + [0.2, 1.8], np.float32), "segment": np.zeros(7, np.int32),
-                         "fill": np.zeros(7, np.float32)}, tmp_path / "library.pq")
+                         "fill": np.zeros(7, np.float32)}, tmp_path / "library.pq", metadata=library_metadata)
 
+    _rerun_fldpln(tmp_path, with_dem, OutDEP=tmp_path / "depth.tif", **inputs)
+    return gdal.Open(str(tmp_path / "depth.tif")).ReadAsArray()
+
+
+def _rerun_fldpln(tmp_path, with_dem=True, **inputs):
+    """Map ``_fldpln_depth``'s inputs, which it made, again, with these inputs."""
     Curve2Flood_MainFunction(args={
-        "DEM_File": tmp_path / "dem.tif", "Print_VDT_Database": tmp_path / "vdt.pq",
+        "Print_VDT_Database": tmp_path / "vdt.pq",
         "COMID_Flow_File": tmp_path / "flows.pq", "mapper": "Curve2Flood-FLDPLNpy",
         "Flow_Direction_File": tmp_path / "flowdir.tif", "Stream_Info_File": tmp_path / "stream_info.pq",
-        "FLDPLN_Library": tmp_path / "library.pq", "OutDEP": tmp_path / "depth.tif", "Make_Output_GPKG": False,
-        **inputs,
+        "FLDPLN_Library": tmp_path / "library.pq", "Make_Output_GPKG": False,
+        **({"DEM_File": tmp_path / "dem.tif"} if with_dem else {}), **inputs,
     }, quiet=True)
-    return gdal.Open(str(tmp_path / "depth.tif")).ReadAsArray()
 
 
 def test_the_fldpln_mapper_floods_only_from_its_minimum_depth(tmp_path):
@@ -652,3 +677,235 @@ def test_the_fldpln_water_surface_is_measured_from_below_raised_bathymetry():
     dem = np.array([[103.0, 98.0, 100.0]], dtype=np.float32)       # raised 3 m, burned 2 m, not in the library
     below = np.array([[-3.0, 0.0, np.nan]], dtype=np.float32)      # min(fill, 0), as the mapper writes it
     np.testing.assert_allclose(outputs.water_surface(depth, dem, below), [[101.0, 99.0, 101.0]])
+
+
+# --------------------------------------------------------------------------
+# Flow events, stream cells and the grid
+# --------------------------------------------------------------------------
+
+def test_each_cell_floods_in_the_percentage_of_the_events_that_flood_it(tmp_path):
+    """Three events: at 15 m3/s the cell above the stream floods, at 1.5 m3/s only the stream's own cells do (0.15 m
+    of water over their DTF of 0.1 m, and short of that cell's 0.2 m), so it floods in a third of them, rounded
+    down. The depth is the deepest of the events'."""
+    _fldpln_depth(tmp_path)
+    pd.DataFrame({"COMID": [1], "q_a": [15.0], "q_b": [1.5], "q_c": [1.5]}).to_parquet(tmp_path / "flows.pq")
+    _rerun_fldpln(tmp_path, OutFLD=tmp_path / "flood.tif", OutDEP=tmp_path / "depth.tif")
+    flood = gdal.Open(str(tmp_path / "flood.tif")).ReadAsArray()
+    assert flood[1].tolist() == [100] * 5
+    assert flood[0, 0] == 33 and flood.sum() == 5 * 100 + 33
+    assert gdal.Open(str(tmp_path / "depth.tif")).ReadAsArray()[0, 0] == pytest.approx(1.3)
+
+
+def test_a_flow_file_has_at_most_655_events_and_no_negative_flow(tmp_path):
+    path = tmp_path / "flows.csv"
+    pd.DataFrame(np.ones((2, 657)), columns=["COMID"] + [f"q{i}" for i in range(656)]).to_csv(path, index=False)
+    with pytest.raises(ValueError, match="656 flow events; a run maps at most 655"):
+        core.check_flow_file(str(path))
+    pd.DataFrame({"COMID": [1, 2], "q1": [5.0, 1.0], "q2": [3.0, -1.0]}).to_csv(path, index=False)
+    with pytest.raises(ValueError, match=r"negative flows in event\(s\) q2"):
+        core.check_flow_file(str(path))
+    pd.DataFrame({"COMID": [1, 2], "q1": [5.0, 1.0], "q2": [3.0, np.nan]}).to_csv(path, index=False)
+    assert core.check_flow_file(str(path)) == 2
+    pd.DataFrame({"COMID": [1, 2]}).to_csv(path, index=False)
+    with pytest.raises(ValueError, match="has no flow events"):
+        core.check_flow_file(str(path))
+
+
+def test_reaches_without_a_flow_are_named(tmp_path, caplog):
+    path = tmp_path / "flows.csv"
+    pd.DataFrame({"COMID": [1, 3], "q": [1.0, 2.0]}).to_csv(path, index=False)
+    with caplog.at_level(logging.WARNING, logger=LOG.name):
+        core._warn_reaches_without_flows(str(path), np.array([1, 2], np.int64))
+    assert "1 of the 2 reaches with stream cells have no flow" in caplog.text and "(such as 2)" in caplog.text
+
+
+def test_stream_cells_must_lie_on_the_dem(tmp_path):
+    path = tmp_path / "vdt.csv"
+    pd.DataFrame({"COMID": [7, 8], "Row": [1, 3], "Col": [1, 2]}).to_csv(path, index=False)
+    with pytest.raises(ValueError, match="1 of the 2 cells .* lie outside the DEM's 3 by 2 cells, the first at row 3"):
+        core.Set_Stream_Locations(3, 2, str(path))
+    # Counted from 1, they lie on it
+    assert core.Set_Stream_Locations(3, 2, str(path), one_based=True).tolist() == [[7, -9999], [-9999, -9999],
+                                                                                   [-9999, 8]]
+
+
+def test_stream_ids_that_do_not_fit_in_int32_are_kept_whole(tmp_path):
+    path = tmp_path / "vdt.csv"
+    big = 55000400012345  # an NHDPlus HR id
+    pd.DataFrame({"COMID": [7, big], "Row": [0, 1], "Col": [0, 0]}).to_csv(path, index=False)
+    streams = core.Set_Stream_Locations(2, 1, str(path))
+    assert streams.dtype == np.int64 and streams[1, 0] == big
+    pd.DataFrame({"COMID": [7, 2**31 - 1], "Row": [0, 1], "Col": [0, 0]}).to_csv(path, index=False)
+    assert core.Set_Stream_Locations(2, 1, str(path)).dtype == np.int32
+
+
+@pytest.mark.parametrize(("ids", "dtype"), [([1, 2**31 - 1], np.int32), ([-2**31, 5], np.int32), ([2**31], np.int64),
+                                            ([], np.int32), (np.array([200], np.uint8), np.int32),
+                                            (np.array([5.0, 2.0**40]), np.int64)])
+def test_ids_are_int32_when_they_fit(ids, dtype):
+    assert _ids.id_dtype(np.asarray(ids)) == dtype
+
+
+def test_an_fldpln_flood_map_takes_its_grid_from_its_library(tmp_path):
+    """Without a DEM the library's metadata places the flood map, and a library made for other ground is refused."""
+    metadata = {"version": 1, "nrows": 3, "ncols": 5, "geotransform": list(_GEOTRANSFORM), "crs": _SRS.ExportToWkt(),
+                "cell_size_m": [30.0, 30.0]}
+    depth = _fldpln_depth(tmp_path, library_metadata=metadata, with_dem=False)
+    assert depth[1].tolist() == pytest.approx([1.4] * 5)
+    assert gdal.Open(str(tmp_path / "depth.tif")).GetGeoTransform() == _GEOTRANSFORM
+
+    shifted = {**metadata, "geotransform": [500030.0, *_GEOTRANSFORM[1:]]}
+    with pytest.raises(ValueError, match="cover different ground"):
+        _fldpln_depth(tmp_path, library_metadata=shifted, with_dem=False)
+
+
+def test_an_fldpln_library_without_metadata_takes_the_flow_directions_grid(tmp_path):
+    depth = _fldpln_depth(tmp_path, with_dem=False)
+    assert depth[1].tolist() == pytest.approx([1.4] * 5)
+    assert gdal.Open(str(tmp_path / "depth.tif")).GetGeoTransform() == _GEOTRANSFORM
+
+
+def test_land_cover_the_manning_table_does_not_list_takes_0_035(tmp_path, caplog):
+    path = tmp_path / "manning.txt"
+    path.write_text("LC_ID\tDescription\tManning_n\n10\tTrees\t0.12\n80\tWater\t0.03\n")
+    n = outputs.DEFAULT_MANNING_N
+    assert n == 0.035
+    with caplog.at_level(logging.WARNING, logger=LOG.name):
+        # 20 isn't in the table, 255 is the no-data of a byte raster
+        lookup = _manning_n(path, np.array([[10, 20], [255, 80]], np.uint8))
+    assert lookup.tolist() == [[np.float32(0.12), np.float32(n)], [np.float32(n), np.float32(0.03)]]
+    assert "(20, 255)" in caplog.text
+    assert _manning_n(path, np.array([[-9999, 80]], np.int32)).tolist() == [
+        [np.float32(n), np.float32(0.03)]]
+    assert _manning_n(path, np.array([[np.nan, 10.0]], np.float32)).tolist() == [
+        [np.float32(n), np.float32(0.12)]]
+
+
+def _valley(tmp_path, comid=1, flows=None, **vdt_columns):
+    """A valley whose stream runs east along row 10 of a 21 x 20 grid of 30 m cells, cells 2 to 17, its sides
+    rising 0.5 m a cell, and the inputs to map it: at 14 m3/s the VDT gives a water surface of 101.4 m (clear of
+    the ground's contours) and a top width of 122 m, so rows 8 to 12 flood. ``flows`` are the flow file's, by
+    reach."""
+    rows, _ = np.mgrid[0:21, 0:20]
+    _write(tmp_path / "dem.tif", (100.0 + 0.5 * np.abs(rows - 10)).astype(np.float32), gdal.GDT_Float32)
+    vdt = pd.DataFrame({"COMID": comid, "Row": 10, "Col": range(2, 18), "Elev": 100.0, "QBaseflow": 5.0,
+                        "Slope": 0.001, "XS_Angle": np.pi / 2, "q_1": 10.0, "q_2": 20.0, "t_1": 70.0, "t_2": 200.0,
+                        "wse_1": 101.0, "wse_2": 102.0, "v_1": 1.0, "v_2": 2.0, **vdt_columns})
+    vdt.to_parquet(tmp_path / "vdt.parquet")
+    flows = flows or {comid: 14.0}
+    pd.DataFrame({"COMID": list(flows), "q": list(flows.values())}).to_csv(tmp_path / "flows.csv", index=False)
+    return {"DEM_File": tmp_path / "dem.tif", "Print_VDT_Database": tmp_path / "vdt.parquet",
+            "COMID_Flow_File": tmp_path / "flows.csv", "Make_Output_GPKG": False, "TW_MultFact": 1.0}
+
+
+def _read(path):
+    return gdal.Open(str(path)).ReadAsArray()
+
+
+@pytest.mark.parametrize("mapper", ["Curve2Flood-Kernel Weighted", "Curve2Flood-Multi-Point Interpolation"])
+def test_a_run_keeps_reach_ids_that_do_not_fit_in_int32(tmp_path, mapper):
+    inputs = _valley(tmp_path, comid=55000400012345)
+    Curve2Flood_MainFunction(args={**inputs, "mapper": mapper, "OutFLD": tmp_path / "flood.tif"}, quiet=False)
+    flood = _read(tmp_path / "flood.tif")
+    assert (flood[8:13, 4:16] == 100).all() and not flood[:7].any() and not flood[14:].any()
+
+
+def test_the_multi_point_mapper_floods_the_valley(tmp_path):
+    """Its points carry the VDT's water surface across the corridor (one top width around them), and every cell
+    below it there floods, as deep as the water is over the ground."""
+    inputs = _valley(tmp_path)
+    Curve2Flood_MainFunction(args={**inputs, "mapper": "Curve2Flood-Multi-Point Interpolation",
+                                   "OutFLD": tmp_path / "flood.tif", "OutDEP": tmp_path / "depth.tif"}, quiet=True)
+    flood, depth = _read(tmp_path / "flood.tif"), _read(tmp_path / "depth.tif")
+    rows = np.arange(21)
+    assert (flood[8:13, 2:18] == 100).all() and not flood[(rows < 8) | (rows > 12)].any()
+    np.testing.assert_allclose(depth[8:13, 5], [0.4, 0.9, 1.4, 0.9, 0.4], atol=1e-4)
+
+
+@pytest.mark.parametrize("curves", ["vdt", "curve file"])
+def test_the_multi_point_mapper_ignores_tw_multfact(tmp_path, curves):
+    """TW_MultFact is the kernel-weighted mapper's: the multi-point mapper sizes its corridor from the rating curves'
+    own top widths, with its MPI factors. At 0.1 its corridor would reach no cell but the stream's own."""
+    inputs = _valley(tmp_path)
+    if curves == "curve file":
+        _constant_curves(tmp_path / "curves.csv")
+        inputs = {**{k: v for k, v in inputs.items() if k != "Print_VDT_Database"},
+                  "Print_Curve_File": tmp_path / "curves.csv"}
+    floods = []
+    for factor in (0.1, 1.0, 6.0):
+        Curve2Flood_MainFunction(args={**inputs, "TW_MultFact": factor, "mapper": "Curve2Flood-Multi-Point Interpolation",
+                                       "OutFLD": tmp_path / f"flood_{factor}.tif"}, quiet=True)
+        floods.append(_read(tmp_path / f"flood_{factor}.tif"))
+    assert (floods[0][8:13, 4:16] == 100).all()
+    assert all(np.array_equal(flood, floods[0]) for flood in floods[1:])
+
+
+def _constant_curves(path):
+    """``_valley``'s rating curves as a curve file of power laws, constant: 1.4 m deep and 122 m wide at any flow."""
+    pd.DataFrame({"COMID": 1, "Row": 10, "Col": range(2, 18), "BaseElev": 100.0, "QMax": 30.0, "Slope": 0.001,
+                  "XS_Angle": np.pi / 2, "depth_a": 1.4, "depth_b": 0.0, "tw_a": 122.0, "tw_b": 0.0, "vel_a": 1.0,
+                  "vel_b": 0.0}).to_csv(path, index=False)
+
+
+def test_the_multi_point_mapper_never_floods_no_data(tmp_path):
+    inputs = _valley(tmp_path)
+    dem = _read(tmp_path / "dem.tif")
+    dem[9, 5] = -9999.0
+    _write(tmp_path / "dem.tif", dem, gdal.GDT_Float32)
+    Curve2Flood_MainFunction(args={**inputs, "mapper": "Curve2Flood-Multi-Point Interpolation",
+                                   "OutFLD": tmp_path / "flood.tif", "OutDEP": tmp_path / "depth.tif"}, quiet=True)
+    flood, depth = _read(tmp_path / "flood.tif"), _read(tmp_path / "depth.tif")
+    assert flood[9, 5] == 0 and flood[9, 6] == 100
+    assert depth.max() < 2.0
+
+
+def test_the_multi_point_mapper_floods_the_stream_cells_of_reaches_without_flow(tmp_path):
+    """As the other mappers do: a second reach up the valley side, with no flow, floods its stream cells alone."""
+    inputs = _valley(tmp_path, flows={1: 14.0, 2: 0.0})
+    vdt = pd.read_parquet(tmp_path / "vdt.parquet")
+    pd.concat([vdt, vdt.assign(COMID=2, Row=3, Elev=103.5)], ignore_index=True).to_parquet(tmp_path / "vdt.parquet")
+    Curve2Flood_MainFunction(args={**inputs, "mapper": "Curve2Flood-Multi-Point Interpolation",
+                                   "OutFLD": tmp_path / "flood.tif"}, quiet=True)
+    flood = _read(tmp_path / "flood.tif")
+    assert (flood[3, 2:18] == 100).all() and not flood[[2, 4]].any()
+
+
+def test_reaches_without_a_flow_above_0_have_no_points(tmp_path):
+    _valley(tmp_path)
+    scenario = multi_point.build_fhs_scenario_dataframe_from_vdt(str(tmp_path / "vdt.parquet"), {1: 0.0})
+    assert scenario.empty
+    scenario = multi_point.build_fhs_scenario_dataframe_from_vdt(str(tmp_path / "vdt.parquet"), {1: 15.0})
+    assert scenario["TopWidth_m"].tolist() == pytest.approx([135.0] * 16)
+    assert scenario["WaterSurfaceElev_m"].tolist() == pytest.approx([101.5] * 16)
+
+
+@pytest.mark.parametrize("mapper", ["Curve2Flood-Kernel Weighted", "Curve2Flood-Multi-Point Interpolation"])
+def test_a_curve_file_maps_as_the_vdt_does(tmp_path, mapper):
+    """The curve file's power laws, constant here: 1.4 m deep and 122 m wide at any flow, over a 100 m bed."""
+    inputs = _valley(tmp_path)
+    _constant_curves(tmp_path / "curves.csv")
+    del inputs["Print_VDT_Database"]
+    Curve2Flood_MainFunction(args={**inputs, "Print_Curve_File": tmp_path / "curves.csv", "mapper": mapper,
+                                   "OutFLD": tmp_path / "flood.tif"}, quiet=True)
+    flood = _read(tmp_path / "flood.tif")
+    assert (flood[8:13, 4:16] == 100).all() and not flood[:7].any() and not flood[14:].any()
+
+
+@pytest.fixture
+def log_level():
+    """Put the logger's level back after a test that sets it."""
+    levels = LOG.level, LOG.handlers[0].level
+    yield
+    LOG.setLevel(levels[0])
+    LOG.handlers[0].setLevel(levels[1])
+
+
+def test_the_command_line_maps_an_input_file(tmp_path, monkeypatch, log_level):
+    inputs = _valley(tmp_path)
+    config = tmp_path / "input.yaml"
+    config.write_text("".join(f"{key}: {value}\n" for key, value in
+                              {**inputs, "OutFLD": tmp_path / "flood.tif"}.items()), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["curve2flood", str(config), "-l", "error"])
+    cli.main()
+    assert (_read(tmp_path / "flood.tif")[8:13, 4:16] == 100).all()
+    assert LOG.level == logging.ERROR

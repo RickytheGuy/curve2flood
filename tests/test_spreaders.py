@@ -5,7 +5,8 @@ import polars as pl
 import pytest
 from numba import njit
 from scipy import ndimage as ndi
-from shapely.geometry import Point, box
+from osgeo import gdal, ogr
+from shapely.geometry import Point
 
 from curve2flood import core
 from curve2flood._patches import patches_holding
@@ -470,11 +471,6 @@ def test_deepest_water_is_numpy_s_maximum_at():
 # Multi-point mapper
 # --------------------------------------------------------------------------
 
-def test_compute_tw_multfact_scale():
-    scale = multi_point.compute_tw_multfact_scale(np.array([10, 1, 5, 5.0]), np.array([5, 50, 0, -1.0]))
-    assert scale.tolist() == pytest.approx([2.0, 0.1, 1.0, 1.0])  # Q / Qbase, clipped; 1 without a baseflow
-
-
 def test_filter_outliers():
     group = pd.DataFrame({"TopWidth": [10.0] * 10 + [100.0], "WSE": 5.0, "Velocity": 1.0})
     assert multi_point.filter_outliers(group)["TopWidth"].tolist() == [10.0] * 10
@@ -482,13 +478,26 @@ def test_filter_outliers():
     assert len(multi_point.filter_outliers(one_row)) == 1
 
 
+def test_filter_outliers_is_each_reach_filtered_on_its_own():
+    rng = np.random.default_rng(3)
+    table = pd.DataFrame({"COMID": rng.integers(0, 12, 400), "TopWidth": rng.normal(50, 10, 400),
+                          "WSE": rng.normal(100, 1, 400), "Velocity": rng.normal(1, 0.2, 400)})
+    table.loc[rng.random(400) < 0.05, "WSE"] = np.nan
+    table = pd.concat([table, pd.DataFrame({"COMID": [99], "TopWidth": [5.0], "WSE": [1.0], "Velocity": [0.1]})])
+    expected = pd.concat([multi_point.filter_outliers(group.drop(columns="COMID")).assign(COMID=comid)
+                          for comid, group in table.groupby("COMID")])
+    assert sorted(multi_point.filter_outliers(table).index) == sorted(expected.index)
+
+
 def test_clean_and_interp_one_row():
     q = np.array([30, 10, 20, -1.0])  # unsorted, with an invalid entry
     v = np.array([3, 1, 2, 9.0])
     t = np.array([30, 10, 20, 9.0])
     wse = np.array([103, 101, 102, 9.0])
-    assert multi_point.clean_and_interp_one_row(15, q, v, t, wse) == pytest.approx((1.5, 15.0, 101.5))
-    assert multi_point.clean_and_interp_one_row(50, q, v, t, wse) == pytest.approx((3.0, 30.0, 103.0))  # held
+    rows = [np.tile(a, (2, 1)) for a in (q, v, t, wse)]
+    out = multi_point._clean_and_interp_rows(np.array([15.0, 50.0]), *rows, multi_point.NO_GROUND)
+    assert [a[0] for a in out] == pytest.approx([1.5, 15.0, 101.5])
+    assert [a[1] for a in out] == pytest.approx([3.0, 30.0, 103.0])  # held
 
 
 def test_get_curve_columns_sorts_by_number():
@@ -496,17 +505,45 @@ def test_get_curve_columns_sorts_by_number():
     assert multi_point.get_curve_columns(columns)[0] == ["q_2", "q_10"]
 
 
-def test_compute_outlier_mask():
-    assert multi_point._compute_outlier_mask(np.array([1, 2, 3, 4, 100.0])).tolist() == [False] * 4 + [True]
-    assert not multi_point._compute_outlier_mask(np.array([1, 2, 100.0])).any()  # too few values
+@pytest.mark.parametrize("method, kept_of_all", [("mad", [0, 1, 2, 3, 5, 6]), ("iqr", list(range(8)))])
+def test_hwm_outliers_are_dropped_within_each_reach(method, kept_of_all):
+    depth = [1.0, 1.1, 0.9, 1.0, 9.0]  # the last is an outlier in its reach
+    table = pd.DataFrame({"COMID": [1] * 5 + [2] * 3, "Elev": 100.0,
+                          "WaterSurfaceElev_m": 100.0 + np.array(depth + [1.0, 1.0, 9.0])})
+    kept = multi_point.filter_hwm_outliers_single_scenario(table, method=method, threshold=3.5, min_samples=5)
+    assert kept.index.tolist() == [0, 1, 2, 3, 5, 6, 7]  # reach 2 has too few points to test
+    # Over all points at once, both 9 m depths stand out by their MAD, but a quarter of the points widens the IQR
+    kept = multi_point.filter_hwm_outliers_single_scenario(table, method=method, threshold=3.5, group_by="global")
+    assert kept.index.tolist() == kept_of_all
 
 
-def test_rasterize_shapes():
-    shapes = [box(0, -20, 20, 0), Point(0, 0).buffer(0)]  # a 2x2-cell square, and an empty shape
-    mask = multi_point.rasterize_shapes_gdal(shapes, (4, 4), (0, 10, 0, 0, 0, -10))
-    expected = np.zeros((4, 4), np.uint8)
-    expected[:2, :2] = 1
-    assert np.array_equal(mask, expected)
+def _gdal_buffer_mask(x, y, radius, shape, dx, dy):
+    """The cells GDAL burns for shapely's buffers of the points, as the mapper burned them before."""
+    driver = gdal.GetDriverByName("MEM")
+    raster = driver.Create("", shape[1], shape[0], 1, gdal.GDT_Byte)
+    raster.SetGeoTransform((0.0, dx, 0.0, 0.0, 0.0, -dy))
+    vectors = (ogr.GetDriverByName("MEM") or ogr.GetDriverByName("Memory")).CreateDataSource("")
+    layer = vectors.CreateLayer("buffers")
+    for px, py, r in zip(x, y, radius):
+        feature = ogr.Feature(layer.GetLayerDefn())
+        feature.SetGeometry(ogr.CreateGeometryFromWkb(Point(float(px), float(py)).buffer(float(r), 16).wkb))
+        layer.CreateFeature(feature)
+    gdal.RasterizeLayer(raster, [1], layer, burn_values=[1])
+    return raster.ReadAsArray().astype(bool)
+
+
+def test_buffers_are_burned_as_gdal_burns_shapely_s_buffers():
+    rng = np.random.default_rng(5)
+    for dx, dy in [(10.0, 10.0), (27.8, 30.9)]:
+        x = rng.uniform(-50, 40 * dx, 30).astype(np.float32)
+        y = -rng.uniform(-50, 30 * dy, 30).astype(np.float32)
+        width = rng.uniform(0, 12 * dx, 30).astype(np.float32)
+        corridor, anchor = multi_point.build_variable_buffer_masks_from_points(
+            x, y, width, (30, 40), (0.0, dx, 0.0, 0.0, 0.0, -dy), 50.0, 5.0, corridor_topwidth_factor=1.0,
+            anchor_topwidth_factor=0.3)
+        assert np.array_equal(corridor, _gdal_buffer_mask(x, y, width.astype(np.float64), (30, 40), dx, dy))
+        radius = (width * 0.3).astype(np.float64)
+        assert np.array_equal(anchor, _gdal_buffer_mask(x, y, radius, (30, 40), dx, dy))
 
 
 def _smoothed_by_scipy(arr, sigma):

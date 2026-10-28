@@ -1,4 +1,5 @@
 import contextlib
+import importlib.metadata
 import itertools
 import math
 import os
@@ -14,10 +15,10 @@ from numba import njit, prange
 from osgeo import gdal
 
 from curve2flood._log import LOG
-from curve2flood._raster import decoding_threads, open_raster, read_array
+from curve2flood._raster import Grid, decoding_threads, open_raster, read_array
 from curve2flood.config import is_parquet
 
-from .library_writer import LibraryWriter
+from .library_writer import METADATA_VERSION, LibraryWriter
 from .solvers import (
     SOLVERS,
     _neighbour_bits_of_row,
@@ -184,19 +185,22 @@ def build_fldpln_library(
         stream_info = pd.read_parquet(stream_info_file)
     else:
         stream_info = pd.read_csv(stream_info_file)
-    assert stream_info.ndim == 2, "Stream info file must be a 2D table"
-    assert stream_info.shape[1] == 4, "Stream info file must have 4 columns: start pixel (0), end pixel (1), length (2), and stream ID (3)"
+
+    if stream_info.shape[1] != 4:
+        raise ValueError(f"The stream info file {stream_info_file} has {stream_info.shape[1]} columns, not the 4 of "
+                         "start pixel, end pixel, length and stream id, in that order.")
     # The whole network, for the channel cells: water draining to a reach left out below is still that reach's
     network = stream_info.values.astype(np.int64)
 
     if stream_ids is not None:
         stream_info = stream_info[stream_info.iloc[:, 3].isin(stream_ids)]
 
+    # The grid the library's pixel ids number, which the DEM and the flow directions must share
+    grid = Grid.of(filled_dem)
+    grid.check_matches(Grid.of(dem), "The filled DEM", "the DEM")
+    grid.check_matches(Grid.of(flow_direction_file), "The filled DEM", "the flow directions")
     filled_dem_array = read_array(filled_dem, np.float32)
     flow_direction_array = read_array(flow_direction_file, np.uint8)
-    dem_shape = _raster_shape(dem)
-    if dem_shape != filled_dem_array.shape:
-        raise ValueError(f"The DEM has shape {dem_shape}, but the filled DEM has {filled_dem_array.shape}.")
 
     if bg_mask is not None:
         # A 0/1 integer mask would index rows 0 and 1 instead of the masked cells
@@ -227,7 +231,9 @@ def build_fldpln_library(
             vdt_columns = pd.read_csv(vdt_file, nrows=0).columns
         # Find last wse_* column
         wse_cols = [col for col in vdt_columns if col.startswith('wse_')]
-        assert wse_cols, "No wse_* columns found in VDT file"
+        if not wse_cols:
+            raise ValueError(f"The VDT database {vdt_file} has no wse_* columns.")
+        
         max_wse_col = wse_cols[-1]
         usecols = ['COMID', 'Row', 'Col', max_wse_col]
         if vdt_is_parquet:
@@ -245,9 +251,9 @@ def build_fldpln_library(
         if bg_mask is not None:
             background |= bg_mask[vdt_df['Row'], vdt_df['Col']]
         vdt_df = vdt_df[~background]
-        ids_max_depths = vdt_df.groupby('COMID', sort=False, as_index=False)['depth'].max().values
-        stream_ids = ids_max_depths[:, 0].astype(np.int32)
-        max_depths = np.minimum(ids_max_depths[:, 1], fldmx)
+        ids_max_depths = vdt_df.groupby('COMID', sort=False, as_index=False)['depth'].max()
+        stream_ids = ids_max_depths['COMID'].to_numpy(np.int64)
+        max_depths = np.minimum(ids_max_depths['depth'].to_numpy(), fldmx)
         if split:
             # Each VDT cell's deepest water, for the segments of split reaches
             vdt_pixel = vdt_df['Row'].to_numpy(np.int64) * filled_dem_array.shape[1] + vdt_df['Col'].to_numpy(np.int64)
@@ -330,8 +336,18 @@ def build_fldpln_library(
     # rows to sort them together took 12 bytes a row, and twice that to sort,
     # which on a big river's floodplain is billions of rows.  They are sorted
     # and compressed in the writer's thread, while the next segments solve
+    metadata = {
+        "version": METADATA_VERSION, "curve2flood": _version(), "nrows": grid.nrows, "ncols": grid.ncols,
+        "geotransform": list(grid.geotransform), "crs": grid.projection,
+        "cell_size_m": list(_cell_size_metres(filled_dem)),
+        "build": {"dh": dh, "fldmn": fldmn, "fldmx": fldmx, "iterative_spill": iterative_spill, "solver": solver,
+                  "spill_decay": spill_decay, "max_cells_per_segment": max_cells_per_segment,
+                  "max_reach_length": max_reach_length, "max_profile_deviation": max_profile_deviation,
+                  "global_max_wse": global_max_wse, "with_vdt": vdt_file is not None,
+                  "with_bg_mask": bg_mask is not None, "with_water_mask": water_mask is not None},
+    }
     limits = []
-    with LibraryWriter(library_file, background=True) as writer, \
+    with LibraryWriter(library_file, background=True, metadata=metadata) as writer, \
             (ThreadPoolExecutor(processes) if parallel else contextlib.nullcontext()) as pool:
         if parallel:
             results = pbar(_ordered_map(pool, solve, args, 2 * processes), total=len(args),
@@ -361,9 +377,12 @@ def _library_rows(segment: int, fsp: np.ndarray, fpp: np.ndarray, dtf: np.ndarra
     return {"FSP": fsp[order], "FPP": fpp, "DTF": dtf[order],
             "segment": np.full(order.size, segment, dtype=np.int32), "fill": fill}
 
-def _raster_shape(path: str) -> tuple[int, int]:
-    ds = gdal.Open(path)
-    return ds.RasterYSize, ds.RasterXSize
+def _version() -> str:
+    """The installed curve2flood's version, or "unknown" when it runs from a copy that isn't installed."""
+    try:
+        return importlib.metadata.version("curve2flood")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
 
 def _channel_cells(flow_direction: np.ndarray, stream_info: np.ndarray, water: np.ndarray
                    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -996,8 +1015,9 @@ def _subtract_from_filled(filled_dem: np.ndarray, fill: np.ndarray, bg: np.float
             else:
                 fill[r, c] = filled_dem[r, c] - dem
 
-def save_library(table: pd.DataFrame | dict[str, np.ndarray], path: str):
-    """Save a library (a table, or its columns' arrays by name) as compact Parquet.
+def save_library(table: pd.DataFrame | dict[str, np.ndarray], path: str, metadata: dict | None = None):
+    """Save a library (a table, or its columns' arrays by name) as compact Parquet, with its ``metadata`` (see
+    ``library_metadata``) if given.
 
     DTF and fill are stored as 2-decimal numbers, and each column gets the
     encoding that compresses it best; the file is several times smaller than
@@ -1005,7 +1025,7 @@ def save_library(table: pd.DataFrame | dict[str, np.ndarray], path: str):
     it 6% smaller, but took five times as long to write and twice as long to
     read.  Rows are converted and written a row group at a time.
     """
-    with LibraryWriter(path, parquet=True) as writer:
+    with LibraryWriter(path, parquet=True, metadata=metadata) as writer:
         writer.write({c: np.asarray(table[c]) for c in table})
 
 

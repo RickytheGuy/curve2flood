@@ -30,9 +30,8 @@ on any warning, such as a broken link.
 3. Document it in `docs/input_file.md`.
 4. Add a test (`tests/test_config.py`).
 
-ARC reads the same input files and rejects keys it doesn't know, except those it lists as Curve2Flood's
-(`_CURVE2FLOOD_KEYS` in ARC's `arc/config.py`), so add a new key there too. Likewise, a new ARC key goes in
-`_ARC_KEYS` here; `tests/test_config.py` checks this when ARC is installed.
+An input file is Curve2Flood's alone: ARC has input files of its own, and each model rejects the other's keys, so a
+new key goes in Curve2Flood only.
 
 ## Documentation
 
@@ -58,3 +57,9 @@ python docs/figures/make_figures.py
 `benchmarks/fldpln_matlab/run_benchmark.py` times the FLDPLN library build, and measures its memory, against the
 University of Kansas's MATLAB model, and writes the table on the [FLDPLN page](fldpln.md#speed-and-memory). The
 script's docstring says how it measures.
+
+`benchmarks/mappers/run_benchmark.py` maps synthetic valleys (a straight stream, a meander, a confluence, a levee with
+a pond behind it, and a steep headwater) with all three mappers and scores each against the flood their rating curves
+imply, in `benchmarks/mappers/results.md`. The valleys are made as it runs, so nothing but the script is stored. Give
+it `--site site.yaml` to score real sites against observed floods too; its docstring says what the YAML holds. Run it
+before a release, and compare its table with the one committed: it isn't a test, as its scores have no pass mark.

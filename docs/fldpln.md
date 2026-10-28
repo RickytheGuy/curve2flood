@@ -59,7 +59,11 @@ All on the DEM's grid:
 - **`Print_VDT_Database`**: the rating curves.
 - **`FLDPLN_Library`**: the floodplain library.
 
-`DEM_File` gives only the grid: its elevations are read just for `OutWSE` or the bathymetry.
+A Parquet library records the grid its pixels are numbered on (its rows, columns, geotransform and coordinate
+system), its cells' size in metres and how it was built, in its metadata (`library_metadata`). So `DEM_File` is
+needed only for `OutWSE` or the bathymetry; without it the flood map takes the library's
+grid, or, for a library built before it said, the flow directions'. Every raster given must be on that grid, or the
+run stops.
 
 ## Building the library
 

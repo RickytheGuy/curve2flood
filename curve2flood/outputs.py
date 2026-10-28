@@ -21,11 +21,14 @@ from curve2flood.config import FLDPLN, Config
 # Rows of _smooth_3x3's band
 _SMOOTH_BAND = 64
 
-# Cell kinds of _nearest_source_of_targets, as bits: a cell may be both
+# Cell kinds of _matched_to_flood, as bits: a cell may be both
 _SOURCE, _TARGET = 1, 2
 
 # Target rows each thread works through in turn, keeping its place in each column's sources
 _NEAREST_CHUNK_ROWS = 32
+
+# Manning's n of land cover the LU_Manning_n table doesn't list, no-data among it
+DEFAULT_MANNING_N = 0.035
 
 def main_flood_ouputs(
         Flood_Ensemble: np.ndarray,
@@ -44,17 +47,13 @@ def main_flood_ouputs(
         dem_geotransform: tuple):
     """Write the flood, depth, WSE and velocity rasters.
 
-    Returns the flood raster: 0 is dry, and 1-100 the percentage of flow events
-    that flooded the cell (100 with a single event).  ``E`` is the DEM padded
-    by one cell; the FLDPLN mapper doesn't need it, and reads the DEM for
-    ``OutWSE`` a strip at a time when it is None.
+    ``Flood_Ensemble`` is the flood raster (uint8): 0 is dry, and 1-100 the
+    percentage of flow events that flooded the cell (see ``spread_flood``);
+    it is returned with the water land cover, stream and water mask cells
+    added as the settings ask.  ``E`` is the DEM padded by one cell; the
+    FLDPLN mapper doesn't need it, and reads the DEM for ``OutWSE`` a strip
+    at a time when it is None.
     """
-    # Turn the count of flooding events into a percentage
-    Flood_Ensemble *= 100
-    if Flood_Ensemble.dtype != np.uint8:
-        Flood_Ensemble /= Flood_Ensemble.shape[2]
-        Flood_Ensemble = Flood_Ensemble.astype(np.uint8)
-
     OutVEL = config.outvel
     Flood_WaterLC_and_STRM_Cells = config.flood_waterlc_and_strm_cells
     OutDEP = config.outdep
@@ -128,12 +127,10 @@ def main_flood_ouputs(
         create_velocity(config, OutVEL, Depth_Array, LC_array, finish_positive_max(Slope_Max), dem_geotransform,
                         dem_projection, ncols, nrows, Flood_Ensemble)
 
-    if config.make_output_gpkg and Flood_File:
+    if config.gpkg_file:
         flood_gdf = Write_Output_Raster_As_GeoDataFrame(Flood_Ensemble, ncols, nrows, dem_geotransform, dem_projection, gdal.GDT_Byte)
-
         # The driver is inferred from the file extension
-        shp_output_filename = f"{Flood_File[:-4]}.gpkg"
-        flood_gdf.to_file(shp_output_filename)
+        flood_gdf.to_file(config.gpkg_file)
 
     return Flood_Ensemble
 
@@ -212,15 +209,8 @@ def finish_positive_max(maximum: np.ndarray) -> np.ndarray:
     maximum[maximum == -np.inf] = np.nan
     return maximum
 
-def create_positive_max_array(array_list: list[np.ndarray]) -> np.ndarray:
-    """Cell-wise maximum of the positive values in ``array_list``; NaN where there are none."""
-    maximum = None
-    for array in array_list:
-        maximum = accumulate_positive_max(maximum, array)
-    return finish_positive_max(maximum)
-
 def create_depth(max_depth: np.ndarray, Flood_Ensemble: np.ndarray, in_place: bool = False):
-    """The maximum depth over the flow events (``create_positive_max_array``), matched to the flood extent (see
+    """The maximum depth over the flow events (``accumulate_positive_max``), matched to the flood extent (see
     ``Flood_Flooded_Cells_in_Map``), in ``max_depth`` itself with ``in_place``."""
     return Flood_Flooded_Cells_in_Map(max_depth, Flood_Ensemble, eps=0.01, in_place=in_place)
 
@@ -259,15 +249,17 @@ def create_velocity(config: Config, OutVEL, Depth_Array, LC_array, Slope_Array,
     of rows at a time.
     """
     lookup = _manning_lookup(config.lu_manning_n)
+    unlisted = set()
     VEL_Array = Slope_Array
     for r0 in range(0, nrows, _STRIP_ROWS):
         r1 = min(r0 + _STRIP_ROWS, nrows)
-        land_cover = LC_array[r0:r1] if LC_array.dtype.kind in 'iu' else LC_array[r0:r1].astype(int)
-        strip = lookup[land_cover]
+        strip = _manning_n(LC_array[r0:r1], lookup, unlisted)
         np.divide(1, strip, out=strip)
         strip *= Depth_Array[r0:r1] ** (2/3)
         strip *= Slope_Array[r0:r1] ** (1/2)
         VEL_Array[r0:r1] = strip
+
+    _warn_unlisted_land_cover(unlisted, config.lu_manning_n)
 
     out_band_data = Flood_Flooded_Cells_in_Map(VEL_Array, Flood_Ensemble, eps=0.01, in_place=True)
     del VEL_Array
@@ -301,26 +293,58 @@ def _write_strips(path: str, ncols: int, nrows: int, geotransform: tuple, projec
     band.FlushCache()
     ds.FlushCache()
 
-def read_manning_table(s_manning_path: str, land_cover: np.ndarray):
-    """Convert a land-cover raster to Manning's n.
-
-    The table is tab separated, with the land-cover code in the first column
-    and Manning's n in the third.  Codes missing from the table get n = 0.
-    """
-    # A lookup array is the fastest way to reclassify the raster.  It is float32,
-    # as the velocity is, and an integer raster indexes it as it is, so no
-    # 8-byte copy of the raster is made.
-    if land_cover.dtype.kind not in 'iu':
-        land_cover = land_cover.astype(int)
-    return _manning_lookup(s_manning_path)[land_cover]
-
 def _manning_lookup(s_manning_path: str) -> np.ndarray:
-    """``read_manning_table``'s table as a float32 lookup array: Manning's n by land-cover code, 0 for a missing one."""
+    """The ``LU_Manning_n`` table as a float32 lookup array: Manning's n by land-cover code, NaN for a code that
+    isn't in it or has no positive n.  The table is tab separated, with the land-cover code in the first column and
+    Manning's n in the third."""
     df = pd.read_csv(s_manning_path, sep='\t')
-    idx = df.iloc[:, 0].astype(int).values
-    lookup_array = np.zeros(idx.max() + 1)
-    lookup_array[idx] = df.iloc[:, 2].values
-    return lookup_array.astype(np.float32)
+    codes = pd.to_numeric(df.iloc[:, 0], errors='coerce').to_numpy(np.float64)
+    n = pd.to_numeric(df.iloc[:, 2], errors='coerce').to_numpy(np.float64)
+    usable = np.isfinite(codes) & (codes >= 0) & (codes == np.round(codes)) & np.isfinite(n) & (n > 0)
+    if not usable.all():
+        LOG.warning(f"{int((~usable).sum())} rows of {s_manning_path} have no land cover code (a whole number, 0 or "
+                    f"more) or no positive Manning's n; their land cover takes n = {DEFAULT_MANNING_N}.")
+        
+    codes = codes[usable].astype(np.int64)
+    lookup_array = np.full(codes.max() + 1 if codes.size else 0, np.nan, dtype=np.float32)
+    lookup_array[codes] = n[usable]
+    return lookup_array
+
+def _manning_n(land_cover: np.ndarray, lookup: np.ndarray, unlisted: set) -> np.ndarray:
+    """Each cell's Manning's n (float32) from its land cover code and ``lookup`` (``_manning_lookup``), or
+    ``DEFAULT_MANNING_N``; the codes the table doesn't give are added to ``unlisted``."""
+    land_cover = np.asarray(land_cover)
+    n = np.full(land_cover.shape, DEFAULT_MANNING_N, dtype=np.float32)
+    if land_cover.dtype.kind == 'f':
+        inside = np.isfinite(land_cover) & (land_cover >= 0) & (land_cover < lookup.size)
+        codes = land_cover[inside].astype(np.int64)
+    else:
+        inside = (land_cover >= 0) & (land_cover < lookup.size)
+        codes = land_cover[inside]
+
+    values = lookup[codes]
+    listed = np.isfinite(values)
+    n[inside] = np.where(listed, values, np.float32(DEFAULT_MANNING_N))
+    if not listed.all():
+        unlisted.update(np.unique(codes[~listed]).tolist())
+
+    if not inside.all():
+        outside = land_cover[~inside]
+        if outside.dtype.kind == 'f' and np.isnan(outside).any():
+            unlisted.add('NaN')
+            outside = outside[~np.isnan(outside)]
+
+        unlisted.update(np.unique(outside).tolist())
+
+    return n
+
+def _warn_unlisted_land_cover(unlisted: set, s_manning_path: str):
+    """Warn that the land cover codes ``unlisted`` take ``DEFAULT_MANNING_N``, not being in the table."""
+    if unlisted:
+        codes = sorted(unlisted, key=lambda code: (isinstance(code, str), 0 if isinstance(code, str) else code))
+        shown = ', '.join(f'{code:g}' if isinstance(code, float) else str(code) for code in codes[:10])
+        LOG.warning(f"{len(codes)} land cover codes aren't in {s_manning_path} ({shown}"
+                    f"{', ...' if len(codes) > 10 else ''}): their cells take Manning's n = {DEFAULT_MANNING_N}.")
 
 
 
@@ -512,8 +536,14 @@ def _flooded_kind(values: np.ndarray, flood: np.ndarray) -> np.ndarray:
 def _matched_to_flood(values: np.ndarray, flood: np.ndarray, kind: np.ndarray, eps: np.float32, filled: np.ndarray,
                       in_place: bool):
     """``filled`` (float32, ``values`` itself ``in_place``) set to ``values``, but each target (in ``kind``) to the
-    value of its nearest source (``_nearest_source_of_targets``), a target without any ``eps``, and NaN where
-    ``flood`` is 0 or less.  In place, the sources are never written: they keep their values."""
+    value of its nearest source, a target without any ``eps``, and NaN where ``flood`` is 0 or less.  In place, the
+    sources are never written: they keep their values.
+
+    The nearest source is the one SciPy's ``distance_transform_edt`` (Maurer
+    et al. 2003) finds, ties and all: each cell's nearest source along its
+    column, then, along each row, the nearest of those.  But only the rows
+    with a target are worked out, in parallel, from each column's list of
+    sources, where the transform keeps two ``int32`` of every cell."""
     nrows, ncols = values.shape
     target_rows, _ = _target_rows(kind)
     col_starts, col_rows = _sources_by_column(kind)
@@ -542,6 +572,7 @@ def _matched_to_flood(values: np.ndarray, flood: np.ndarray, kind: np.ndarray, e
                 if not with_sources:
                     filled[r, c] = eps
                 continue
+            
             if flood[r, c] <= 0:
                 filled[r, c] = np.float32(np.nan)
             elif not in_place:
@@ -554,7 +585,7 @@ def Flood_Flooded_Cells_in_Map(Array_Ensemble: np.ndarray, Flood_Ensemble: np.nd
     """Match a value raster (depth, WSE, velocity, slope) to the flood extent.
 
     Flooded cells that are NaN take the value of the nearest flooded cell that
-    has one (see ``_nearest_sources``); flooded cells with no such cell get
+    has one (see ``_matched_to_flood``); flooded cells with no such cell get
     ``eps``.  Cells outside the flood become NaN.  Returns a new float32 array,
     or with ``in_place`` ``Array_Ensemble`` itself, which must be float32.
     """
@@ -613,7 +644,7 @@ def _row_sources(r: int, col_starts: np.ndarray, col_rows: np.ndarray, at: np.nd
     """Row ``r``'s candidate sources: in each column the nearest source, the upper of two equally near, in ``near``
     (-1 in a column without one), and then those that are someone's nearest along the row, a stack in ``g``; returns
     its top (-1 for none).  ``at[c]`` is where column ``c``'s first source at or below the previous row was, and is
-    moved on to ``r``'s.  The arithmetic is the distance transform's (see ``_nearest_source_of_targets``)."""
+    moved on to ``r``'s.  The arithmetic is the distance transform's (see ``_matched_to_flood``)."""
     ncols = near.size
     for c in range(ncols):
         end = col_starts[c + 1]
@@ -674,45 +705,3 @@ def _first_at_or_below(r: int, col_starts: np.ndarray, col_rows: np.ndarray, at:
     for c in range(at.size):
         lo, hi = col_starts[c], col_starts[c + 1]
         at[c] = lo + np.searchsorted(col_rows[lo:hi], r)
-
-@njit(cache=True, parallel=True)
-def _nearest_source_of_targets(kind: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """The nearest source (``kind & _SOURCE``) to each target (``kind & _TARGET``), as ``_nearest_sources``.
-
-    SciPy's ``distance_transform_edt`` (Maurer et al. 2003) finds each cell's
-    nearest source along its column, then, along each row, the nearest of
-    those, and this is its algorithm, step for step, ties and all.  But it
-    works out only the rows with a target, in parallel, from each column's
-    list of sources, where the transform keeps two ``int32`` of every cell,
-    and NumPy an ``int64`` copy of its input: many times faster, in a
-    fraction of the memory.  Without a source, every target gets the
-    transform's ``(-1, 0)``.
-    """
-    ncols = kind.shape[1]
-    target_rows, starts = _target_rows(kind)
-    out_rows = np.empty(starts[-1], dtype=np.int64)
-    out_cols = np.empty(starts[-1], dtype=np.int64)
-    col_starts, col_rows = _sources_by_column(kind)
-    for chunk in prange((target_rows.size + _NEAREST_CHUNK_ROWS - 1) // _NEAREST_CHUNK_ROWS):
-        k0 = chunk * _NEAREST_CHUNK_ROWS
-        at = np.empty(ncols, dtype=np.int64)
-        near = np.empty(ncols, dtype=np.int64)
-        g = np.empty(ncols, dtype=np.int64)
-        _first_at_or_below(target_rows[k0], col_starts, col_rows, at)
-        for k in range(k0, min(k0 + _NEAREST_CHUNK_ROWS, target_rows.size)):
-            r = target_rows[k]
-            top = _row_sources(r, col_starts, col_rows, at, near, g)
-            n = starts[k]
-            if top < 0:
-                out_rows[n:starts[k + 1]] = -1
-                out_cols[n:starts[k + 1]] = 0
-                continue
-            j = 0
-            for i in range(ncols):
-                j = _next_nearest(r, i, j, top, near, g)
-                if kind[r, i] & _TARGET:
-                    out_rows[n] = near[g[j]]
-                    out_cols[n] = g[j]
-                    n += 1
-
-    return out_rows, out_cols
