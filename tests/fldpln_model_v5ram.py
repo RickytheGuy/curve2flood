@@ -22,10 +22,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-
-from scipy.io import loadmat, savemat
 from osgeo import gdal
-
+from scipy.io import loadmat, savemat
 
 # Neighbor order used in the MATLAB code:
 # 1 2 3

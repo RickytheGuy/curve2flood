@@ -5,7 +5,7 @@ Command-line interface for Curve2Flood.
 import argparse
 import logging
 
-from curve2flood import Curve2Flood_MainFunction, LOG
+from curve2flood import LOG, Curve2Flood_MainFunction
 
 LOG_LEVELS = {
     'debug': logging.DEBUG,

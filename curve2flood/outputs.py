@@ -1,8 +1,5 @@
-import geopandas as gpd
 import numpy as np
-import pandas as pd
 import pyarrow as pa
-import shapely
 from numba import njit, prange
 from osgeo import gdal, ogr, osr
 
@@ -159,17 +156,8 @@ def remove_cells_not_connected(flood_array: np.ndarray, streams_array: np.ndarra
     containing a cell with ``streams_array > 0`` are kept; the rest are set to
     0, as ``flood_array`` times a mask of the kept cells gives it.
     """
-    return _times(flood_array, patches_holding(flood_array, streams_array, True))
-
-@njit(cache=True, parallel=True)
-def _times(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """``values * mask``, in ``values``' type."""
-    out = np.empty_like(values)
-    for r in prange(values.shape[0]):
-        for c in range(values.shape[1]):
-            out[r, c] = values[r, c] * mask[r, c]
-
-    return out
+    # A bool mask keeps the flood's type
+    return flood_array * patches_holding(flood_array, streams_array, True)
 
 def accumulate_positive_max(maximum: np.ndarray | None, array: np.ndarray | None,
                             in_place: bool = False) -> np.ndarray | None:
@@ -297,6 +285,8 @@ def _manning_lookup(s_manning_path: str) -> np.ndarray:
     """The ``LU_Manning_n`` table as a float32 lookup array: Manning's n by land-cover code, NaN for a code that
     isn't in it or has no positive n.  The table is tab separated, with the land-cover code in the first column and
     Manning's n in the third."""
+    import pandas as pd  # Imported here: only velocity needs it
+
     df = pd.read_csv(s_manning_path, sep='\t')
     codes = pd.to_numeric(df.iloc[:, 0], errors='coerce').to_numpy(np.float64)
     n = pd.to_numeric(df.iloc[:, 2], errors='coerce').to_numpy(np.float64)
@@ -477,6 +467,10 @@ def uniform_smoothing(mask: np.ndarray, values: np.ndarray):
 
 def Write_Output_Raster_As_GeoDataFrame(raster_data, ncols, nrows, dem_geotransform, dem_projection, s_output_type):
     """Polygonise a raster and return the polygons of its positive cells as a GeoDataFrame."""
+    # Imported here: only the GeoPackage needs them
+    import geopandas as gpd
+    import shapely
+
     driver = gdal.GetDriverByName('MEM')
     raster_ds = driver.Create('', xsize=ncols, ysize=nrows, bands=1, eType=s_output_type)
     raster_ds.SetGeoTransform(dem_geotransform)

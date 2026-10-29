@@ -1114,9 +1114,11 @@ def test_ordered_map_keeps_the_order_and_few_tasks_ahead():
 
 
 def test_library_parts_read_a_file_as_a_lazy_frame_would(tmp_path, monkeypatch):
-    """A file read through pyarrow a batch at a time gives the rows a LazyFrame of it does, decimals as Float32."""
+    """A file read through pyarrow a batch at a time gives the rows a LazyFrame of it does: its decimals as the
+    integer hundredths whose ``_metres`` are the LazyFrame's Float32."""
     import polars as pl
     monkeypatch.setattr(LW, "_LIBRARY_SLICE_ROWS", 4)
+    monkeypatch.setattr(M, "_READ_ROWS", 4)
     path = tmp_path / "library.parquet"
     L.save_library(_toy_library(), path)
     lazy = pl.scan_parquet(path)
@@ -1128,8 +1130,10 @@ def test_library_parts_read_a_file_as_a_lazy_frame_would(tmp_path, monkeypatch):
     for column in columns:
         values = np.concatenate([part[column] for part in from_file])
         expected = np.concatenate([part[column] for part in from_lazy])
+        if column in ("DTF", "fill"):
+            assert values.dtype == np.int32 and expected.dtype == np.float32
+            values = M._metres(values)
         assert values.dtype == expected.dtype and np.array_equal(values, expected)
-    assert from_file[0]["DTF"].dtype == np.float32
     assert M._library_columns(str(path)) == M._library_columns(lazy) == list(_toy_library())
 
 
@@ -1140,7 +1144,32 @@ def test_hundredths_are_polars_decimal_casts():
     import pyarrow as pa
     integers = np.r_[np.arange(-9_999_999, 10_000_000, 7), 9_999_999, -1, 0, 1].astype(np.int32)
     column = pa.Array.from_buffers(pa.decimal32(7, 2), integers.size, [None, pa.py_buffer(integers.tobytes())])
-    assert np.array_equal(M._column_values(column), pl.from_arrow(column).cast(pl.Float32).to_numpy())
+    assert np.array_equal(M._metres(M._column_values(column)), pl.from_arrow(column).cast(pl.Float32).to_numpy())
+
+
+def test_decimals_are_written_as_arrow_casts_them():
+    """The library's decimals are Arrow's cast of the values as float32 rounded to two places, over the whole of
+    decimal32(7, 2) (every seventh value, and its ends); a value that doesn't fit, or isn't a number, is refused."""
+    import pyarrow as pa
+    hundredths = np.r_[np.arange(-9_999_999, 10_000_000, 7), 9_999_999, -1, 0, 1]
+    values = (hundredths / 100.0).astype(np.float32)
+    kind = pa.decimal32(7, 2)
+    assert LW._as_decimal(values, kind).equals(pa.array(values.round(2)).cast(kind))
+    for bad in (1e5, np.nan):
+        with pytest.raises(ValueError, match="doesn't fit"):
+            LW._as_decimal(np.array([1.0, bad], np.float32), kind)
+
+
+def test_column_values_read_numbers_in_place_as_pyarrow_converts_them():
+    """Numbers without nulls are read from the column's buffer, a slice of one too, as pyarrow's to_numpy gives them;
+    a column with nulls is converted by pyarrow."""
+    import pyarrow as pa
+    for values in (np.arange(-5, 7, dtype=np.int32), np.arange(9, dtype=np.uint16), np.linspace(0, 1, 6)):
+        column = pa.array(values)[2:]
+        read = M._column_values(column)
+        assert read.dtype == values.dtype and np.array_equal(read, column.to_numpy())
+    with_null = pa.array([1.5, None, 2.0])
+    assert np.array_equal(M._column_values(with_null), [1.5, np.nan, 2.0], equal_nan=True)
 
 
 def test_a_sparse_fill_reads_as_the_raster_and_a_dense_one_is_the_raster(tmp_path):

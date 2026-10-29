@@ -171,11 +171,20 @@ def _ordered_bits(values: np.ndarray) -> np.ndarray:
 
     return out
 
+@njit(cache=True, nogil=True, inline="always")
+def _spilled_from(cell: int, j: int, spill_dtf: float, head: float, spill_decay: float, round_id: int,
+                  spilled_round: np.ndarray, spilled_depth: np.ndarray, spilled_dtf: np.ndarray) -> bool:
+    """Whether an earlier path of this spill round backfilled from ``cell`` from no more DTF, and at least as deep,
+    than this path would as its ``j``-th cell."""
+    return (spilled_round[cell] == round_id and head - j * spill_decay <= spilled_depth[cell]
+            and np.float32(spill_dtf + j * spill_decay) >= spilled_dtf[cell])
+
 @njit(cache=True, nogil=True)
 def _forward_path(start: int, spill_dtf: float, head: float, fil: np.ndarray, fdr: np.ndarray,
                   offsets: np.ndarray, flood_depths: np.ndarray,
                   bg: float, excluded: np.ndarray, spill_decay: float,
-                  path: np.ndarray, seen: np.ndarray, seen_stamp: int) -> int:
+                  path: np.ndarray, seen: np.ndarray, seen_stamp: int, round_id: int,
+                  spilled_round: np.ndarray, spilled_depth: np.ndarray, spilled_dtf: np.ndarray) -> int:
     """Algorithm step 6a: the trajectory ``T(y_k)``, with its two halt criteria.
 
     The spill floods ``start`` from ``spill_dtf`` with ``head`` metres of water
@@ -187,12 +196,24 @@ def _forward_path(start: int, spill_dtf: float, head: float, fil: np.ndarray, fd
     taken at the top of the spill round and deliberately *not* refreshed while
     the round's candidates are processed.  Reading live depths here would halt
     trajectories a cell or two earlier and change the result.
+
+    The path is cut short, before the cell, where it joins an earlier path of
+    the round that backfilled from that cell from no more DTF, at least as deep
+    (``_spilled_from``).  The rest of this path is the earlier one's, the flow
+    directions being the same, and so it would lower no DTF and backfill from
+    no cell: the earlier path gave each of its cells as little DTF, and
+    backfilled from each from as little, as deep (spills run shallowest
+    first), or met a still earlier one that did.
     """
     current = start
     length = 0
     while True:
         if seen[current] == seen_stamp:
             break
+
+        if _spilled_from(current, length, spill_dtf, head, spill_decay, round_id, spilled_round, spilled_depth, spilled_dtf):
+            break
+
         seen[current] = seen_stamp
         path[length] = current
         length += 1
@@ -210,9 +231,12 @@ def _forward_path(start: int, spill_dtf: float, head: float, fil: np.ndarray, fd
         if spill_decay > 0.0 and length * spill_decay > head:
             break
         if excluded[nxt]:
-            path[length] = nxt
-            length += 1
+            if not _spilled_from(nxt, length, spill_dtf, head, spill_decay, round_id, spilled_round, spilled_depth,
+                                 spilled_dtf):
+                path[length] = nxt
+                length += 1
             break
+        
         if fil[nxt] == bg:
             break
         if flood_depths[nxt] > 0.0 and np.float32(spill_dtf + length * spill_decay) >= flood_depths[nxt]:
@@ -388,7 +412,7 @@ def _iterate(fil: np.ndarray, fdr: np.ndarray, inflow: np.ndarray, has_data: np.
                 stamp += 1
                 length = _forward_path(start, spill_dtf, path_depth, fil, fdr, offsets,
                                        flood_depths, bg, excluded, spill_decay,
-                                       path, seen, stamp)
+                                       path, seen, stamp, round_id, spilled_round, spilled_depth, spilled_dtf)
                 if length == 0:
                     continue
 
@@ -414,21 +438,15 @@ def _iterate(fil: np.ndarray, fdr: np.ndarray, inflow: np.ndarray, has_data: np.
                             n_added += 1
                             n_new += 1
 
+                # The path stops before any cell an earlier path of this round
+                # backfilled from from no more DTF, at least as deep (see
+                # _forward_path): that one gave every cell above it as little DTF
+                # as this one would, its own path cells above it too, which
+                # block this one's backfill and are no lower.
                 for j in range(length):
                     source = path[j]
                     source_dtf = np.float32(spill_dtf + j * spill_decay)
                     source_depth = path_depth - j * spill_decay
-                    # An earlier path of this round that backfilled from here
-                    # from no more DTF, at least as deep, gave every cell above
-                    # it as little DTF as this one would: its own path cells
-                    # above it too, which block this one's backfill and are no
-                    # lower.  Most path cells of a round are another's.  (Spills
-                    # run shallowest first, so without a decay the earlier DTF
-                    # is never more.)
-                    if (spilled_round[source] == round_id and source_depth <= spilled_depth[source]
-                            and source_dtf >= spilled_dtf[source]):
-                        continue
-
                     spilled_round[source] = round_id
                     spilled_depth[source] = source_depth
                     spilled_dtf[source] = source_dtf

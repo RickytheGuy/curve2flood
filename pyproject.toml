@@ -52,3 +52,10 @@ include = ["curve2flood*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+extend-exclude = [
+    "tests/*.py",
+    "docs",
+    "benchmarks"
+]

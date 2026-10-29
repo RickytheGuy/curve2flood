@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-import numba
 import numpy as np
-import pandas as pd
 import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
-from numba import njit, prange
+from numba import njit
 
 from . import library_writer
 from .solvers import _next_downstream
 
+if TYPE_CHECKING:
+    import pandas as pd
+
+# Rows of a Parquet library read at a time.  A quarter of a row group: pyarrow keeps the buffers it decoded a batch
+# in for the next. This saves memory, at no cost in time.
+_READ_ROWS = 1 << 18
 
 @njit(cache=True, nogil=True)
 def _walk_reaches(starts: np.ndarray, lengths: np.ndarray, fdr: np.ndarray, nrows: int,
@@ -38,69 +44,149 @@ def _walk_reaches(starts: np.ndarray, lengths: np.ndarray, fdr: np.ndarray, nrow
 
     return pixels[:n], offsets
 
-def _deepest_water(best: np.ndarray, key: np.ndarray, fpp: np.ndarray, dtf: np.ndarray, fill: np.ndarray,
-                   dof: np.ndarray, below: np.ndarray):
-    """Raise ``best[p]`` to the water of each library row ``(key, p, DTF, fill)`` that reaches ``p``'s filled
-    surface: ``dof[key] - DTF + max(fill, 0)`` where ``dof[key] - DTF > 0``.
+@dataclass(frozen=True)
+class LibrarySources:
+    """What a flood map needs of a library before its depths, the same for every flow (see ``library_sources``).
 
-    ``dof`` is NaN for a key without a depth.  The arithmetic is in the
-    columns' own types, rounded to float32, and a NaN depth leaves its cell
-    NaN, as ``np.maximum.at`` did.  Unless ``below`` is empty, every row's
-    cell also gets ``min(fill, 0)`` there: how far the filled DEM sits below
-    the DEM.  A cell's result doesn't depend on the order of its rows (the
-    deepest, or NaN, and its one fill), so they are worked through in
-    parallel, each thread keeping to its own range of cells.
+    ``key`` is the column each row's depth is looked up by: ``segment``, or
+    ``FSP`` for a library built before reaches were split into segments.
+    ``pixels`` holds each segment's stream pixels, every ``(segment, FSP)``
+    once (only ``FSP`` without segments).  ``own_fsp`` are the stream pixels
+    with a row for their own cell, ascending, and ``own_fill`` that cell's
+    fill.  ``fill_cells`` are the cells whose fill is above 0 (or NaN),
+    ascending, and ``fill_values`` their fill.
     """
-    _deepest_water_in(best, key, fpp, dtf, fill, dof, below, numba.get_num_threads())
+    key: str
+    pixels: pl.DataFrame
+    own_fsp: np.ndarray
+    own_fill: np.ndarray
+    fill_cells: np.ndarray
+    fill_values: np.ndarray
 
-@njit(cache=True, parallel=True)
-def _deepest_water_in(best: np.ndarray, key: np.ndarray, fpp: np.ndarray, dtf: np.ndarray, fill: np.ndarray,
-                      dof: np.ndarray, below: np.ndarray, n_parts: int):
-    """``_deepest_water``, its cells in ``n_parts`` ranges, each range's rows in a thread of their own."""
-    for part in prange(n_parts):
-        lo = best.size * part // n_parts
-        hi = best.size * (part + 1) // n_parts
-        for i in range(key.size):
-            if lo <= fpp[i] < hi:
-                _deepest_row(best, key, fpp, dtf, fill, dof, below, i)
 
-@njit(cache=True, inline="always")
-def _deepest_row(best, key, fpp, dtf, fill, dof, below, i):
-    """``_deepest_water`` of library row ``i``."""
+def library_sources(fldpln_library: pl.LazyFrame | str | os.PathLike, ncells: int,
+                    fill_below_dem: np.ndarray | None = None, scratch: np.ndarray | None = None) -> LibrarySources:
+    """Read a library's stream pixels and fills, once whatever the flows (see ``make_fldpln_flood_map``).
+
+    A cell's fill is the same in every row, so it is read here, a cell at a
+    time, and the depths need only ``(key, FPP, DTF)``.  ``fill_below_dem``,
+    a float32 raster of ``ncells`` cells, gets ``min(fill, 0)`` at every cell
+    of the library: how far the filled DEM sits below the DEM, for the water
+    surface.  ``scratch``, float32 of ``ncells`` cells, is worked in (made
+    when None) and left with every cell's fill, 0 off the library.
+    """
+    columns = _library_columns(fldpln_library)
+    if 'fill' not in columns:
+        raise ValueError("The FLDPLN library has no fill column. Rebuild it with build_fldpln_library, "
+                         "which now takes the DEM the floods are mapped on.")
+
+    key = 'segment' if 'segment' in columns else 'FSP'
+    group = ['segment', 'FSP'] if key == 'segment' else ['FSP']
+    fill_of = np.zeros(ncells, np.float32) if scratch is None else scratch
+    fill_of[:] = 0.0
+    below = np.empty(0, np.float32) if fill_below_dem is None else fill_below_dem.reshape(-1)
+    last = np.zeros(3, np.int64)
+    # Where each part's runs start and its own rows are: few, so only the first pages are ever touched
+    starts = own = np.empty(0, np.int32)
+    pairs = {column: [] for column in group}
+    own_fsp = []
+    for part in _library_parts(fldpln_library, group + ['FPP', 'fill']):
+        fsp, fill = part['FSP'], part['fill']
+        if starts.size < fsp.size:
+            starts, own = np.empty(fsp.size, np.int32), np.empty(fsp.size, np.int32)
+        n_starts, n_own = _scan_sources(part[key], fsp, part['FPP'], fill, _scale(fill), last, starts, own, fill_of,
+                                        below)
+        for column in group:
+            pairs[column].append(part[column][starts[:n_starts]])
+        own_fsp.append(fsp[own[:n_own]])
+
+    pixels = pl.DataFrame({column: np.concatenate(pairs[column]) if pairs[column] else np.empty(0, np.int32)
+                           for column in group}).unique()
+    own_fsp = np.unique(np.concatenate(own_fsp)) if own_fsp else np.empty(0, np.int32)
+    # A cell's fill is the same in every row, its own row's too
+    own_fill = fill_of[own_fsp]
+    raised = fill_of <= 0
+    np.logical_not(raised, out=raised)
+    fill_cells = np.flatnonzero(raised)
+    del raised
+    return LibrarySources(key, pixels, own_fsp, own_fill, fill_cells, fill_of[fill_cells])
+
+
+@njit(cache=True, nogil=True)
+def _scan_sources(segment, fsp, fpp, fill, scale, last, starts, own, fill_of, below):
+    """``library_sources`` of one part of the library's rows: where each run of rows of one ``(segment, FSP)``
+    starts, into ``starts``, and which rows are their source's own cell's (``FPP == FSP``), into ``own``; returns how
+    many of each.  ``last`` is the previous part's last ``(segment, FSP)`` and 1, or 0s before the first part, and
+    is moved on to this part's.
+
+    Each row's fill, float32 ``fill / scale``, goes to its cell of
+    ``fill_of`` unless 0 (``fill_of`` starts at 0), and of ``below``, unless
+    empty, as ``min(fill, 0)``.
+    """
     zero = np.float32(0.0)
-    if below.size > 0:
-        f = fill[i]
-        below[fpp[i]] = min(zero, f)
-        
-    k = key[i]
-    if k < 0 or k >= dof.size:
-        return
-    
-    water = dof[k]
-    if water != water:  # noqa: PLR0124
-        return
-    
-    head = water - dtf[i]
-    if not head > zero:
-        return
-    
-    f = fill[i]
-    depth = np.float32(head + (f if (f > zero or f != f) else zero)) # noqa: PLR0124
-    p = fpp[i]
-    current = best[p]
-    if current != current: # noqa: PLR0124
-        return
-    
-    if depth != depth or depth > current: # noqa: PLR0124
-        best[p] = depth
+    n_starts = 0
+    n_own = 0
+    for i in range(fsp.size):
+        source = fsp[i]
+        k = segment[i]
+        if last[2] == 0 or source != last[0] or k != last[1]:
+            starts[n_starts] = i
+            n_starts += 1
+            last[0] = source
+            last[1] = k
+            last[2] = 1
+
+        cell = fpp[i]
+        if cell == source:
+            own[n_own] = i
+            n_own += 1
+
+        raw = fill[i]
+        if raw != 0:
+            fill_of[cell] = np.float32(raw / scale)
+        if below.size > 0:
+            below[cell] = min(zero, np.float32(raw / scale))
+
+    return n_starts, n_own
+
+
+@njit(cache=True, nogil=True)
+def _deepest_heads(best: np.ndarray, key: np.ndarray, fpp: np.ndarray, dtf: np.ndarray, scale: float,
+                   dof: np.ndarray):
+    """Raise ``best[p]`` to the head of each library row ``(key, p, DTF)`` above 0: ``dof[key] - DTF``, how deep the
+    water stands over ``p``'s filled surface, in float32 (``DTF`` is float32 ``dtf / scale``).
+
+    ``dof`` is NaN for a key without a depth, and a key outside it has none
+    either.  The order of the rows doesn't matter.
+    """
+    zero = np.float32(0.0)
+    for i in range(key.size):
+        k = key[i]
+        if k < 0 or k >= dof.size:
+            continue
+
+        head = dof[k] - np.float32(dtf[i] / scale)
+        if head > zero and head > best[fpp[i]]:
+            best[fpp[i]] = head
+
+
+def _add_fill(best: np.ndarray, sources: LibrarySources):
+    """Add to the heads in ``best`` (``_deepest_heads``; -inf where none) their cell's fill where it is above 0: the
+    depth over the DEM.  A NaN fill makes the depth NaN.  Each cell's fill is the same in every row, and float32
+    rounding keeps the order of sums, so this is the deepest of its rows' ``head + fill``."""
+    heads = best[sources.fill_cells]
+    reached = heads > -np.inf
+    best[sources.fill_cells[reached]] = heads[reached] + sources.fill_values[reached]
+
 
 def make_fldpln_flood_map(
         vdt_df: pl.DataFrame,
         fdr: np.ndarray,
         fldpln_library: pl.LazyFrame | str | os.PathLike,
-        stream_info_df: pd.DataFrame,
+        stream_info_df: pl.DataFrame | pd.DataFrame,
         fill_below_dem: np.ndarray | None = None,
-        min_depth: float = 0.0) -> np.ndarray:
+        min_depth: float = 0.0,
+        sources: LibrarySources | None = None) -> np.ndarray:
     """Flood depth raster for one event, from VDT stages and a floodplain library.
 
     1. Along each reach (its pixels in ``stream_info_df``, walked down the
@@ -139,48 +225,29 @@ def make_fldpln_flood_map(
     Returns the depth where the cell floods, NaN elsewhere, on ``fdr``'s grid;
     no DEM is needed.  ``vdt_df`` needs ``COMID``, ``Row``, ``Col``, ``Elev``
     and ``WSE``.  ``fldpln_library`` is a Parquet library's path or a
-    LazyFrame (a CSV library), read a part at a time.  ``fill_below_dem``, a
-    float32 raster, gets ``min(fill, 0)`` at every cell of the library: how
-    far the filled DEM sits below the DEM, for the water surface.
+    LazyFrame (a CSV library), read a part at a time: its stream pixels and
+    fills first (``library_sources``, unless ``sources`` gives them, read
+    once for every flow), and then its depths.  ``fill_below_dem``, a float32
+    raster, gets ``min(fill, 0)`` at every cell of the library: how far the
+    filled DEM sits below the DEM, for the water surface; with ``sources``,
+    ``library_sources`` wrote it.  ``stream_info_df`` is a polars or pandas
+    DataFrame.
     """
-    columns = _library_columns(fldpln_library)
-    if 'fill' not in columns:
-        raise ValueError("The FLDPLN library has no fill column. Rebuild it with build_fldpln_library, "
-                         "which now takes the DEM the floods are mapped on.")
     nrows, ncols = fdr.shape
     # C order: the library's flat pixel ids index it
     depth_array = np.full((nrows, ncols), np.nan, dtype=np.float32)
 
-    # Each segment's stream pixels, read a part at a time like the depths
-    # below.  Every stream pixel of a reach in the library is the source of
-    # at least its own cell, so it has a row there, which gives its fill.
-    key = 'segment' if 'segment' in columns else 'FSP'
-    group = ['segment', 'FSP'] if key == 'segment' else ['FSP']
-    pairs, own_fsp, own_fill = [], [], []
-    for part in _library_parts(fldpln_library, group + ['FPP', 'fill']):
-        if not len(part['FPP']):
-            continue
-        # A sorted library repeats each source over its rows: drop the repeats
-        # first, cheaply, and leave the rest to the unique below
-        repeat = np.ones(len(part['FPP']) - 1, dtype=bool)
-        for column in group:
-            values = part[column]
-            repeat &= values[1:] == values[:-1]
+    # Each segment's stream pixels, and the fill of their own cells.  Every
+    # stream pixel of a reach in the library is the source of at least its
+    # own cell, so it has a row there, which gives its fill.
+    if sources is None:
+        sources = library_sources(fldpln_library, depth_array.size, fill_below_dem, scratch=depth_array.reshape(-1))
+        depth_array.fill(np.nan)
 
-        first = np.r_[True, ~repeat]
-        pairs.append(pl.DataFrame({column: part[column][first] for column in group}))
-        fsp = part['FSP']
-        is_own = fsp == part['FPP']
-        own_fsp.append(fsp[is_own])
-        own_fill.append(part['fill'][is_own])
-
-    if not pairs:
+    if sources.pixels.is_empty():
         return depth_array
-    
-    library_pixels = pl.concat(pairs).unique()
-    # A cell's fill is the same in every row: any one of a source's own rows will do
-    own_fsp, first = np.unique(np.concatenate(own_fsp), return_index=True)
-    own_fill = np.concatenate(own_fill)[first]
+
+    key, library_pixels, own_fsp, own_fill = sources.key, sources.pixels, sources.own_fsp, sources.own_fill
 
     # The VDT's WSE and Elev at its stream pixels, sorted by pixel; a pixel listed twice keeps its last row
     vdt_fsp = vdt_df['Row'].to_numpy().astype(np.int64) * ncols + vdt_df['Col'].to_numpy()
@@ -188,14 +255,15 @@ def make_fldpln_flood_map(
     vdt_fsp, vdt_wse, vdt_elev = vdt_fsp[order], vdt_df['WSE'].to_numpy()[order], vdt_df['Elev'].to_numpy()[order]
     stream_ids = list(set(vdt_df['COMID']))
 
-    stream_info_dict = stream_info_df.set_index('stream_id').to_dict(orient='index')
+    row_of = {stream_id: i for i, stream_id in enumerate(stream_info_df['stream_id'].to_numpy().tolist())}
     for stream_id in stream_ids:
-        if stream_id not in stream_info_dict:
+        if stream_id not in row_of:
             raise ValueError(f"Stream ID {stream_id} not found in stream_info_df.")
 
     # Walk each reach's stream pixels, with the VDT's WSE and Elev where it has them
-    starts = np.array([stream_info_dict[s]['start_pixel'] for s in stream_ids], dtype=np.int64)
-    lengths = np.array([stream_info_dict[s]['length'] for s in stream_ids], dtype=np.int64)
+    rows = np.array([row_of[s] for s in stream_ids], dtype=np.int64)
+    starts = stream_info_df['start_pixel'].to_numpy().astype(np.int64)[rows]
+    lengths = stream_info_df['length'].to_numpy().astype(np.int64)[rows]
     pixels, offsets = _walk_reaches(starts, lengths, fdr.ravel(), nrows, ncols)
     at = np.searchsorted(vdt_fsp, pixels, side='right') - 1
     known = at >= 0
@@ -264,24 +332,23 @@ def make_fldpln_flood_map(
     # Read the library a part at a time and keep only each pixel's deepest
     # water so far, in ``depth_array`` itself: joined whole, the library and
     # its join were several times the size of every raster in the run.
-    best = depth_array.ravel()
-    best[:] = -np.inf
-    below = np.empty(0, np.float32) if fill_below_dem is None else fill_below_dem.reshape(-1)
-    for part in _library_parts(fldpln_library, [key, 'FPP', 'DTF', 'fill']):
-        _deepest_water(best, part[key], part['FPP'], part['DTF'], part['fill'], dof, below)
-        
-    _shallow_to_nan(depth_array, np.float32(min_depth))
+    best = depth_array.reshape(-1)
+    best.fill(-np.inf)
+    for part in _library_parts(fldpln_library, [key, 'FPP', 'DTF']):
+        dtf = part['DTF']
+        _deepest_heads(best, part[key], part['FPP'], dtf, _scale(dtf), dof)
+
+    _add_fill(best, sources)
+    # NaN where the depth isn't above 0 and at least min_depth (a NaN depth is NaN already)
+    min_depth = np.float32(min_depth)
+    if min_depth > 0:
+        best[best < min_depth] = np.nan
+    elif min_depth <= 0:
+        best[best <= 0] = np.nan
+    else:
+        best.fill(np.nan)
 
     return depth_array
-
-@njit(cache=True, parallel=True)
-def _shallow_to_nan(depth: np.ndarray, min_depth: np.float32):
-    """NaN, in place, where ``depth`` isn't above 0 and at least ``min_depth``."""
-    for r in prange(depth.shape[0]):
-        for c in range(depth.shape[1]):
-            if not (depth[r, c] > 0 and depth[r, c] >= min_depth):
-                depth[r, c] = np.nan
-
 
 def _median_by_group(group: np.ndarray, value: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Each group's median: its middle value, or the lower of the two middle ones for an even count.
@@ -329,47 +396,56 @@ def _library_columns(library: pl.LazyFrame | str | os.PathLike) -> list[str]:
     return pq.read_schema(library).names
 
 def _library_parts(library: pl.LazyFrame | str | os.PathLike, columns: list[str]):
-    """The library's ``columns``, ``_LIBRARY_SLICE_ROWS`` rows at a time, as NumPy arrays by name, with decimals as
-    float32.
+    """The library's ``columns`` a part at a time, as NumPy arrays by name: ``_READ_ROWS`` rows of a Parquet file,
+    ``_LIBRARY_SLICE_ROWS`` of a LazyFrame.  DTF and fill are float32 metres, or int32 hundredths of a metre: their
+    values are ``_metres`` of them.
 
     A Parquet file is read through pyarrow, a batch at a time: two to five
     times as fast as slicing ``pl.scan_parquet``, and half the memory.
-    Without pre-buffering: pyarrow would hold the requested columns of every
-    row group until the last batch
-    and read it no faster.  Its decimals, hundredths stored as integers, are
-    worked out from the integers (``_column_values``); a LazyFrame's (a CSV
-    library's) are cast by polars, which gives the same values.
     """
-    rows = library_writer._LIBRARY_SLICE_ROWS
     if isinstance(library, pl.LazyFrame):
+        rows = library_writer._LIBRARY_SLICE_ROWS
         n = library.select(pl.len()).collect().item()
         for offset in range(0, n, rows):
             part = library.slice(offset, rows).select(columns).collect()
             part = part.with_columns([pl.col(c).cast(pl.Float32) for c, d in part.schema.items() if d == pl.Decimal])
             yield {c: part[c].to_numpy() for c in columns}
         return
-    for batch in pq.ParquetFile(library, pre_buffer=False).iter_batches(batch_size=rows, columns=columns):
+    
+    for batch in pq.ParquetFile(library, pre_buffer=False).iter_batches(batch_size=_READ_ROWS, columns=columns):
         yield {name: _column_values(batch.column(i)) for i, name in enumerate(batch.schema.names)}
 
 def _column_values(column: pa.Array) -> np.ndarray:
-    """A library column's values as NumPy, a decimal's as float32.
+    """A library column's values as NumPy: a decimal of hundredths stored in 32 bits (``DECIMAL_COLS``) as its int32
+    hundredths, and any other decimal cast to float32 by polars.
 
-    A decimal of hundredths stored in 32 bits (``DECIMAL_COLS``) is worked
-    out from its integers, ``float32(integer / 100)``, which is what polars'
-    cast gives for every one of them (all twenty million of decimal32(7, 2)
-    were checked), at a third of the cost; any other decimal is cast by polars.
+    ``float32(integer / 100)``, worked out where a value is used, is what
+    polars' cast gives for every one of them (all twenty million of
+    decimal32(7, 2) were checked), with no float32 copy of the column.
+    Numbers without nulls are read in place, from the column's buffer:
+    pyarrow's ``to_numpy`` imports pandas, a third of a second.
     """
-    if pa.types.is_decimal(column.type):
-        if column.type.bit_width == 32 and column.type.scale == 2 and column.null_count == 0:
-            integers = np.frombuffer(column.buffers()[1], dtype=np.int32)[column.offset:column.offset + len(column)]
-            return _hundredths(integers)
+    kind = column.type
+    if pa.types.is_decimal(kind):
+        if kind.bit_width == 32 and kind.scale == 2 and column.null_count == 0:
+            return _in_place(column, np.dtype(np.int32))
+        
         return pl.from_arrow(column).cast(pl.Float32).to_numpy()
+    
+    if column.null_count == 0 and (pa.types.is_integer(kind) or pa.types.is_floating(kind)):
+        letter = "f" if pa.types.is_floating(kind) else "i" if pa.types.is_signed_integer(kind) else "u"
+        return _in_place(column, np.dtype(f"{letter}{kind.bit_width // 8}"))
+    
     return column.to_numpy(zero_copy_only=False)
 
-@njit(cache=True, parallel=True)
-def _hundredths(integers: np.ndarray) -> np.ndarray:
-    """``integers / 100`` as float32: worked out in float64, and rounded once."""
-    out = np.empty(integers.size, dtype=np.float32)
-    for i in prange(integers.size):
-        out[i] = np.float32(integers[i] / 100.0)
-    return out
+def _in_place(column: pa.Array, dtype: np.dtype) -> np.ndarray:
+    """A fixed-width column without nulls as NumPy ``dtype``, read from its data buffer."""
+    return np.frombuffer(column.buffers()[1], dtype=dtype)[column.offset:column.offset + len(column)]
+
+def _scale(values: np.ndarray) -> float:
+    """What a DTF or fill column of ``_library_parts`` is divided by to give metres: 100 for integer hundredths."""
+    return 100.0 if values.dtype.kind in "iu" else 1.0
+
+def _metres(values: np.ndarray) -> np.ndarray:
+    """A DTF or fill column of ``_library_parts`` in metres, as float32: worked out in float64 and rounded once."""
+    return (values / _scale(values)).astype(np.float32)

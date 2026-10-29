@@ -9,7 +9,6 @@ import os
 
 # third-party imports
 import numpy as np
-import pandas as pd
 import polars as pl
 import polars.selectors as cs
 from numba import njit, prange
@@ -37,12 +36,12 @@ from curve2flood.rating_curves import (
     Calculate_Depth_TopWidth_TWMax_Velocity,
     calculate_interpolated_vdt,
 )
-from curve2flood.spreaders import (
+from curve2flood.spreaders.fldpln import (
+    library_metadata,
+    library_sources,
     make_fldpln_flood_map,
-    multi_point_interpolation,
-    spread_stream_cells,
 )
-from curve2flood.spreaders.fldpln import library_metadata
+from curve2flood.spreaders.kernel_weighted import spread_stream_cells
 from curve2flood.streamcell_values import StreamCellValues
 
 gdal.UseExceptions()
@@ -89,13 +88,18 @@ def convert_cell_size(
 
     return d_x_cell_size, d_y_cell_size
 
-@njit("float32[:,:](int32, float32, float32)", cache=True)
-def create_weightbox(tw: int, dx: float, dy: float):
-    """Inverse squared distance weights for a ``(2*tw + 1)`` square window.
+def create_weightbox(tw: int, dx: float, dy: float) -> np.ndarray:
+    """Inverse squared distance weights for a ``(2*tw + 1)`` square window, float32.
 
     ``tw`` is the window's half width in cells; the centre weight is capped at
-    ``1 / 0.0001``.
+    ``1 / 0.0001``.  Worked out with ``tw`` as int32 and ``dx`` and ``dy`` as
+    float32.
     """
+    return _create_weightbox(np.int32(tw), np.float32(dx), np.float32(dy))
+
+@njit(cache=True)
+def _create_weightbox(tw, dx, dy):
+    """``create_weightbox``, compiled when first used rather than on import."""
     n = 2*tw + 1
     indices = np.arange(n)
     # Squared distance (m^2) of each column and row from the centre cell
@@ -193,6 +197,7 @@ def _make_fldpln_flood_map(
         flow_dir,
         fldpln_library,
         V_Rast=None,
+        sources=None,
         ):
     """FLDPLN mapper: ``(flood, depth, None)`` for one flow event.
 
@@ -202,7 +207,9 @@ def _make_fldpln_flood_map(
     velocity raster is written.  When ``S_Rast`` is given, the stream cells'
     slopes are written into it, and their valley slopes into ``V_Rast``; when
     ``fill_below_dem`` is, how far the filled DEM sits below the DEM at each
-    library cell (for ``water_surface``).
+    library cell (for ``water_surface``), unless ``sources``, the library's
+    stream pixels and fills (``library_sources``), are given: it was written
+    as they were read.
     """
     vdt_df = calculate_interpolated_vdt(
         config.print_vdt_database,
@@ -221,23 +228,15 @@ def _make_fldpln_flood_map(
         stream_info,
         fill_below_dem=fill_below_dem,
         min_depth=config.fldpln_min_flood_depth,
+        sources=sources,
     )
 
-    Flood_array = _wet(depth)
+    # 1 where the depth is above 0, else 0: the comparison's bools are those bytes
+    Flood_array = np.greater(depth, 0).view(np.uint8)
     # Depths are only used to write depth, WSE or velocity rasters
     Depth_array = depth if config.outdep or config.outwse or config.outvel else None
 
     return Flood_array, Depth_array, None  # Slopes are spread after all events are mapped
-
-@njit(cache=True, parallel=True)
-def _wet(depth: np.ndarray) -> np.ndarray:
-    """1 where ``depth`` is above 0, else 0, as uint8."""
-    wet = np.empty(depth.shape, dtype=np.uint8)
-    for r in prange(depth.shape[0]):
-        for c in range(depth.shape[1]):
-            wet[r, c] = 1 if depth[r, c] > 0 else 0
-
-    return wet
 
 def Curve2Flood(config: Config, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
                 COMID_Unique_Flow, WeightBox,
@@ -248,7 +247,8 @@ def Curve2Flood(config: Config, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique
                 stream_info,
                 fldpln_library,
                 V_Rast=None,
-                channel=None,):
+                channel=None,
+                sources=None,):
     """Map one flow event with the configured mapper.
 
     Returns ``(flood, depth, slope)`` on the DEM grid; ``depth`` and ``slope``
@@ -256,7 +256,8 @@ def Curve2Flood(config: Config, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique
     are padded by one cell, and ``RR``/``CC`` index their stream cells.  The
     FLDPLN mapper reads neither.  ``V_Rast`` gets the stream cells' valley
     slopes, and the kernel-weighted mapper's slope outside the ``channel``
-    is theirs (see ``channel_cells``).
+    is theirs (see ``channel_cells``).  ``sources`` are the FLDPLN library's
+    stream pixels and fills (``library_sources``).
     """
     if config.mapper == FLDPLN:
         return _make_fldpln_flood_map(
@@ -268,9 +269,12 @@ def Curve2Flood(config: Config, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique
             flowdir,
             fldpln_library,
             V_Rast,
+            sources,
         )
 
     if config.mapper == MULTI_POINT:
+        # Imported here: it alone needs pandas and SciPy
+        from curve2flood.spreaders.multi_point import multi_point_interpolation
         # It reads its rating curves itself, at its points
         Flood_array, Depth_array, Slope_array, stats_message = multi_point_interpolation(
             E=E,
@@ -331,19 +335,40 @@ def Set_Stream_Locations(nrows: int, ncols: int, infilename: str, one_based: boo
     rows and columns count from 1.  A cell outside the ``nrows`` by
     ``ncols`` grid raises a ValueError: the table is another DEM's.
     """
-    if is_parquet(infilename):
-        df = pd.read_parquet(infilename, columns=['Row', 'Col', 'COMID'])
-    else:
-        df = pd.read_csv(infilename, usecols=['Row', 'Col', 'COMID'])
-
-    rows = df['Row'].to_numpy(np.int64) - int(one_based)
-    cols = df['Col'].to_numpy(np.int64) - int(one_based)
-    check_cells_inside(rows, cols, nrows, ncols, infilename)
-    ids = df['COMID'].to_numpy()
+    rows, cols, ids = _stream_table(nrows, ncols, infilename, one_based)
     S = np.full((nrows, ncols), -9999, dtype=id_dtype(ids))
     S[rows, cols] = ids
 
     return S
+
+def _stream_table(nrows: int, ncols: int, infilename: str, one_based: bool = False):
+    """The ``Row``, ``Col`` (int64, from 0) and ``COMID`` columns of a VDT or curve file (``Set_Stream_Locations``)."""
+    df = _read_table(infilename, ['Row', 'Col', 'COMID'])
+    rows = df['Row'].to_numpy().astype(np.int64) - int(one_based)
+    cols = df['Col'].to_numpy().astype(np.int64) - int(one_based)
+    check_cells_inside(rows, cols, nrows, ncols, infilename)
+    return rows, cols, df['COMID'].to_numpy()
+
+def _stream_cells(nrows: int, ncols: int, infilename: str, one_based: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """The cells of ``Set_Stream_Locations``' raster with an id above 0, without the raster: their flat indices,
+    ``row * ncols + col`` (int64), ascending, and their ids, int32 when every id of the table fits (see
+    ``id_dtype``).  A cell listed twice keeps its last row's id, as the raster does."""
+    rows, cols, ids = _stream_table(nrows, ncols, infilename, one_based)
+    ids = ids.astype(id_dtype(ids), copy=False)
+    cells = rows * ncols + cols
+    order = np.argsort(cells, kind='stable')
+    cells, ids = cells[order], ids[order]
+    last = np.ones(cells.size, dtype=np.bool_)
+    last[:-1] = cells[1:] != cells[:-1]
+    last &= ids > 0
+    return cells[last], ids[last]
+
+def _read_table(path: str, columns: list[str]) -> pl.DataFrame:
+    """Some columns of a CSV or Parquet table."""
+    if is_parquet(path):
+        return pl.read_parquet(path, columns=columns)
+    
+    return pl.read_csv(path, columns=columns)
 
 def check_cells_inside(rows: np.ndarray, cols: np.ndarray, nrows: int, ncols: int, table: str):
     """Raise a ValueError if any of a table's cells ``(rows, cols)`` lies outside the ``nrows`` by ``ncols`` grid."""
@@ -382,7 +407,7 @@ def _positive_cells(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def check_flow_file(FlowFileName: str) -> int:
     """The number of flow events in a flow file, after checking it has at least one and at most
     ``MAX_FLOW_EVENTS``, and no negative flow.  Raises a ValueError otherwise."""
-    table = _scan_table(FlowFileName)
+    table = _scan_flows(FlowFileName)
     events = table.collect_schema().names()[1:]
     if not events:
         raise ValueError(f"The flow file {FlowFileName} has no flow events: a column of flows for each after its "
@@ -402,7 +427,7 @@ def check_flow_file(FlowFileName: str) -> int:
 def _warn_reaches_without_flows(FlowFileName: str, stream_ids: np.ndarray):
     """Say which reaches with stream cells have no flow in the flow file, and how many of its reaches have no
     stream cell: the ones without a flow don't flood."""
-    flow_ids = _scan_table(FlowFileName).select(pl.first()).collect().to_series().to_numpy()
+    flow_ids = _scan_flows(FlowFileName).select(pl.first()).collect().to_series().to_numpy()
     no_flow = np.setdiff1d(stream_ids, flow_ids)
     if no_flow.size:
         LOG.warning(f"{no_flow.size} of the {stream_ids.size} reaches with stream cells have no flow in "
@@ -418,23 +443,26 @@ def FindFlowRateForEachCOMID_Ensemble(FlowFileName: str, flow_event_num: int) ->
     The flow file (CSV or Parquet) has the COMID in its first column and one
     column of flows per event.  Missing flows are treated as zero.
     """
-    if is_parquet(FlowFileName):
-        names = _scan_table(FlowFileName).collect_schema().names()
-        flow_df = pd.read_parquet(FlowFileName, columns=[names[0], names[flow_event_num + 1]])
-    else:
-        flow_df = pd.read_csv(FlowFileName, usecols=[0, flow_event_num + 1])
-
-    if flow_df.iloc[:, 1].isna().any():
+    table = _scan_flows(FlowFileName)
+    names = table.collect_schema().names()
+    comid, event = names[0], names[flow_event_num + 1]
+    flow_df = table.select(comid, pl.col(event).cast(pl.Float64)).collect()
+    flows = flow_df[event]
+    if flows.is_null().any() or flows.is_nan().any():
         LOG.warning(f"Warning: NaN values found in flow data for event {flow_event_num}. These will be treated as zero flow.")
-        flow_df.iloc[:, 1] = flow_df.iloc[:, 1].fillna(0)
+        flows = flows.fill_nan(0.0).fill_null(0.0)
 
-    comid_q_dict = flow_df.set_index(flow_df.columns[0])[flow_df.columns[1]].to_dict()
-
-    return comid_q_dict
+    # A COMID listed twice keeps its last flow
+    return dict(zip(flow_df[comid].to_list(), flows.to_list()))
 
 def _scan_table(path: str) -> pl.LazyFrame:
     """A CSV or Parquet table, lazily."""
     return pl.scan_parquet(path) if is_parquet(path) else pl.scan_csv(path)
+
+def _scan_flows(path: str) -> pl.LazyFrame:
+    """A flow file, lazily: a CSV's column types from all of its rows, as pandas read it, so that a flow with
+    decimals after whole ones is a float."""
+    return pl.scan_parquet(path) if is_parquet(path) else pl.scan_csv(path, infer_schema_length=None)
 
 def has_valley_slopes(VDTDatabaseFileName: str | None) -> bool:
     """Whether a VDT database gives its stream cells' valley slopes (``Valley_Slope``, ARC's with Valley_Sections)."""
@@ -447,10 +475,7 @@ def channel_cells(VDTDatabaseFileName: str, nrows: int, ncols: int, dx: float, d
     The water in a channel runs along it, at the stream's slope, but over the
     floodplain of a meandering river it runs straight down the valley, at the
     valley's slope: the stream's times its sinuosity.  So outside the channels
-    the velocity takes the valley's slope, where the VDT gives it.  On
-    synthetic meanders, against a 2D model (LISFLOOD-FP's local inertial
-    scheme), the velocities over the floodplain were 0.71-0.93 of the 2D
-    model's with the stream's slope, and 0.88-1.02 with the valley's.
+    the velocity takes the valley's slope, where the VDT gives it.
 
     A stream cell's baseflow top width is the VDT's at the first flow at or
     above its ``QBaseflow``, as in ``Find_TopWidth_at_Baseflow_when_using_VDT``,
@@ -491,11 +516,8 @@ def _paint_channel(rows, cols, half_widths, dx, dy, channel):
 
 def _vdt_cells(VDTDatabaseFileName: str, ncols: int) -> np.ndarray:
     """The flat indices, ``row * ncols + col``, of a VDT database's cells, ascending."""
-    if is_parquet(VDTDatabaseFileName):
-        df = pd.read_parquet(VDTDatabaseFileName, columns=['Row', 'Col'])
-    else:
-        df = pd.read_csv(VDTDatabaseFileName, usecols=['Row', 'Col'])
-    return np.unique(df['Row'].to_numpy(np.int64) * ncols + df['Col'].to_numpy(np.int64))
+    df = _read_table(VDTDatabaseFileName, ['Row', 'Col'])
+    return np.unique(df['Row'].to_numpy().astype(np.int64) * ncols + df['Col'].to_numpy().astype(np.int64))
 
 def spread_flood(
         config: Config,
@@ -525,53 +547,57 @@ def spread_flood(
         FlowDir = read_array(config.flow_direction_file, np.uint8)
         _check_shape(FlowDir, (nrows, ncols), "Flow direction raster")
 
-        if is_parquet(config.stream_info_file):
-            stream_info: pd.DataFrame = pd.read_parquet(config.stream_info_file)
-        else:
-            stream_info: pd.DataFrame = pd.read_csv(config.stream_info_file)
+        stream_info = _read_table(config.stream_info_file, ['stream_id', 'start_pixel', 'length'])
 
-        # A Parquet library is read by its path, a row group at a time (see _make_fldpln_flood_map)
+        # A Parquet library is read by its path, a part at a time (see make_fldpln_flood_map)
         if is_parquet(config.fldpln_library):
             fldpln_library = config.fldpln_library
         else:
             fldpln_library = pl.scan_csv(config.fldpln_library)
         # How far the filled DEM sits below the DEM, from the library, for the water surface (see water_surface)
         fill_below_dem = np.full((nrows, ncols), np.nan, np.float32) if config.outwse else None
+        # The library's stream pixels and fills are the same for every event: read once, writing fill_below_dem
+        sources = library_sources(fldpln_library, nrows * ncols, fill_below_dem)
     else:
         FlowDir = None
         fill_below_dem = None
         stream_info = None
         fldpln_library = None
+        sources = None
 
     LOG.info("Executing flood mapping logic...")
 
     # Stream cells come from the stream raster with Set_Depth, otherwise from the VDT or curve file, whose rows and
     # columns the multi-point mapper may count from 1
     one_based = config.mapper == MULTI_POINT and config.mpi_one_based_vdt_rc
+    # Where the stream cells are, row by row, and their ids, int32 when they all fit (see id_dtype).  After this
+    # only whether a cell is a stream cell is needed (S), but for the multi-point mapper's padded stream ids.
     if set_depth:
         S, _, _ = Read_Raster_GDAL(config.stream_file)
         _check_shape(S, (nrows, ncols), "Stream raster")
-    elif config.print_vdt_database:
-        S = Set_Stream_Locations(nrows, ncols, config.print_vdt_database, one_based)
+        ids = as_ids(S)
+        rows, cols = _positive_cells(ids)
+        stream_ids = ids[rows, cols]
+        del ids
+        S = S > 0
     else:
-        S = Set_Stream_Locations(nrows, ncols, config.print_curve_file, one_based)
+        cells, stream_ids = _stream_cells(nrows, ncols, config.print_vdt_database or config.print_curve_file,
+                                          one_based)
+        rows, cols = np.divmod(cells, ncols)
+        S = np.zeros((nrows, ncols), dtype=np.bool_)
+        S.reshape(-1)[cells] = True
+        del cells
 
-    # Where the stream cells are, as indices of the rasters padded by one cell, and their ids, int32 when they all
-    # fit (see id_dtype).  After this only whether a cell is a stream cell is needed (S > 0), but for the
-    # multi-point mapper's padded stream ids.
-    ids = as_ids(S)
-    rows, cols = _positive_cells(ids)
+    # As indices of the rasters padded by one cell
     RR, CC = rows + 1, cols + 1
-
-    COMID_Unique = np.unique(ids[rows, cols]).astype(np.int64)  # Always sorted
+    COMID_Unique = np.unique(stream_ids).astype(np.int64)  # Always sorted
     B = None
     if config.mapper == MULTI_POINT:
         # It reads them only at the stream cells (see StreamCellValues)
-        B = StreamCellValues(RR * (ncols + 2) + CC, ncols + 2, 0, dtype=ids.dtype)
-        B.values[:] = ids[rows, cols]
+        B = StreamCellValues(RR * (ncols + 2) + CC, ncols + 2, 0, dtype=stream_ids.dtype)
+        B.values[:] = stream_ids
 
-    del ids, rows, cols
-    S = S > 0
+    del stream_ids, rows, cols
 
     if set_depth:
         # Every stream cell gets the same depth, so there is a single event
@@ -632,7 +658,7 @@ def spread_flood(
             config, E, B, RR, CC, nrows, ncols, dx, dy, COMID_Unique,
             COMID_Unique_Flow, WeightBox, TW_for_WeightBox_ElipseMask,
             quiet, flood_vdt_cells, T_Rast, W_Rast, S_Rast, FlowDir,
-            fill_below_dem, stream_info, fldpln_library, V_Rast, channel
+            fill_below_dem, stream_info, fldpln_library, V_Rast, channel, sources
             )
         Flood_array_this_flow = remove_cells_not_connected(Flood_array_this_flow, S)
         Flood_Ensemble += Flood_array_this_flow
@@ -649,16 +675,14 @@ def spread_flood(
     return (_percent_of_events(Flood_Ensemble, num_flows), S, fill_below_dem, channel, S_Rast, V_Rast, Depth_Max,
             Slope_Max)
 
-@njit(cache=True, parallel=True)
 def _percent_of_events(counts: np.ndarray, num_flows: int) -> np.ndarray:
-    """The percentage of the ``num_flows`` flow events that flooded each cell, from how many did (``counts``),
-    rounded down, as uint8."""
-    percent = np.empty(counts.shape, dtype=np.uint8)
-    for r in prange(counts.shape[0]):
-        for c in range(counts.shape[1]):
-            percent[r, c] = np.int64(counts[r, c]) * 100 // num_flows
-
-    return percent
+    """The percentage of the ``num_flows`` flow events that flooded each cell, from how many did (``counts``, uint8
+    or uint16, worked in), rounded down, as uint8.  ``MAX_FLOW_EVENTS`` times 100 fits uint16."""
+    counts *= 100
+    if num_flows > 1:
+        counts //= num_flows
+        
+    return counts.astype(np.uint8, copy=False)
 
 def run_grid(config: Config) -> Grid:
     """The grid a run maps on: the DEM's, or for an FLDPLN flood map its library's (see ``library_metadata``) or,

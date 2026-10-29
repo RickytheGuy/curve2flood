@@ -521,7 +521,7 @@ def _cross_section_points(x, y, ux, uy, half_width, wse, spacing, dem, dx, dy, n
                     value = np.float64(dem[row, col])
                     if np.isfinite(value) and value > nodata:
                         ground = value
-                if not ground == ground or wse[i] <= ground:
+                if not ground == ground or wse[i] <= ground:     # noqa: PLR0124, SIM201
                     blocked[side] = True
                     continue
                 if write:
@@ -701,7 +701,7 @@ def _paint_buffers(mask, x, y, radius, pixel_width, pixel_height):
                 line = row + 0.5
                 a = _chain_crossing(us, vs, right, line)
                 b = _chain_crossing(us, vs, left, line)
-                if a != a or b != b:
+                if a != a or b != b:    # noqa: PLR0124
                     continue
                 start = max(int(np.floor(min(a, b) + 0.5)), 0)
                 end = min(int(np.floor(max(a, b) + 0.5)), ncols)
@@ -933,7 +933,7 @@ def _flood_candidates(wse, dem, corridor, anchor, nodata):
             ground = dem[r, c] > nodata
             water = wse[r, c]
             seeds[r, c] = anchor[r, c] and ground
-            candidates[r, c] = seeds[r, c] or (ground and corridor[r, c] and water == water and dem[r, c] < water)
+            candidates[r, c] = seeds[r, c] or (ground and corridor[r, c] and water == water and dem[r, c] < water)     # noqa: PLR0124
 
     return candidates, seeds
 
@@ -984,7 +984,7 @@ def _depth_in_place(wse, dem):
     for r in prange(wse.shape[0]):
         for c in range(wse.shape[1]):
             water = wse[r, c]
-            if water == water:
+            if water == water:     # noqa: PLR0124
                 wse[r, c] = max(water - dem[r, c], np.float32(0.0))
 
 @njit(cache=True, parallel=True)

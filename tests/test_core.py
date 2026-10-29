@@ -1,6 +1,7 @@
 """Small tests of the Curve2Flood driver: running it, input files and raster helpers."""
 
 import logging
+import subprocess
 import sys
 
 import numpy as np
@@ -15,8 +16,8 @@ from curve2flood import (
     Curve2Flood_MainFunction,
     _ids,
     _raster,
-    cli,
     bathymetry,
+    cli,
     core,
     outputs,
     rating_curves,
@@ -744,6 +745,59 @@ def test_stream_ids_that_do_not_fit_in_int32_are_kept_whole(tmp_path):
                                             (np.array([5.0, 2.0**40]), np.int64)])
 def test_ids_are_int32_when_they_fit(ids, dtype):
     assert _ids.id_dtype(np.asarray(ids)) == dtype
+
+
+def test_stream_cells_are_the_stream_raster_s_positive_cells(tmp_path):
+    """The cells of Set_Stream_Locations' raster with an id above 0, without the raster, ascending: a cell listed
+    twice keeps its last row's id, and the ids have the raster's type."""
+    path = tmp_path / "vdt.csv"
+    big = 55000400012345  # an NHDPlus HR id
+    pd.DataFrame({"COMID": [7, 8, 0, -3, 9, big], "Row": [2, 0, 1, 1, 2, 0],
+                  "Col": [1, 0, 1, 0, 1, 2]}).to_csv(path, index=False)
+    raster = core.Set_Stream_Locations(3, 3, str(path)).ravel()
+    cells, ids = core._stream_cells(3, 3, str(path))
+    assert cells.tolist() == [0, 2, 7] and ids.tolist() == [8, big, 9]  # (2, 1) listed twice: 9 replaced 7
+    assert np.array_equal(cells, np.flatnonzero(raster > 0)) and np.array_equal(ids, raster[raster > 0])
+    assert ids.dtype == raster.dtype == np.int64
+
+
+@pytest.mark.parametrize("num_flows", [1, 3, core.MAX_FLOW_EVENTS])
+def test_percent_of_events_rounds_down(num_flows):
+    rng = np.random.default_rng(1)
+    counts = rng.integers(0, num_flows + 1, (5, 7)).astype(np.uint8 if num_flows == 1 else np.uint16)
+    counts[0, :2] = (0, num_flows)
+    expected = counts.astype(np.int64) * 100 // num_flows
+    percent = core._percent_of_events(counts, num_flows)
+    assert percent.dtype == np.uint8 and np.array_equal(percent, expected) and percent[0, 1] == 100
+
+
+def test_flows_with_decimals_after_whole_numbers_are_floats(tmp_path):
+    """A CSV flow file's columns are typed from all of their rows, as pandas typed them: a flow with decimals after
+    hundreds of whole ones is read, not refused."""
+    path = tmp_path / "flows.csv"
+    path.write_text("COMID,q\n" + "".join(f"{i},5\n" for i in range(1, 201)) + "201,7.5\n")
+    assert core.check_flow_file(str(path)) == 1
+    flows = core.FindFlowRateForEachCOMID_Ensemble(str(path), 0)
+    assert flows[1] == 5.0 and flows[201] == 7.5
+
+
+def test_mapping_with_a_parquet_library_imports_no_pandas(tmp_path):
+    """The driver imports neither pandas, SciPy's image tools nor GeoPandas, and reading a Parquet library imports
+    no pandas: only the multi-point mapper, curve files, velocity and the GeoPackage need them, and pandas alone
+    took a third of a second to import."""
+    path = tmp_path / "library.parquet"
+    from curve2flood.spreaders.fldpln.library import save_library
+    save_library({"FSP": np.array([5, 5], np.int32), "FPP": np.array([5, 0], np.int32),
+                  "DTF": np.array([0.0, 0.25], np.float32), "segment": np.array([0, 0], np.int32),
+                  "fill": np.array([0.0, 0.5], np.float32)}, path)
+    code = ("import sys\n"
+            "import curve2flood.core\n"
+            "from curve2flood.spreaders.fldpln import library_sources\n"
+            f"sources = library_sources({str(path)!r}, 6)\n"
+            "assert sources.fill_cells.tolist() == [0]\n"
+            "print(sorted(m for m in ('pandas', 'scipy.ndimage', 'geopandas', 'shapely') if m in sys.modules))\n")
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == "[]"
 
 
 def test_an_fldpln_flood_map_takes_its_grid_from_its_library(tmp_path):

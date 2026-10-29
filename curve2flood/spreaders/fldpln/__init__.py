@@ -39,8 +39,16 @@ Flow directions use WhiteboxTools D8 codes, and the stream table has columns
 indices, ``row * ncols + col``, of the grid a Parquet library records in its
 metadata (``library_metadata``), so a flood map needs no DEM to place them.
 """
-from .library import build_fldpln_library
 from .library_writer import library_metadata
-from .mapping import make_fldpln_flood_map
+from .mapping import library_sources, make_fldpln_flood_map
 
-__all__ = ["build_fldpln_library", "library_metadata", "make_fldpln_flood_map"]
+__all__ = ["build_fldpln_library", "library_metadata", "library_sources", "make_fldpln_flood_map"]
+
+
+def __getattr__(name):
+    # The builder, and the pandas it reads with, are imported when first asked for: mapping a flood needs neither
+    # Saves import time
+    if name == "build_fldpln_library":
+        from .library import build_fldpln_library
+        return build_fldpln_library
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

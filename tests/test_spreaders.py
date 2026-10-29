@@ -4,16 +4,17 @@ import pandas as pd
 import polars as pl
 import pytest
 from numba import njit
-from scipy import ndimage as ndi
 from osgeo import gdal, ogr
+from scipy import ndimage as ndi
 from shapely.geometry import Point
 
 from curve2flood import core
 from curve2flood._patches import patches_holding
-from curve2flood.spreaders import fldpln, multi_point, kernel_weighted
-from curve2flood.spreaders.fldpln import library as fldpln_library, library_writer, mapping as fldpln_mapping
+from curve2flood.spreaders import fldpln, kernel_weighted, multi_point
+from curve2flood.spreaders.fldpln import library as fldpln_library
+from curve2flood.spreaders.fldpln import library_writer
+from curve2flood.spreaders.fldpln import mapping as fldpln_mapping
 from curve2flood.spreaders.kernel_weighted import create_kernel_weighted_spread_map
-
 
 # --------------------------------------------------------------------------
 # Kernel-weighted mapper
@@ -127,8 +128,7 @@ def _slice_spread(RR, CC, T_Rast, W_Rast, S_Rast, E, nrows, ncols, TW_m, dx, dy,
             continue
         if S_Rast is not None:
             SLOPE = float(S_Rast[r - 1, c - 1])
-        if COMID_TW_m > TW_m:
-            COMID_TW_m = TW_m
+        COMID_TW_m = min(COMID_TW_m, TW_m)
         COMID_TW = int(max(np.round(COMID_TW_m / dx), np.round(COMID_TW_m / dy)))
         r_min = max(r - COMID_TW, 1)
         r_max = min(r + COMID_TW + 1, nrows + 1)
@@ -421,8 +421,9 @@ def test_fldpln_needs_the_fill_column():
 
 @pytest.mark.parametrize("segments", [True, False])
 def test_fldpln_maps_a_library_file_as_its_lazy_frame(tmp_path, monkeypatch, segments):
-    """A Parquet library is read by its path, a row group at a time, with or without a segment column."""
+    """A Parquet library is read by its path, a part at a time, with or without a segment column."""
     monkeypatch.setattr(library_writer, "_LIBRARY_SLICE_ROWS", 3)
+    monkeypatch.setattr(fldpln_mapping, "_READ_ROWS", 2)
     library = _segment_library(fsp=[5, 5, 5, 6, 7, 8, 9], fpp=[0, 1, 2, 11, 12, 13, 14],
                                dtf=[0.1, 0.4, 0.9, 1.5, 0.2, 0.5, 0.5], segment=[0, 0, 0, 0, 0, 1, 1])
     if not segments:
@@ -436,35 +437,88 @@ def test_fldpln_maps_a_library_file_as_its_lazy_frame(tmp_path, monkeypatch, seg
     assert np.array_equal(from_file, _fldpln_map(library, wse=wse), equal_nan=True)
 
 
-def test_deepest_water_is_numpy_s_maximum_at():
-    """Keys without a depth, or outside the lookup, are skipped; a NaN fill makes its cell NaN; float64 columns (a CSV
-    library) are added in float64 and rounded."""
+def _random_library(n=400, cells=30, nan_fill=False):
+    """A library of ``n`` rows, sorted by segment and source, over ``cells`` cells, each with one fill, DTF and fill
+    in hundredths of a metre: ``(columns, fill of each cell)``.  Segment -1 has no depth, and segment 5 is outside
+    the lookup of ``_random_dof``."""
     rng = np.random.default_rng(3)
-    n = 400
-    key = rng.integers(-1, 6, n).astype(np.int32)
-    fpp = rng.integers(0, 30, n).astype(np.int32)
-    dof = np.array([1.0, np.nan, 2.5, 0.3, 4.0], np.float32)
-    for kind in (np.float32, np.float64):
-        dtf = rng.uniform(0.0, 3.0, n).astype(kind)
-        fill = rng.uniform(-1.0, 2.0, n).astype(kind)
-        fill[7] = np.nan
-        best = np.full(30, -np.inf, np.float32)
-        below = np.full(30, np.nan, np.float32)
-        fldpln_mapping._deepest_water(best, key, fpp, dtf, fill, dof, below)
-        expected_below = np.full(30, np.nan, np.float32)
-        expected_below[fpp] = np.where(fill < 0, fill, 0.0)  # every row's cell, whatever its key; the last row wins
-        assert np.array_equal(below, expected_below, equal_nan=True)
-        fldpln_mapping._deepest_water(best_again := np.full(30, -np.inf, np.float32), key, fpp, dtf, fill, dof,
-                                      np.empty(0, np.float32))
-        expected = np.full(30, -np.inf, np.float32)
-        known = (key >= 0) & (key < dof.size)
-        water = np.where(known, dof[np.clip(key, 0, dof.size - 1)], np.nan)
-        head = water - dtf
-        reaches = known & (head > 0)
-        depth = head[reaches] + np.maximum(fill[reaches], 0.0)
-        np.maximum.at(expected, fpp[reaches], depth.astype(np.float32))
+    segment = np.sort(rng.integers(-1, 6, n)).astype(np.int32)
+    fsp = (segment * 7 + rng.integers(0, 3, n)).astype(np.int32) % cells
+    fpp = rng.integers(0, cells, n).astype(np.int32)
+    fpp[::9] = fsp[::9]  # some sources' own cells
+    cell_fill = rng.integers(-100, 200, cells) / 100.0
+    if nan_fill:
+        cell_fill[7] = np.nan
+    columns = {"FSP": fsp, "FPP": fpp, "DTF": rng.integers(0, 300, n) / 100.0, "segment": segment,
+               "fill": cell_fill[fpp]}
+    return columns, cell_fill.astype(np.float32)
+
+
+def _random_dof():
+    return np.array([1.0, np.nan, 2.5, 0.3, 4.0], np.float32)
+
+
+def _libraries(tmp_path, columns):
+    """``columns`` as a LazyFrame of float32 metres, and saved as a Parquet library of decimals."""
+    lazy = pl.LazyFrame({c: v.astype(np.float32) if c in ("DTF", "fill") else v for c, v in columns.items()})
+    if np.isnan(columns["fill"]).any():
+        return [lazy]
+    path = tmp_path / "library.parquet"
+    fldpln_library.save_library(pd.DataFrame(columns), path)
+    return [lazy, str(path)]
+
+
+@pytest.mark.parametrize("nan_fill", [False, True])
+def test_deepest_heads_and_fill_are_numpy_s_maximum_at(tmp_path, monkeypatch, nan_fill):
+    """Each cell's depth is the deepest of its rows' head plus its fill above 0, as every row's depth, the deepest
+    kept by np.maximum.at, gives it: keys without a depth, or outside the lookup, are skipped, a NaN fill makes its
+    cell NaN, and a library of decimals read a part at a time gives what its float32 metres do."""
+    monkeypatch.setattr(fldpln_mapping, "_READ_ROWS", 64)
+    monkeypatch.setattr(library_writer, "_LIBRARY_SLICE_ROWS", 64)
+    columns, cell_fill = _random_library(nan_fill=nan_fill)
+    dof = _random_dof()
+    key, fpp = columns["segment"], columns["FPP"]
+    dtf = columns["DTF"].astype(np.float32)
+    known = (key >= 0) & (key < dof.size)
+    head = np.where(known, dof[np.clip(key, 0, dof.size - 1)], np.float32(np.nan)) - dtf
+    reaches = known & (head > 0)
+    depth = head[reaches] + np.maximum(cell_fill[fpp[reaches]], np.float32(0.0))
+    expected = np.full(cell_fill.size, -np.inf, np.float32)
+    with np.errstate(invalid="ignore"):  # The NaN fill's depth
+        np.maximum.at(expected, fpp[reaches], depth)
+    assert np.isfinite(expected).sum() > 10 and np.isnan(expected).sum() == nan_fill
+    for library in _libraries(tmp_path, columns):
+        sources = fldpln_mapping.library_sources(library, cell_fill.size)
+        best = np.full(cell_fill.size, -np.inf, np.float32)
+        for part in fldpln_mapping._library_parts(library, ["segment", "FPP", "DTF"]):
+            dtf_part = part["DTF"]
+            fldpln_mapping._deepest_heads(best, part["segment"], part["FPP"], dtf_part,
+                                          fldpln_mapping._scale(dtf_part), dof)
+        fldpln_mapping._add_fill(best, sources)
         assert np.array_equal(best, expected, equal_nan=True)
-        assert np.array_equal(best_again, expected, equal_nan=True)
+
+
+def test_library_sources_are_each_source_once_with_its_own_fill(tmp_path, monkeypatch):
+    """Each (segment, FSP) once, however the parts split their rows; the sources with a row for their own cell, and
+    that cell's fill; the cells whose fill is above 0; and min(fill, 0) at every cell of the library, NaN off it."""
+    monkeypatch.setattr(fldpln_mapping, "_READ_ROWS", 5)
+    monkeypatch.setattr(library_writer, "_LIBRARY_SLICE_ROWS", 5)
+    columns, cell_fill = _random_library(n=120, cells=40)
+    fsp, fpp, segment = columns["FSP"], columns["FPP"], columns["segment"]
+    in_library = np.zeros(cell_fill.size, bool)
+    in_library[fpp] = True
+    for library in _libraries(tmp_path, columns):
+        below = np.full(cell_fill.size, np.nan, np.float32)
+        sources = fldpln_mapping.library_sources(library, cell_fill.size, fill_below_dem=below)
+        assert sources.key == "segment"
+        pairs = sorted(set(zip(segment.tolist(), fsp.tolist())))
+        assert sorted(sources.pixels.select("segment", "FSP").iter_rows()) == pairs
+        own = np.unique(fsp[fsp == fpp])
+        assert np.array_equal(sources.own_fsp, own) and np.array_equal(sources.own_fill, cell_fill[own])
+        raised = np.flatnonzero(in_library & (cell_fill > 0))
+        assert np.array_equal(sources.fill_cells, raised) and np.array_equal(sources.fill_values, cell_fill[raised])
+        expected_below = np.where(in_library, np.minimum(cell_fill, np.float32(0.0)), np.float32(np.nan))
+        assert np.array_equal(below, expected_below, equal_nan=True)
 
 
 # --------------------------------------------------------------------------
@@ -587,9 +641,9 @@ def test_flood_from_wse_must_connect_to_the_anchor():
 
 def test_flood_map_from_one_point():
     dem = np.full((5, 5), 100.0, np.float32)
-    kwargs = dict(point_rows=[2], point_cols=[2], point_topwidth=[25.0], point_ids=[1], dx=10.0,
-                  corridor_topwidth_factor=1.0, anchor_topwidth_factor=0.1, maxdist_topwidth_factor=1.0,
-                  smooth_sigma_pixels=0)
+    kwargs = {"point_rows": [2], "point_cols": [2], "point_topwidth": [25.0], "point_ids": [1], "dx": 10.0,
+              "corridor_topwidth_factor": 1.0, "anchor_topwidth_factor": 0.1, "maxdist_topwidth_factor": 1.0,
+              "smooth_sigma_pixels": 0}
     result = multi_point.create_fhs_flood_map_from_points(dem, point_wse=[100.5], **kwargs)
     # Every cell within the 25 m corridor around the point floods: all but the four corners
     assert result["has_valid_points"] and result["flood"].sum() == 21 and result["flood"][0, 0] == 0
@@ -604,9 +658,9 @@ def test_a_flood_map_interpolated_a_few_cells_at_a_time_is_the_whole_s(monkeypat
     """The corridor's cells interpolated seven at a time give what they give all at once."""
     rng = np.random.default_rng(4)
     dem = (100.0 + rng.random((30, 40))).astype(np.float32)
-    kwargs = dict(point_rows=rng.integers(0, 30, 25), point_cols=rng.integers(0, 40, 25),
-                  point_topwidth=rng.uniform(20.0, 90.0, 25), point_ids=np.arange(25) % 3, dx=10.0,
-                  point_wse=101.5 + rng.random(25), point_slope=rng.uniform(1e-4, 1e-2, 25))
+    kwargs = {"point_rows": rng.integers(0, 30, 25), "point_cols": rng.integers(0, 40, 25),
+              "point_topwidth": rng.uniform(20.0, 90.0, 25), "point_ids": np.arange(25) % 3, "dx": 10.0,
+              "point_wse": 101.5 + rng.random(25), "point_slope": rng.uniform(1e-4, 1e-2, 25)}
     whole = multi_point.create_fhs_flood_map_from_points(dem, **kwargs)
     monkeypatch.setattr(multi_point, "_IDW_TARGETS", 7)
     parts = multi_point.create_fhs_flood_map_from_points(dem, **kwargs)

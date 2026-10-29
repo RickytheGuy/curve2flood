@@ -369,8 +369,9 @@ def _library_rows(segment: int, fsp: np.ndarray, fpp: np.ndarray, dtf: np.ndarra
     """One segment's library rows, sorted by FSP and then FPP (which compresses well), with each cell's fill from
     the flat ``fill_depth`` (or ``SparseFill``).  Cells without a DEM value (a NaN fill) never flood, and are left out."""
     order = np.lexsort((fpp, fsp))
+    # Looked up in the cells' own order, ascending as the solvers give them, and then put in the rows'
+    fill = fill_depth[fpp][order]
     fpp = fpp[order]
-    fill = fill_depth[fpp]
     has_dem = np.isfinite(fill)
     if not has_dem.all():
         order, fpp, fill = order[has_dem], fpp[has_dem], fill[has_dem]

@@ -1,12 +1,17 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
-import pandas as pd
 import polars as pl
 import polars.selectors as cs
 from numba import njit
 
 from curve2flood._log import LOG
 from curve2flood.config import Config, is_parquet
-from curve2flood.spreaders import filter_outliers
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 
 def calculate_interpolated_curvefile(CurveParamFileName: str, COMID_Unique_Flow: dict, TW_MultFact: float) -> pd.DataFrame:
@@ -17,6 +22,11 @@ def calculate_interpolated_curvefile(CurveParamFileName: str, COMID_Unique_Flow:
     deviations from their reach's mean are dropped, and top widths are scaled
     by ``TW_MultFact``.
     """
+    # Imported here: only curve files need pandas
+    import pandas as pd
+
+    from curve2flood.spreaders.multi_point import filter_outliers
+
     LOG.debug('\nOpening and Reading ' + CurveParamFileName)
 
     if is_parquet(CurveParamFileName):
@@ -48,6 +58,8 @@ def Calculate_TW_D_V_ForEachCOMID_CurveFile(CurveParamFileName: str, COMID_Uniqu
     W_Rast, S_Rast)``: each reach's median top width and depth (0 for reaches
     without curves), and the largest of those top widths.
     """
+    import pandas as pd
+
     curve_df = calculate_interpolated_curvefile(CurveParamFileName, COMID_Unique_Flow, TW_MultFact)
 
     T_Rast[curve_df['Row'], curve_df['Col']] = curve_df['TopWidth']

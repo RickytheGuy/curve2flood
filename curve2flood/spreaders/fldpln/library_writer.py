@@ -5,9 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from curve2flood.config import is_parquet
@@ -22,6 +20,9 @@ DECIMAL_COLS = {"DTF": pa.decimal32(5, 2), "fill": pa.decimal32(7, 2)}
 # Library rows written and read at a time: one row group of a library written by
 # save_library.
 _LIBRARY_SLICE_ROWS = 1 << 20
+
+# zstd's level for a Parquet library.
+_ZSTD_LEVEL = 6
 
 # The key of a Parquet library's metadata (see library_metadata)
 METADATA_KEY = b"curve2flood:fldpln_library"
@@ -141,16 +142,17 @@ class LibraryWriter:
 
     def _write_part(self, part: dict[str, np.ndarray]):
         if not self.parquet:
+            import pandas as pd  # Imported here: only a CSV library needs it
+
             pd.DataFrame(part).to_csv(self._partial, index=False, mode="a" if self._begun else "w",
                                       header=not self._begun)
             self._begun = True
             return
+        
         arrays = {}
         for c, values in part.items():
-            if c in DECIMAL_COLS:
-                arrays[c] = pc.cast(pa.array(values.astype(np.float32).round(2)), DECIMAL_COLS[c])
-            else:
-                arrays[c] = pa.array(values)
+            arrays[c] = _as_decimal(values, DECIMAL_COLS[c]) if c in DECIMAL_COLS else pa.array(values)
+
         table = pa.table(arrays)
         if self._metadata is not None:
             table = table.replace_schema_metadata(self._metadata)
@@ -159,7 +161,18 @@ class LibraryWriter:
             encoding = {"FPP": "DELTA_BINARY_PACKED"} | {c: "BYTE_STREAM_SPLIT" for c in DECIMAL_COLS if c in part}
             self._writer = pq.ParquetWriter(
                 self._partial, table.schema, use_dictionary=[c for c in ("FSP", "segment") if c in part],
-                column_encoding=encoding, store_decimal_as_integer=True, compression="zstd", compression_level=9)
+                column_encoding=encoding, store_decimal_as_integer=True, compression="zstd",
+                compression_level=_ZSTD_LEVEL)
             self._begun = True
         self._writer.write_table(table, row_group_size=_LIBRARY_SLICE_ROWS)
 
+
+def _as_decimal(values: np.ndarray, kind: pa.Decimal32Type) -> pa.Array:
+    """``values`` (metres) as ``kind``, a decimal32 of hundredths, as Arrow's cast of them as float32 rounded to two
+    places, at a quarter of its cost."""
+    hundredths = np.round(values.astype(np.float32).round(2).astype(np.float64) * 100.0)
+    limit = 10.0 ** kind.precision
+    if not (np.abs(hundredths) < limit).all():
+        raise ValueError(f"A value doesn't fit {kind}: {values[~(np.abs(hundredths) < limit)][:3]}.")
+    
+    return pa.Array.from_buffers(kind, hundredths.size, [None, pa.py_buffer(hundredths.astype(np.int32))])
